@@ -29,7 +29,7 @@ def load_shingseng_target_data():
         if len(rows) > 10:
             parsed_data = []
             
-            # 依照你的表格結構，從第 10 行（索引 9）開始讀取各通路明細
+            # 從第 10 行（索引 9）開始讀取各通路明細
             for r in rows[10:]:
                 if not r or len(r) < 15:
                     continue
@@ -39,10 +39,6 @@ def load_shingseng_target_data():
                     continue
                 
                 try:
-                    # 依據你的試算表欄位索引抓取：
-                    # 1月實際: 索引 2, 1月2026目標: 索引 4
-                    # 2月實際: 索引 7, 2月2026目標: 索引 9
-                    # 3月實際: 索引 12, 3月2026目標: 索引 14
                     m1_actual = float(str(r[2]).replace(',', '').strip()) if r[2] else 0
                     m1_target = float(str(r[4]).replace(',', '').strip()) if r[4] else 0
                     
@@ -52,7 +48,6 @@ def load_shingseng_target_data():
                     m3_actual = float(str(r[12]).replace(',', '').strip()) if r[12] else 0
                     m3_target = float(str(r[14]).replace(',', '').strip()) if r[14] else 0
                     
-                    # 組合為標準清單
                     parsed_data.append({'通路': channel_name, '月份': '1月', '目標銷售額': m1_target, '實際銷售額': m1_actual})
                     parsed_data.append({'通路': channel_name, '月份': '2月', '目標銷售額': m2_target, '實際銷售額': m2_actual})
                     parsed_data.append({'通路': channel_name, '月份': '3月', '目標銷售額': m3_target, '實際銷售額': m3_actual})
@@ -66,7 +61,7 @@ def load_shingseng_target_data():
     except Exception as e:
         print(f"Google API 連線或解析發生例外，自動載入備用模擬數據: {e}")
     
-    # 備用防呆模擬數據（確保 API 異常時網頁依然能正常呈現圖表）
+    # 備用防呆模擬數據
     return pd.DataFrame({
         '月份': ['1月', '1月', '2月', '2月', '3月', '3月'],
         '通路': ['X線上-FB官網', 'R線上-蝦皮', 'X線上-FB官網', 'R線上-蝦皮', 'X線上-FB官網', 'R線上-蝦皮'],
@@ -101,7 +96,6 @@ def main_page():
         with ui.card().classes('p-4 bg-orange-50'):
             ui.label('整體達成率').classes('text-sm text-gray-500')
             ui.label(f'{achievement_rate:.1f}%').classes('text-xl font-bold text-orange-600')
-        ])
 
     ui.separator().classes('my-6')
     
@@ -111,19 +105,6 @@ def main_page():
     channels = df['通路'].unique().tolist()
     actual_vals = [df[df['通路'] == c]['實際銷售額'].sum() for c in channels]
     target_vals = [df[df['通路'] == c]['目標銷售額'].sum() for c in channels]
-    
-    chart_data = {
-        'тивных': channels,
-        'antic': {
-            'type': 'bar',
-            'title': '通路績效表現',
-            'xAxis': {'categories': channels},
-            'series': [
-                {'name': '實際銷售額', 'data': actual_vals},
-                {'name': '目標銷售額', 'data': target_vals}
-            ]
-        }
-    }
     
     # 使用 Plotly 長條圖展示
     ui.plotly({
