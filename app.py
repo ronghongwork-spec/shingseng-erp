@@ -90,16 +90,16 @@ def main_page():
     achievement_rate = (total_actual / total_target * 100) if total_target > 0 else 0
     
     with ui.row().classes('w-full gap-4'):
-        ui.card().classes('p-4 bg-blue-50').content(lambda: [
-            ui.label('第一季總目標營收').classes('text-sm text-gray-500'),
+        with ui.card().classes('p-4 bg-blue-50'):
+            ui.label('第一季總目標營收').classes('text-sm text-gray-500')
             ui.label(f'{total_target:,.0f}').classes('text-xl font-bold text-blue-600')
-        ])
-        ui.card().classes('p-4 bg-green-50').content(lambda: [
-            ui.label('第一季實際總營收').classes('text-sm text-gray-500'),
+            
+        with ui.card().classes('p-4 bg-green-50'):
+            ui.label('第一季實際總營收').classes('text-sm text-gray-500')
             ui.label(f'{total_actual:,.0f}').classes('text-xl font-bold text-green-600')
-        ])
-        ui.card().classes('p-4 bg-orange-50').content(lambda: [
-            ui.label('整體達成率').classes('text-sm text-gray-500'),
+            
+        with ui.card().classes('p-4 bg-orange-50'):
+            ui.label('整體達成率').classes('text-sm text-gray-500')
             ui.label(f'{achievement_rate:.1f}%').classes('text-xl font-bold text-orange-600')
         ])
 
