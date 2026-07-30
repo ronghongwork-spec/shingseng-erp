@@ -1,101 +1,17 @@
 from nicegui import ui
-
-# 模擬儲存採購單的資料庫或列表
-purchase_orders = {
-    "海濤客": [],
-    "容鴻": [],
-    "芙萊柏": []
-}
-
-def create_purchase_page(company_name: str):
-    """建立各公司的採購頁面與採購單介面"""
-    with ui.column().classes('w-full p-4'):
-        ui.label(f'{company_name} - 採購管理系統').classes('text-2xl font-bold mb-4')
-        
-        # 採購單輸入表單
-        with ui.card().classes('w-full p-4 mb-4'):
-            ui.label('建立新採購單').classes('text-lg font-semibold mb-2')
-            
-            with ui.row().classes('w-full gap-4'):
-                item_name_input = ui.input(label='品名').classes('flex-1')
-                item_no_input = ui.input(label='品號').classes('flex-1')
-                quantity_input = ui.number(label='採購數量', value=1).classes('w-32')
-            
-            with ui.row().classes('w-full gap-4 mt-2'):
-                supplier_input = ui.input(label='供應商').classes('flex-1')
-                remark_input = ui.input(label='備註').classes('flex-1')
-
-            def submit_order():
-                if not item_name_input.value or not item_no_input.value:
-                    ui.notify('請填寫品名與品號！', color='negative')
-                    return
-                
-                order_data = {
-                    "品名": item_name_input.value,
-                    "品號": item_no_input.value,
-                    "數量": quantity_input.value,
-                    "供應商": supplier_input.value,
-                    "備註": remark_input.value
-                }
-                
-                purchase_orders[company_name].append(order_data)
-                ui.notify(f'成功為 {company_name} 建立採購單！', color='positive')
-                
-                # 清空欄位
-                item_name_input.value = ''
-                item_no_input.value = ''
-                quantity_input.value = 1
-                supplier_input.value = ''
-                remark_input.value = ''
-                
-                # 重新整理表格
-                order_table.rows = purchase_orders[company_name]
-                order_table.update()
-
-            ui.button('送出採購單', on_click=submit_order).classes('mt-4 bg-blue-500 text-white')
-
-        # 採購單清單表格
-        ui.label('歷史採購單列表').classes('text-lg font-semibold mb-2')
-        
-        columns = [
-            {'name': '品名', 'label': '品名', 'field': '品名', 'required': True},
-            {'name': '品號', 'label': '品號', 'field': '品號'},
-            {'name': '數量', 'label': '數量', 'field': '數量'},
-            {'name': '供應商', 'label': '供應商', 'field': '供應商'},
-            {'name': '備註', 'label': '備註', 'field': '備註'},
-        ]
-        
-        order_table = ui.table(columns=columns, rows=purchase_orders[company_name], row_key='品號').classes('w-full')
-
-# 註冊各公司的頁面路由
-@ui.page('/haitaoke_purchase')
-def haitaoke_page():
-    create_purchase_page("海濤客")
-
-@ui.page('/ronghong_purchase')
-def ronghong_page():
-    create_purchase_page("容鴻")
-
-@ui.page('/freiber_purchase')
-def freiber_page():
-    create_purchase_page("芙萊柏")
-
-# 主頁導覽連結
-@ui.page('/')
-def main_index():
-    ui.label('多公司 ERP 採購系統').classes('text-3xl font-bold mb-6')
-    ui.link('前往 海濤客 採購頁面', '/haitaoke_purchase').classes('text-blue-600 block mb-2')
-    ui.link('前往 容鴻 採購頁面', '/ronghong_purchase').classes('text-blue-600 block mb-2')
-    ui.link('前往 芙萊柏 採購頁面', '/freiber_purchase').classes('text-blue-600 block mb-2')
-
-ui.run(port=8080, host='0.0.0.0')
-from nicegui import ui
 import pandas as pd
 import plotly.express as px
 
 # -------------------------------------------------------------------------
-# 模擬多公司與多倉庫資料庫
+# 模擬多公司與多倉庫資料庫（包含採購單暫存資料結構）
 # -------------------------------------------------------------------------
+PURCHASE_ORDERS = {
+    '海濤客食品工廠': [],
+    '興聖分公司': [],
+    '容鴻分公司': [],
+    '芙萊柏分公司': []
+}
+
 COMPANY_DATA = {
     '海濤客食品工廠': {
         'warehouses': ['總廠原料倉', '成品冷凍倉', '電商出貨倉'],
@@ -243,11 +159,12 @@ def main_dashboard():
             badge_text = '● 啟用完整工廠模組' if is_factory else '● 標準商貿營運模式'
             ui.label(badge_text).classes('text-xs font-bold px-3 py-1 bg-emerald-50 text-emerald-700 border border-emerald-200')
 
-        # 分頁標籤
+        # 分頁標籤 (加入採購管理分頁)
         with ui.tabs().classes('w-full bg-[#f7f6f2] px-0 text-zinc-500 border-b border-[#e2e1dc]') as tabs:
             t_dash = ui.tab('📊 總覽與數據分析', icon='dashboard')
             t_inv = ui.tab('📦 即時庫存清單', icon='inventory')
             t_ord = ui.tab('📋 訂單管理與確認', icon='shopping_cart')
+            t_pur = ui.tab('🛒 採購單建立與管理', icon='add_shopping_cart')
             
             if is_factory:
                 t_bom = ui.tab('🌳 產品用料結構 (BOM)', icon='account_tree')
@@ -257,7 +174,6 @@ def main_dashboard():
             
             # 1. 統計與分析看板
             with ui.tab_panel(t_dash):
-                # 預設用第一個倉庫計算總量供總覽展示
                 default_wh_df = list(data['inventory_by_wh'].values())[0]
                 df_ord = data['orders']
                 
@@ -287,15 +203,14 @@ def main_dashboard():
                         ui.plotly(fig).classes('w-full')
                     with ui.card().classes('flex-1 p-6 bg-white border border-[#e2e1dc] shadow-none rounded-none'):
                         ui.label('數據洞察與摘要').classes('font-bold text-zinc-900 text-sm tracking-wide mb-3')
-                        ui.markdown(f'• **{selected_co}** 目前多倉庫存連線正常。<br>• 可透過「即時庫存清單」切換不同子倉庫檢視細項。').classes('text-zinc-600 text-sm leading-relaxed')
+                        ui.markdown(f'• **{selected_co}** 目前多倉庫存連線正常。<br>• 可透過上方分頁切換檢視庫存、訂單及採購模組。').classes('text-zinc-600 text-sm leading-relaxed')
 
-            # 2. 即時庫存 (加入多倉庫篩選)
+            # 2. 即時庫存
             with ui.tab_panel(t_inv):
                 with ui.card().classes('w-full p-6 bg-white border border-[#e2e1dc] shadow-none rounded-none'):
                     with ui.row().classes('w-full items-center justify-between mb-4'):
                         ui.label(f'{selected_co} — 即時庫存明細表').classes('text-lg font-bold text-zinc-900 tracking-wide')
                         
-                        # 倉庫篩選下拉選單
                         with ui.row().classes('items-center gap-2'):
                             ui.label('選擇倉庫：').classes('text-zinc-500 text-xs font-bold')
                             wh_select = ui.select(
@@ -303,7 +218,6 @@ def main_dashboard():
                                 value=warehouses[0]
                             ).classes('bg-[#f7f6f2] text-zinc-900 rounded-none px-3 py-1 text-xs font-bold border border-[#e2e1dc]')
 
-                    # 動態切換倉庫表格的容器
                     table_container = ui.column().classes('w-full')
 
                     def update_inventory_table(wh_name):
@@ -339,7 +253,67 @@ def main_dashboard():
                         rows=data['orders'].to_dict('records')
                     ).classes('w-full')
 
-            # 4. 工廠專屬模組
+            # 4. 採購單建立與管理模組（新增整合）
+            with ui.tab_panel(t_pur):
+                with ui.card().classes('w-full p-6 bg-white border border-[#e2e1dc] shadow-none rounded-none mb-6'):
+                    ui.label(f'{selected_co} — 建立新採購單').classes('text-lg font-bold text-zinc-900 mb-4 tracking-wide')
+                    
+                    with ui.row().classes('w-full gap-4'):
+                        item_name_input = ui.input(label='品名').classes('flex-1')
+                        item_no_input = ui.input(label='品號').classes('flex-1')
+                        quantity_input = ui.number(label='採購數量', value=1).classes('w-32')
+                    
+                    with ui.row().classes('w-full gap-4 mt-2'):
+                        supplier_input = ui.input(label='供應商').classes('flex-1')
+                        remark_input = ui.input(label='備註').classes('flex-1')
+
+                    def submit_order():
+                        if not item_name_input.value or not item_no_input.value:
+                            ui.notify('請填寫品名與品號！', color='negative')
+                            return
+                        
+                        order_data = {
+                            "品名": item_name_input.value,
+                            "品號": item_no_input.value,
+                            "數量": quantity_input.value,
+                            "供應商": supplier_input.value,
+                            "備註": remark_input.value
+                        }
+                        
+                        PURCHASE_ORDERS[selected_co].append(order_data)
+                        ui.notify(f'成功為 {selected_co} 建立採購單！', color='positive')
+                        
+                        # 清空欄位
+                        item_name_input.value = ''
+                        item_no_input.value = ''
+                        quantity_input.value = 1
+                        supplier_input.value = ''
+                        remark_input.value = ''
+                        
+                        # 重新整理表格
+                        purchase_table.rows = PURCHASE_ORDERS[selected_co]
+                        purchase_table.update()
+
+                    ui.button('送出採購單', on_click=submit_order).classes('mt-4 awwwards-btn px-6 py-2 text-xs rounded-none')
+
+                with ui.card().classes('w-full p-6 bg-white border border-[#e2e1dc] shadow-none rounded-none'):
+                    ui.label(f'{selected_co} — 歷史採購單列表').classes('text-lg font-bold text-zinc-900 mb-4 tracking-wide')
+                    
+                    purchase_columns = [
+                        {'name': '品名', 'label': '品名', 'field': '品名', 'required': True},
+                        {'name': '品號', 'label': '品號', 'field': '品號'},
+                        {'name': '數量', 'label': '數量', 'field': '數量'},
+                        {'name': '供應商', 'label': '供應商', 'field': '供應商'},
+                        {'name': '備註', 'label': '備註', 'field': '備註'},
+                    ]
+                    
+                    purchase_table = ui.table(
+                        columns=purchase_columns, 
+                        rows=PURCHASE_ORDERS[selected_co], 
+                        row_key='品號'
+                    ).classes('w-full')
+
+            # 5. 工廠專屬模組
             if is_factory:
                 with ui.tab_panel(t_bom):
                     with ui.card().classes('w-full p-6 bg-white border border-[#e2e1dc] shadow-none rounded-none'):
@@ -387,5 +361,4 @@ def main_dashboard():
         company_select.on_value_change(lambda e: render_content.refresh(e.value))
         render_content(company_select.value)
 
-ui.run(port=8080, title="興聖集團 ERP 系統")
-
+ui.run(port=8080, title="興聖集團 ERP 系統", host='0.0.0.0')
