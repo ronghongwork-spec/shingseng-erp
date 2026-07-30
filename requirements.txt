@@ -1,3 +1,9 @@
+<<<<<<< HEAD
 nicegui
 pandas
 plotly
+=======
+nicegui
+pandas
+plotly
+>>>>>>> 0bf36a41c0e5f161488801dbd79a0141fcf3a8b0
