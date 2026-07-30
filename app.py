@@ -390,4 +390,4 @@ def main_dashboard():
         render_content(company_select.value)
 
 ui.run(port=8080, title="興聖集團 ERP 系統")
->>>>>>> 0bf36a41c0e5f161488801dbd79a0141fcf3a8b0
+
