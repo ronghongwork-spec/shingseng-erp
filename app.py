@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 from nicegui import ui
 
 # 模擬儲存採購單的資料庫或列表
@@ -90,7 +89,6 @@ def main_index():
     ui.link('前往 芙萊柏 採購頁面', '/freiber_purchase').classes('text-blue-600 block mb-2')
 
 ui.run(port=8080, host='0.0.0.0')
-=======
 from nicegui import ui
 import pandas as pd
 import plotly.express as px
