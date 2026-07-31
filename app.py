@@ -55,12 +55,13 @@ def get_a1_token():
     if response.status_code == 200:
       data = response.json()
       access_token = data.get("access_token")
-      token_type = data.get("token_type") or "Bearer"
       if not access_token:
         print(f"A1 登入回應缺少 access_token: {data}")
         return None
-      # 回傳組合好的 Authorization 值，其餘函式直接使用即可
-      return f"{token_type} {access_token}"
+      # 手冊寫的是「Authorization Header 填入使用者金鑰」，不是標準 OAuth
+      # 的 "Bearer <token>" 格式，這裡直接回傳原始 access_token 給後續呼叫使用。
+      print(f"A1 登入成功，token 前 8 碼: {access_token[:8]}...")
+      return access_token
     else:
       print(f"A1 登入失敗 [{response.status_code}]: {response.text}")
   except requests.exceptions.RequestException as e:
