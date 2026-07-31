@@ -37,6 +37,17 @@ STOCK_PAGE_SIZE = 100  # 手冊：StockBatch 每頁固定 100 筆（依 品號+�
 MAX_STOCK_PAGES = 1000  # 分頁安全上限，避免 More 一直為 true 造成無窮迴圈
 ITEM_DETAIL_WORKERS = 8  # 平行抓取商品明細的執行緒數
 
+# 鼎新 A1 目前的 POS API（手冊 1.0.35）沒有提供「組合品-組成明細」的查詢
+# 端點，只能改用人工維護的 Excel 來補齊「主件/子件品號＋用量」關係，
+# 再由本程式讀取、合併進「商品組合資訊」頁籤顯示。
+# 預設放在 app.py 同層的 data/ 資料夾，也可用環境變數 A1_BOM_EXCEL_PATH
+# 指到其他路徑（例如掛載的網路磁碟、共用資料夾）。
+BOM_EXCEL_PATH = os.environ.get(
+    "A1_BOM_EXCEL_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "商品組合明細.xlsx"),
+)
+BOM_EXCEL_SHEET_NAME = "組合明細"
+
 
 def get_a1_token():
   """透過 APIKey + Password 呼叫 Login，取得完整可用的 Authorization 值。
@@ -415,6 +426,63 @@ ITEM_TYPE_LABELS = {
     "3": "組合品-先銷售自動組合",
 }
 
+# 對應 build_template.py 產生的「商品組合明細_填寫範本.xlsx」欄位名稱
+BOM_COL_PARENT_ID = "主件品號"
+BOM_COL_PARENT_NAME = "主件品名（選填，供參考）"
+BOM_COL_CHILD_ID = "子件品號"
+BOM_COL_CHILD_NAME = "子件品名（選填，供參考）"
+BOM_COL_QTY = "用量"
+BOM_COL_UNIT = "單位（選填）"
+BOM_COL_MEMO = "備註"
+
+
+def load_bom_from_excel(path):
+  """讀取人工維護的「商品組合明細」Excel（因 A1 API 無此明細查詢端點）
+
+  回傳 {主件品號: [{子件品號, 子件品名, 用量, 單位, 備註}, ...]}
+  找不到檔案或讀取失敗時回傳空 dict，不會讓頁面掛掉——只是「商品組合
+  資訊」頁籤會顯示「尚未補齊子件明細」而已。
+  """
+  if not path or not os.path.exists(path):
+    print(f"未找到商品組合明細 Excel（{path}），商品組合資訊頁籤將只顯示型態、無子件明細")
+    return {}
+
+  try:
+    # dtype=str 是關鍵：避免品號（例如 011109900001）被 pandas 當數字，
+    # 把前導 0 吃掉
+    df = pd.read_excel(path, sheet_name=BOM_EXCEL_SHEET_NAME, dtype=str)
+  except Exception as e:
+    print(f"讀取商品組合明細 Excel 失敗：{e}")
+    return {}
+
+  df = df.fillna("")
+  bom_map = {}
+  for _, row in df.iterrows():
+    parent_id = str(row.get(BOM_COL_PARENT_ID, "")).strip()
+    child_id = str(row.get(BOM_COL_CHILD_ID, "")).strip()
+    if not parent_id or not child_id:
+      continue  # 略過空白列或只填了一半的列
+
+    qty_raw = str(row.get(BOM_COL_QTY, "")).strip()
+    try:
+      qty = float(qty_raw) if qty_raw else 0.0
+    except ValueError:
+      qty = qty_raw  # 萬一填了非數字，原樣顯示，不擋住整批匯入
+
+    bom_map.setdefault(parent_id, []).append({
+        "子件品號": child_id,
+        "子件品名": str(row.get(BOM_COL_CHILD_NAME, "")).strip(),
+        "用量": qty,
+        "單位": str(row.get(BOM_COL_UNIT, "")).strip(),
+        "備註": str(row.get(BOM_COL_MEMO, "")).strip(),
+    })
+
+  print(
+      f"商品組合明細 Excel 讀取完成：共 {len(bom_map)} 個主件品號、"
+      f"{sum(len(v) for v in bom_map.values())} 筆子件關係"
+  )
+  return bom_map
+
 
 # -------------------------------------------------------------------------
 # 興聖集團旗下分公司清單（右上角切換用）
@@ -428,9 +496,11 @@ ACTIVE_COMPANY_LABEL = "海濤客食品工業(股)公司"
 
 # 初始化全域狀態
 initial_df, initial_whs, initial_cats, initial_items_map = fetch_all_a1_inventory()
+initial_bom_map = load_bom_from_excel(BOM_EXCEL_PATH)
 app_state = {
     "df": initial_df,
     "items_map": initial_items_map,
+    "bom_map": initial_bom_map,
     "warehouses": (
         initial_whs
         if initial_whs
@@ -850,10 +920,9 @@ def inventory_dashboard():
           # ---------------- 頁籤 3：商品組合資訊 ----------------
           # 手冊 1.0.35 全文查過一遍，Items[Get] 只回傳「商品型態」
           # （1.一般商品 2.組合品-先組合再銷售 3.組合品-先銷售自動組合），
-          # 並沒有提供組成品/用量明細的查詢端點（BOM）。所以這裡誠實地
-          # 只列出「哪些品號是組合品、屬於哪一種組合型態」，無法顯示組成
-          # 用量——如需組成明細，需要另外確認鼎新是否有其他端點，或請
-          # A1 後台人員手動提供。
+          # A1 本身的匯出功能也只有主件、沒有子件。因此子件/用量明細改由
+          # 人工維護的「商品組合明細」Excel 補齊（見 BOM_EXCEL_PATH），
+          # 這裡讀取後與 A1 商品主檔的組合品清單合併顯示。
           with ui.tab_panel(tab_bom):
             with ui.card().classes(
                 "w-full p-6 bg-white border border-[#e2e1dc] shadow-none"
@@ -866,86 +935,145 @@ def inventory_dashboard():
                   "w-full p-3 mb-4 bg-[#fff8e6] border border-[#f0dca0]"
               ):
                 ui.label(
-                    "⚠ 依「鼎新 A1 POS API 串接手冊」1.0.35 版，Items[Get] "
-                    "僅回傳商品型態（是否為組合品），並未提供組成品／用量"
-                    "明細的查詢端點。下表僅能列出被標記為組合品的品號，"
-                    "無法顯示其組成用量；如需完整 BOM 明細，需另洽鼎新確認"
-                    "是否有其他端點，或於 A1 後台人工查看。"
+                    "⚠ 鼎新 A1 目前的 API／後台匯出都只有組合品「主件」，"
+                    "沒有「子件＋用量」明細，因此子件資訊改由人工維護的"
+                    "「商品組合明細」Excel 補齊，系統會自動讀取合併顯示。"
+                    "填寫範本請洽系統管理員索取，或參考先前提供的"
+                    "「商品組合明細_填寫範本.xlsx」。"
                 ).classes("text-xs text-amber-800")
 
-              with ui.row().classes("items-center gap-3 flex-wrap mb-2"):
+              with ui.row().classes(
+                  "items-center gap-3 flex-wrap mb-2 justify-between w-full"
+              ):
                 combo_search_input = ui.input(
                     placeholder="輸入品號或品名關鍵字..."
                 ).classes("w-64 text-xs")
 
+                def handle_reload_bom_excel():
+                  app_state["bom_map"] = load_bom_from_excel(BOM_EXCEL_PATH)
+                  ui.notify(
+                      f"已重新讀取商品組合明細 Excel（{BOM_EXCEL_PATH}）",
+                      color="positive",
+                  )
+                  update_combo_list()
+
+                ui.button(
+                    "重新載入 Excel", on_click=handle_reload_bom_excel
+                ).classes("sync-btn px-3 py-1 text-xs rounded-none")
+
               combo_stats_label = ui.label().classes(
                   "text-xs text-zinc-500 mb-3"
               )
-              combo_table_container = ui.column().classes("w-full")
+              combo_list_container = ui.column().classes("w-full gap-2")
 
               def update_combo_list():
-                combo_table_container.clear()
+                combo_list_container.clear()
                 items_map = app_state.get("items_map", {})
+                bom_map = app_state.get("bom_map", {})
 
-                combo_rows = [
-                    {
-                        "品號": item_id,
-                        "品名": info.get("Name"),
-                        "商品分類": info.get("CategoryName", "未分類"),
-                        "商品型態": ITEM_TYPE_LABELS.get(
-                            str(info.get("Type")), str(info.get("Type"))
-                        ),
-                    }
+                combo_entries = [
+                    (item_id, info)
                     for item_id, info in items_map.items()
                     if str(info.get("Type")) in ("2", "3")
                 ]
 
-                keyword = (combo_search_input.value or "").strip()
+                keyword = (combo_search_input.value or "").strip().lower()
                 if keyword:
-                  combo_rows = [
-                      r
-                      for r in combo_rows
-                      if keyword.lower() in str(r["品號"]).lower()
-                      or keyword.lower() in str(r["品名"]).lower()
+                  combo_entries = [
+                      (item_id, info)
+                      for item_id, info in combo_entries
+                      if keyword in str(item_id).lower()
+                      or keyword in str(info.get("Name", "")).lower()
                   ]
 
-                combo_stats_label.text = f"共 {len(combo_rows)} 項組合品"
+                filled_count = sum(
+                    1 for item_id, _ in combo_entries if bom_map.get(item_id)
+                )
+                combo_stats_label.text = (
+                    f"共 {len(combo_entries)} 項組合品｜其中 {filled_count} 項"
+                    f"已在 Excel 補齊子件明細"
+                )
 
-                with combo_table_container:
-                  if not combo_rows:
+                with combo_list_container:
+                  if not combo_entries:
                     ui.label(
                         "目前沒有標記為組合品的商品，或尚未同步商品資料"
                     ).classes("text-xs text-zinc-400")
-                  else:
-                    ui.table(
-                        columns=[
-                            {
-                                "name": "品號",
-                                "label": "品號",
-                                "field": "品號",
-                                "align": "left",
-                            },
-                            {
-                                "name": "品名",
-                                "label": "品名",
-                                "field": "品名",
-                                "align": "left",
-                            },
-                            {
-                                "name": "商品分類",
-                                "label": "商品分類",
-                                "field": "商品分類",
-                                "align": "left",
-                            },
-                            {
-                                "name": "商品型態",
-                                "label": "商品型態",
-                                "field": "商品型態",
-                                "align": "left",
-                            },
-                        ],
-                        rows=combo_rows,
-                    ).classes("w-full")
+
+                  for item_id, info in combo_entries:
+                    components = bom_map.get(item_id, [])
+                    type_label = ITEM_TYPE_LABELS.get(
+                        str(info.get("Type")), str(info.get("Type"))
+                    )
+                    header_suffix = (
+                        f"（{len(components)} 項子件）"
+                        if components
+                        else "（尚未在 Excel 補齊子件明細）"
+                    )
+                    with ui.expansion(
+                        f"{item_id}｜{info.get('Name', '')}｜{type_label}"
+                        f"{header_suffix}",
+                        icon="inventory_2",
+                    ).classes(
+                        "w-full border border-[#e2e1dc] text-sm"
+                    ):
+                      if components:
+                        ui.table(
+                            columns=[
+                                {
+                                    "name": "子件品號",
+                                    "label": "子件品號",
+                                    "field": "子件品號",
+                                    "align": "left",
+                                },
+                                {
+                                    "name": "子件品名",
+                                    "label": "子件品名",
+                                    "field": "子件品名",
+                                    "align": "left",
+                                },
+                                {
+                                    "name": "用量",
+                                    "label": "用量",
+                                    "field": "用量",
+                                },
+                                {
+                                    "name": "單位",
+                                    "label": "單位",
+                                    "field": "單位",
+                                },
+                                {
+                                    "name": "備註",
+                                    "label": "備註",
+                                    "field": "備註",
+                                    "align": "left",
+                                },
+                            ],
+                            rows=components,
+                        ).classes("w-full")
+                      else:
+                        ui.label(
+                            "尚未在「商品組合明細」Excel 中新增此品號的子件"
+                            "資料，請於範本新增一列（主件品號填此品號）。"
+                        ).classes("text-xs text-zinc-400 p-2")
+
+                  # 提醒：Excel 裡有填，但目前 A1 商品主檔查無此品號的主件
+                  # （可能是品號打錯，或該商品已停售）
+                  orphan_ids = [
+                      pid for pid in bom_map if pid not in items_map
+                  ]
+                  if orphan_ids:
+                    shown = "、".join(orphan_ids[:10])
+                    more = "…" if len(orphan_ids) > 10 else ""
+                    with ui.row().classes(
+                        "w-full p-3 mt-2 bg-[#fdecea] border"
+                        " border-[#f5c2c0]"
+                    ):
+                      ui.label(
+                          f"⚠ Excel 中有 {len(orphan_ids)} 個主件品號，在"
+                          f"目前 A1 商品主檔中查無此品號（可能是品號填錯，"
+                          f"或該商品已停售）：{shown}{more}"
+                      ).classes("text-xs text-red-700")
 
               combo_search_input.on_value_change(lambda e: update_combo_list())
               update_combo_list()
