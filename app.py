@@ -158,14 +158,19 @@ def fetch_items_map(token):
 
 
 def fetch_all_a1_inventory():
-  """透過 StockBatch API，逐倉庫分頁完整抓取所有商品在各倉庫的庫存資料
+  """透過 StockBatch API，以「品號分批（ItemIDs）」的方式完整抓取庫存資料
 
-  手冊 StockBatch[Post]：每頁固定 100 筆（依 品號+倉庫 組合計算）。
-  實測發現：不傳 WarehouseName、一次查「全部倉庫」時，分頁的 More 旗標
-  會提前變成 false，導致漏抓後面倉庫的資料。因此改為依 Warehouses[Get]
-  拿到的倉庫清單，逐一倉庫帶入 WarehouseName 分開查詢並各自分頁到底，
-  再合併結果，確保每個倉庫都有查好查滿。
-  Response 為 {"Data": [...], "More": bool}，More=true 代表還有下一頁。
+  手冊 StockBatch[Post]：每頁固定 100 筆（依 品號+倉庫 組合計算），
+  且支援 ItemIDs 參數一次帶入多個品號查詢（最多 100 筆）。
+
+  實測發現：不指定品號、查「全部品號」時（不論有無搭配 WarehouseName），
+  分頁的 More 旗標會提前變成 false，導致漏抓資料——即使該品號用
+  Stock[Get]（單品查詢）直查是查得到、有庫存的。
+
+  因此改為：先用 Items[Get] 取得完整品號清單，切成每批 100 個
+  （符合手冊 ItemIDs 上限），逐批帶入 ItemIDs 查詢 StockBatch，
+  每批各自分頁到底再合併。這樣每一批查詢的品號範圍都是我們自己
+  明確指定的，不會受「全部品號」模式下 More 旗標異常的影響。
   """
   token = get_a1_token()
 
@@ -182,8 +187,8 @@ def fetch_all_a1_inventory():
   categories_map = fetch_categories(token)
   items_map = fetch_items_map(token)
 
-  def fetch_stock_rows(warehouse_name=None):
-    """對單一倉庫（或不指定倉庫）完整分頁抓取 StockBatch 原始資料列"""
+  def fetch_stock_rows(item_ids_batch=None, warehouse_name=None):
+    """依 ItemIDs（品號批次）、可選 WarehouseName，完整分頁抓取 StockBatch 原始資料列"""
     url = f"{A1_BASE_URL}/Stock/Batch"
     rows_collected = []
     pagination = 1
@@ -191,6 +196,8 @@ def fetch_all_a1_inventory():
 
     while more_data and pagination <= MAX_STOCK_PAGES:
       payload = {"Pagination": pagination}
+      if item_ids_batch:
+        payload["ItemIDs"] = item_ids_batch
       if warehouse_name:
         payload["WarehouseName"] = warehouse_name
 
@@ -211,32 +218,37 @@ def fetch_all_a1_inventory():
           pagination += 1
         else:
           print(
-              f"StockBatch 抓取失敗 [{warehouse_name or '全部倉庫'}]"
-              f" [{response.status_code}]: {response.text}"
+              f"StockBatch 抓取失敗 [{response.status_code}]: {response.text}"
           )
           break
       except requests.exceptions.RequestException as e:
-        print(f"StockBatch 請求異常 [{warehouse_name or '全部倉庫'}]: {e}")
+        print(f"StockBatch 請求異常: {e}")
         break
 
     if pagination > MAX_STOCK_PAGES:
-      print(
-          f"警告：StockBatch [{warehouse_name or '全部倉庫'}]"
-          f" 已達分頁安全上限 {MAX_STOCK_PAGES} 頁，資料可能未抓取完整"
-      )
+      print(f"警告：StockBatch 已達分頁安全上限 {MAX_STOCK_PAGES} 頁，資料可能未抓取完整")
 
     return rows_collected
 
+  ITEM_BATCH_SIZE = 100  # 手冊：ItemIDs 一次最多可傳 100 筆
+  all_item_ids = list(items_map.keys())
   raw_rows = []
-  if warehouses:
-    # 逐倉庫分開查，避免「全部倉庫一次查」時分頁提前中斷漏資料
-    for wh_name in warehouses:
-      wh_rows = fetch_stock_rows(warehouse_name=wh_name)
-      print(f"StockBatch [{wh_name}] 抓取完成，共 {len(wh_rows)} 筆")
-      raw_rows.extend(wh_rows)
+
+  if all_item_ids:
+    batches = [
+        all_item_ids[i:i + ITEM_BATCH_SIZE]
+        for i in range(0, len(all_item_ids), ITEM_BATCH_SIZE)
+    ]
+    for batch_index, batch in enumerate(batches, start=1):
+      batch_rows = fetch_stock_rows(item_ids_batch=batch)
+      print(
+          f"StockBatch 品號批次 {batch_index}/{len(batches)}"
+          f"（{len(batch)} 個品號）抓取完成，共 {len(batch_rows)} 筆"
+      )
+      raw_rows.extend(batch_rows)
   else:
-    # 沒抓到倉庫清單時，退回原本「不分倉庫」的查詢方式
-    print("警告：未取得倉庫清單，改用不分倉庫的方式查詢 StockBatch")
+    # 沒取到商品清單時，退回原本「不分品號」的查詢方式
+    print("警告：未取得商品清單，改用不分品號的方式查詢 StockBatch")
     raw_rows = fetch_stock_rows()
 
   all_stock_data = []
