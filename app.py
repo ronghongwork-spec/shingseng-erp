@@ -8,6 +8,24 @@ from nicegui import ui
 import pandas as pd
 import requests
 
+
+def safe_text(value, default=""):
+  """把值轉成安全的顯示字串，同時避免 pandas 的 NaN 陷阱。
+
+  pandas 若某欄位全部是 None，會把該欄自動轉成 float64 的 NaN；但
+  Python 的 bool(nan) 是 True，用 `value or default` 這種寫法會誤判
+  NaN 為「有值」，後續 f-string 或字串操作就會出錯。這裡統一用
+  pd.isna() 明確判斷。
+  """
+  if value is None:
+    return default
+  try:
+    if pd.isna(value):
+      return default
+  except (TypeError, ValueError):
+    pass
+  return str(value)
+
 # -------------------------------------------------------------------------
 # 1. 鼎新 A1 API 串接與全量資料自動抓取
 #    依「鼎新 A1 商務應用雲 POS API 串接手冊」版本 1.0.35
@@ -40,8 +58,15 @@ ITEM_DETAIL_WORKERS = 8  # 平行抓取商品明細的執行緒數
 # 鼎新 A1 目前的 POS API（手冊 1.0.35）沒有提供「組合品-組成明細」的查詢
 # 端點，只能改用人工維護的 Excel 來補齊「主件/子件品號＋用量」關係，
 # 再由本程式讀取、合併進「商品組合資訊」頁籤顯示。
-# 預設放在 app.py 同層的 data/ 資料夾，也可用環境變數 A1_BOM_EXCEL_PATH
-# 指到其他路徑（例如掛載的網路磁碟、共用資料夾）。
+#
+# 部署到 Render 時請注意：Render 的一般檔案系統在「每次重新部署／服務
+# 重啟」時都會被清空還原成 git 版本，並不是永久保存的硬碟。若要讓網頁
+# 上傳的 Excel 檔案能長期保留，需要在 Render 後台為此服務加裝一個
+# Persistent Disk（付費功能），掛載到一個固定路徑（例如 /var/data），
+# 再把環境變數 A1_BOM_EXCEL_PATH 設成該路徑底下的檔案位置，例如：
+#   A1_BOM_EXCEL_PATH=/var/data/商品組合明細.xlsx
+# 若沒有加裝 Persistent Disk，網頁上傳的檔案在下次部署/重啟後就會消失，
+# 需要重新上傳一次（但服務持續運作期間內都可以正常使用、下載、查詢）。
 BOM_EXCEL_PATH = os.environ.get(
     "A1_BOM_EXCEL_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "商品組合明細.xlsx"),
@@ -696,7 +721,7 @@ def inventory_dashboard():
 
                 with products_container:
                   for _, row in catalog.iterrows():
-                    item_name = row["品名"] or "(未命名商品)"
+                    item_name = safe_text(row["品名"], "(未命名商品)")
                     initial = item_name[0] if item_name else "?"
                     with ui.card().classes(
                         "w-56 p-4 bg-white border border-[#e2e1dc]"
@@ -705,11 +730,19 @@ def inventory_dashboard():
                       # 依手冊 ItemImage[Get] 抓取的商品圖片（已轉成 base64
                       # data URI）；沒有上傳過圖片的商品，改用品名首字當
                       # 預留圖示。
+                      # 注意：若整欄「圖片」都是 None，pandas 會把該欄自動
+                      # 轉成 float64 的 NaN，而 Python 的 bool(nan) 是
+                      # True，用 `if image_uri:` 判斷會誤把 NaN 當成「有
+                      # 圖片」，把 NaN 傳進 ui.image() 造成 TypeError。
+                      # 因此這裡明確要求是非空字串才視為有圖片。
                       image_uri = row.get("圖片")
+                      has_image = (
+                          isinstance(image_uri, str) and bool(image_uri)
+                      )
                       with ui.row().classes(
                           "w-full items-center justify-center mb-2"
                       ):
-                        if image_uri:
+                        if has_image:
                           ui.image(image_uri).classes(
                               "w-14 h-14 rounded-full object-cover"
                           )
@@ -726,7 +759,7 @@ def inventory_dashboard():
                       ui.label(f"品號：{row['品號']}").classes(
                           "text-xs text-zinc-500 text-center w-full"
                       )
-                      ui.label(row["商品分類"] or "未分類").classes(
+                      ui.label(safe_text(row["商品分類"], "未分類")).classes(
                           "text-xs text-center w-full text-[#5bc0be]"
                           " font-bold mt-1"
                       )
@@ -735,7 +768,7 @@ def inventory_dashboard():
                           "w-full justify-between text-xs text-zinc-700"
                       ):
                         ui.label(
-                            f"庫存：{row['庫存數量']:g} {row['單位'] or ''}"
+                            f"庫存：{row['庫存數量']:g} {safe_text(row['單位'])}"
                         )
                         ui.label(f"成本：{row['平均成本']:.2f}")
 
@@ -937,10 +970,39 @@ def inventory_dashboard():
                 ui.label(
                     "⚠ 鼎新 A1 目前的 API／後台匯出都只有組合品「主件」，"
                     "沒有「子件＋用量」明細，因此子件資訊改由人工維護的"
-                    "「商品組合明細」Excel 補齊，系統會自動讀取合併顯示。"
-                    "填寫範本請洽系統管理員索取，或參考先前提供的"
+                    "「商品組合明細」Excel 補齊。請直接在下方上傳最新的"
+                    "Excel 檔案（不需要連進伺服器手動放檔案），系統會立即"
+                    "讀取套用。填寫範本請參考先前提供的"
                     "「商品組合明細_填寫範本.xlsx」。"
                 ).classes("text-xs text-amber-800")
+
+              with ui.row().classes(
+                  "w-full items-center gap-3 flex-wrap mb-4 p-3"
+                  " bg-[#f7f6f2] border border-[#e2e1dc]"
+              ):
+
+                def handle_bom_upload(e):
+                  os.makedirs(os.path.dirname(BOM_EXCEL_PATH), exist_ok=True)
+                  with open(BOM_EXCEL_PATH, "wb") as f:
+                    f.write(e.content.read())
+                  app_state["bom_map"] = load_bom_from_excel(BOM_EXCEL_PATH)
+                  ui.notify(
+                      f"已上傳並套用最新的商品組合明細（{e.name}）",
+                      color="positive",
+                  )
+                  update_combo_list()
+
+                ui.upload(
+                    label="上傳商品組合明細 Excel（.xlsx）",
+                    on_upload=handle_bom_upload,
+                    auto_upload=True,
+                ).props('accept=".xlsx"').classes("max-w-sm text-xs")
+
+                ui.label(
+                    "⚠ 若 Render 服務未加裝「Persistent Disk」，重新部署或"
+                    "服務重啟後，這裡上傳的檔案會被清空，需要再上傳一次；"
+                    "詳情請見下方說明。"
+                ).classes("text-xs text-zinc-500 max-w-xs")
 
               with ui.row().classes(
                   "items-center gap-3 flex-wrap mb-2 justify-between w-full"
@@ -958,7 +1020,7 @@ def inventory_dashboard():
                   update_combo_list()
 
                 ui.button(
-                    "重新載入 Excel", on_click=handle_reload_bom_excel
+                    "重新讀取伺服器上的 Excel", on_click=handle_reload_bom_excel
                 ).classes("sync-btn px-3 py-1 text-xs rounded-none")
 
               combo_stats_label = ui.label().classes(
