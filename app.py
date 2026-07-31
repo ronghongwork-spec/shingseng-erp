@@ -1,3 +1,4 @@
+import base64
 import concurrent.futures
 import os
 import sys
@@ -101,13 +102,36 @@ def fetch_categories(token):
   return {}
 
 
+def fetch_item_image_data_uri(item_id, headers, sequence=1):
+  """依手冊 ItemImage[Get]（/ItemImage/{ItemID}/{Sequence}）取得單一商品圖片，
+  將回傳的二進位圖檔轉成 base64 data URI，方便直接放進 <img> 顯示。
+
+  手冊備註：若該品號沒有上傳過圖片，會回傳 400 400028（商品圖檔不存在），
+  這是正常情況（大部分商品可能都還沒有圖），此處直接回傳 None，不視為錯誤。
+  """
+  url = f"{A1_BASE_URL}/ItemImage/{item_id}/{sequence}"
+  try:
+    response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+    if response.status_code == 200:
+      content_type = response.headers.get("Content-Type", "image/png")
+      encoded = base64.b64encode(response.content).decode("utf-8")
+      return f"data:{content_type};base64,{encoded}"
+    if response.status_code != 400:
+      print(f"取得商品圖片失敗 [{item_id}] [{response.status_code}]: {response.text}")
+  except requests.exceptions.RequestException as e:
+    print(f"取得商品圖片連線異常 [{item_id}]: {e}")
+  return None
+
+
 def fetch_items_map(token):
-  """取得商品詳細資料（對應品名、分類、單位、平均成本等）
+  """取得商品詳細資料（對應品名、分類、單位、平均成本、商品圖片等）
 
   手冊 Items[Get] 無傳入商品代號時，只回傳 ID/Name，要拿到 CategoryID、
   UnitName、StdPurPrice 等完整欄位，必須逐筆呼叫 Items/{ItemID}。
   商品數量多時逐一序列呼叫會很慢，這裡改用多執行緒平行抓取明細，
   並針對單筆失敗加入重試，避免暫時性網路錯誤讓某些商品被靜默漏掉。
+  同時依手冊 ItemImage[Get] 一併嘗試抓取每個品號的圖片（第 1 張），
+  沒有圖片的商品會是 None，前端會改用預留圖示顯示。
   """
   url = f"{A1_BASE_URL}/Items"
   headers = {"Authorization": token}
@@ -134,7 +158,9 @@ def fetch_items_map(token):
             detail_url, headers=headers, timeout=REQUEST_TIMEOUT
         )
         if detail_res.status_code == 200:
-          return item_id, detail_res.json()
+          detail = detail_res.json()
+          detail["ImageDataURI"] = fetch_item_image_data_uri(item_id, headers)
+          return item_id, detail
         last_error = f"[{detail_res.status_code}]: {detail_res.text}"
       except requests.exceptions.RequestException as e:
         last_error = str(e)
@@ -176,7 +202,7 @@ def fetch_all_a1_inventory():
 
   if not token:
     print("無法取得 A1 Token，啟用測試防呆數據...")
-    return get_mock_data(), [], []
+    return get_mock_data(), [], [], {}
 
   headers = {
       "Content-Type": "application/json",
@@ -267,6 +293,8 @@ def fetch_all_a1_inventory():
         "單位": item_info.get("UnitName", "個"),
         "庫存數量": row.get("Qty", 0.0),
         "平均成本": item_info.get("StdPurPrice", 0.0),
+        "圖片": item_info.get("ImageDataURI"),
+        "商品型態": item_info.get("Type"),
     })
 
   # 手冊備註：StockBatch「若商品為新建，未在任何倉庫中有異動，則不會回傳」，
@@ -291,6 +319,8 @@ def fetch_all_a1_inventory():
         "單位": item_info.get("UnitName", "個"),
         "庫存數量": 0.0,
         "平均成本": item_info.get("StdPurPrice", 0.0),
+        "圖片": item_info.get("ImageDataURI"),
+        "商品型態": item_info.get("Type"),
     })
 
   print(
@@ -301,9 +331,14 @@ def fetch_all_a1_inventory():
 
   # 防呆機制：若 API 無資料或連線失敗，回傳範例資料
   if not all_stock_data:
-    return get_mock_data(), warehouses, list(categories_map.values())
+    return get_mock_data(), warehouses, list(categories_map.values()), items_map
 
-  return pd.DataFrame(all_stock_data), warehouses, list(categories_map.values())
+  return (
+      pd.DataFrame(all_stock_data),
+      warehouses,
+      list(categories_map.values()),
+      items_map,
+  )
 
 
 def fetch_stock_single_item(token, item_id):
@@ -335,6 +370,8 @@ def get_mock_data():
           "單位": "罐",
           "庫存數量": 262.00,
           "平均成本": 214.41,
+          "圖片": None,
+          "商品型態": "1",
       },
       {
           "倉庫名稱": "食品廠鳳仁倉",
@@ -344,6 +381,8 @@ def get_mock_data():
           "單位": "罐",
           "庫存數量": 258.00,
           "平均成本": 90.50,
+          "圖片": None,
+          "商品型態": "1",
       },
       {
           "倉庫名稱": "永福倉",
@@ -353,6 +392,8 @@ def get_mock_data():
           "單位": "公斤",
           "庫存數量": 500.00,
           "平均成本": 150.00,
+          "圖片": None,
+          "商品型態": "1",
       },
       {
           "倉庫名稱": "小琉球現場",
@@ -362,37 +403,17 @@ def get_mock_data():
           "單位": "組",
           "庫存數量": 45.00,
           "平均成本": 680.00,
+          "圖片": None,
+          "商品型態": "2",
       },
   ])
 
 
-def get_mock_bom_data(item_id):
-  """BOM（商品組合）範例資料，待確認 A1 正式 API 端點後即可自動改為即時資料"""
-  return [
-      {"組成品號": "011102000001", "組成品名": "原料_干貝散裝", "用量": 0.05, "單位": "公斤"},
-      {"組成品號": "011101180002", "組成品名": "醬料_飛魚卵XO醬", "用量": 1, "單位": "罐"},
-  ]
-
-
-def fetch_item_bom(token, item_id):
-  """查詢單一商品的 BOM（組合品用量明細）
-
-  TODO：目前「鼎新 A1 商務應用雲 POS API 串接手冊」中 BOM／商品組合對應的
-  正式端點尚待確認，此處先以常見 RESTful 慣例試打 /Items/{ItemID}/BOM。
-  正式串接前請對照手冊確認實際路徑與回傳欄位名稱（常見命名如 ItemBOM、
-  Combination、ItemComponents 等），呼叫失敗時頁面會自動退回範例資料。
-  """
-  url = f"{A1_BASE_URL}/Items/{item_id}/BOM"
-  headers = {"Authorization": token}
-  try:
-    response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-    if response.status_code == 200:
-      data = response.json()
-      rows = data if isinstance(data, list) else data.get("Data", []) if isinstance(data, dict) else []
-      return True, rows
-    return False, f"[{response.status_code}] {response.text}"
-  except requests.exceptions.RequestException as e:
-    return False, str(e)
+ITEM_TYPE_LABELS = {
+    "1": "一般商品",
+    "2": "組合品-先組合再銷售",
+    "3": "組合品-先銷售自動組合",
+}
 
 
 # -------------------------------------------------------------------------
@@ -406,9 +427,10 @@ ACTIVE_COMPANY_LABEL = "海濤客食品工業(股)公司"
 
 
 # 初始化全域狀態
-initial_df, initial_whs, initial_cats = fetch_all_a1_inventory()
+initial_df, initial_whs, initial_cats, initial_items_map = fetch_all_a1_inventory()
 app_state = {
     "df": initial_df,
+    "items_map": initial_items_map,
     "warehouses": (
         initial_whs
         if initial_whs
@@ -488,8 +510,9 @@ def inventory_dashboard():
       refs = {}
 
       def handle_sync():
-        df, whs, cats = fetch_all_a1_inventory()
+        df, whs, cats, items_map = fetch_all_a1_inventory()
         app_state["df"] = df
+        app_state["items_map"] = items_map
         if whs:
           app_state["warehouses"] = whs
         if cats:
@@ -511,6 +534,8 @@ def inventory_dashboard():
           refs["update_inventory_table"]()
         if "update_products_grid" in refs:
           refs["update_products_grid"]()
+        if "update_combo_list" in refs:
+          refs["update_combo_list"]()
 
       with ui.column().classes("w-full p-8 max-w-[1600px] mx-auto"):
         with ui.row().classes("w-full items-center justify-between mb-4"):
@@ -524,7 +549,7 @@ def inventory_dashboard():
         with ui.tabs().classes("w-full") as page_tabs:
           tab_products = ui.tab("商品資料")
           tab_inventory = ui.tab("倉庫即時庫存總表")
-          tab_bom = ui.tab("BOM表（商品組合）")
+          tab_bom = ui.tab("商品組合資訊")
 
         with ui.tab_panels(page_tabs, value=tab_products).classes(
             "w-full bg-transparent"
@@ -564,14 +589,20 @@ def inventory_dashboard():
                     )
                   return
 
+                # 舊資料（或防呆資料）可能沒有「圖片」欄位，這裡先補上避免
+                # groupby 時噴錯
+                if "圖片" not in df.columns:
+                  df["圖片"] = None
+
                 # 依品號彙整（同一品號在不同倉庫的庫存加總，
-                # 品名/分類/單位/平均成本取第一筆即可，均來自商品主檔）
+                # 品名/分類/單位/平均成本/圖片取第一筆即可，均來自商品主檔）
                 catalog = df.groupby("品號", as_index=False).agg({
                     "品名": "first",
                     "商品分類": "first",
                     "單位": "first",
                     "平均成本": "first",
                     "庫存數量": "sum",
+                    "圖片": "first",
                 })
 
                 if (
@@ -601,17 +632,23 @@ def inventory_dashboard():
                         "w-56 p-4 bg-white border border-[#e2e1dc]"
                         " shadow-none rounded-none"
                     ):
-                      # 目前 A1 商品明細（Items/{ID}）未回傳圖片欄位，
-                      # 這裡先以品名首字當作預留圖示，待確認 A1 是否有
-                      # 圖片欄位、或改由人工上傳商品照片後再替換。
+                      # 依手冊 ItemImage[Get] 抓取的商品圖片（已轉成 base64
+                      # data URI）；沒有上傳過圖片的商品，改用品名首字當
+                      # 預留圖示。
+                      image_uri = row.get("圖片")
                       with ui.row().classes(
                           "w-full items-center justify-center mb-2"
                       ):
-                        ui.label(initial).classes(
-                            "w-14 h-14 flex items-center justify-center"
-                            " rounded-full bg-[#5bc0be] text-white text-xl"
-                            " font-black"
-                        )
+                        if image_uri:
+                          ui.image(image_uri).classes(
+                              "w-14 h-14 rounded-full object-cover"
+                          )
+                        else:
+                          ui.label(initial).classes(
+                              "w-14 h-14 flex items-center justify-center"
+                              " rounded-full bg-[#5bc0be] text-white text-xl"
+                              " font-black"
+                          )
                       ui.label(item_name).classes(
                           "text-sm font-bold text-zinc-900 text-center"
                           " w-full truncate"
@@ -810,82 +847,110 @@ def inventory_dashboard():
               refs["cat_select"] = cat_select
               refs["update_inventory_table"] = update_inventory_table
 
-          # ---------------- 頁籤 3：BOM表（商品組合） ----------------
+          # ---------------- 頁籤 3：商品組合資訊 ----------------
+          # 手冊 1.0.35 全文查過一遍，Items[Get] 只回傳「商品型態」
+          # （1.一般商品 2.組合品-先組合再銷售 3.組合品-先銷售自動組合），
+          # 並沒有提供組成品/用量明細的查詢端點（BOM）。所以這裡誠實地
+          # 只列出「哪些品號是組合品、屬於哪一種組合型態」，無法顯示組成
+          # 用量——如需組成明細，需要另外確認鼎新是否有其他端點，或請
+          # A1 後台人員手動提供。
           with ui.tab_panel(tab_bom):
             with ui.card().classes(
                 "w-full p-6 bg-white border border-[#e2e1dc] shadow-none"
                 " rounded-none"
             ):
-              ui.label("查詢商品的 BOM（組合品用量明細）").classes(
-                  "text-sm font-bold text-zinc-700 mb-3"
+              ui.label("商品組合資訊").classes(
+                  "text-lg font-bold text-zinc-900 tracking-wide mb-2"
               )
+              with ui.row().classes(
+                  "w-full p-3 mb-4 bg-[#fff8e6] border border-[#f0dca0]"
+              ):
+                ui.label(
+                    "⚠ 依「鼎新 A1 POS API 串接手冊」1.0.35 版，Items[Get] "
+                    "僅回傳商品型態（是否為組合品），並未提供組成品／用量"
+                    "明細的查詢端點。下表僅能列出被標記為組合品的品號，"
+                    "無法顯示其組成用量；如需完整 BOM 明細，需另洽鼎新確認"
+                    "是否有其他端點，或於 A1 後台人工查看。"
+                ).classes("text-xs text-amber-800")
 
               with ui.row().classes("items-center gap-3 flex-wrap mb-2"):
-                bom_item_options = {
-                    f"{row['品號']}｜{row['品名']}": row["品號"]
-                    for row in app_state["df"]
-                    .drop_duplicates("品號")
-                    .to_dict("records")
-                }
-                bom_select = ui.select(
-                    options=list(bom_item_options.keys()),
-                    with_input=True,
-                    label="選擇商品",
-                ).classes("w-96 text-xs")
+                combo_search_input = ui.input(
+                    placeholder="輸入品號或品名關鍵字..."
+                ).classes("w-64 text-xs")
 
-                def handle_query_bom():
-                  if not bom_select.value:
-                    ui.notify("請先選擇商品", color="warning")
-                    return
-                  item_id = bom_item_options.get(bom_select.value)
-                  token = get_a1_token()
-                  bom_rows = None
-                  if token:
-                    ok, data = fetch_item_bom(token, item_id)
-                    if ok and data:
-                      bom_rows = data
+              combo_stats_label = ui.label().classes(
+                  "text-xs text-zinc-500 mb-3"
+              )
+              combo_table_container = ui.column().classes("w-full")
 
-                  if not bom_rows:
-                    bom_rows = get_mock_bom_data(item_id)
-                    bom_result_label.text = (
-                        "（尚未取得 A1 正式 BOM 資料，以下為範例資料，"
-                        "待確認 API 端點後將自動改為即時資料）"
-                    )
+              def update_combo_list():
+                combo_table_container.clear()
+                items_map = app_state.get("items_map", {})
+
+                combo_rows = [
+                    {
+                        "品號": item_id,
+                        "品名": info.get("Name"),
+                        "商品分類": info.get("CategoryName", "未分類"),
+                        "商品型態": ITEM_TYPE_LABELS.get(
+                            str(info.get("Type")), str(info.get("Type"))
+                        ),
+                    }
+                    for item_id, info in items_map.items()
+                    if str(info.get("Type")) in ("2", "3")
+                ]
+
+                keyword = (combo_search_input.value or "").strip()
+                if keyword:
+                  combo_rows = [
+                      r
+                      for r in combo_rows
+                      if keyword.lower() in str(r["品號"]).lower()
+                      or keyword.lower() in str(r["品名"]).lower()
+                  ]
+
+                combo_stats_label.text = f"共 {len(combo_rows)} 項組合品"
+
+                with combo_table_container:
+                  if not combo_rows:
+                    ui.label(
+                        "目前沒有標記為組合品的商品，或尚未同步商品資料"
+                    ).classes("text-xs text-zinc-400")
                   else:
-                    bom_result_label.text = (
-                        f"A1 即時 BOM 資料，共 {len(bom_rows)} 筆組成"
-                    )
-
-                  bom_table_container.clear()
-                  with bom_table_container:
                     ui.table(
                         columns=[
                             {
-                                "name": "組成品號",
-                                "label": "組成品號",
-                                "field": "組成品號",
+                                "name": "品號",
+                                "label": "品號",
+                                "field": "品號",
                                 "align": "left",
                             },
                             {
-                                "name": "組成品名",
-                                "label": "組成品名",
-                                "field": "組成品名",
+                                "name": "品名",
+                                "label": "品名",
+                                "field": "品名",
                                 "align": "left",
                             },
-                            {"name": "用量", "label": "用量", "field": "用量"},
-                            {"name": "單位", "label": "單位", "field": "單位"},
+                            {
+                                "name": "商品分類",
+                                "label": "商品分類",
+                                "field": "商品分類",
+                                "align": "left",
+                            },
+                            {
+                                "name": "商品型態",
+                                "label": "商品型態",
+                                "field": "商品型態",
+                                "align": "left",
+                            },
                         ],
-                        rows=bom_rows,
+                        rows=combo_rows,
                     ).classes("w-full")
 
-                ui.button("查詢 BOM", on_click=handle_query_bom).classes(
-                    "sync-btn px-3 py-1 text-xs rounded-none"
-                )
+              combo_search_input.on_value_change(lambda e: update_combo_list())
+              update_combo_list()
 
-              bom_result_label = ui.label().classes(
-                  "text-xs text-zinc-500 mb-3"
-              )
-              bom_table_container = ui.column().classes("w-full")
+              refs["update_combo_list"] = update_combo_list
 
   def handle_company_change(e):
     selected = e.value
