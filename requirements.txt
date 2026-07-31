@@ -1,5 +1,4 @@
 nicegui
 pandas
-plotly
-gspread
-google-auth
+requests
+python-dotenv

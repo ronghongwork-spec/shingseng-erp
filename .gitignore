@@ -1,0 +1,13 @@
+# 環境變數 / 金鑰，絕對不要上傳
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store
