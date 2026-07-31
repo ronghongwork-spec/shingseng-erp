@@ -1,3 +1,3 @@
 git add .
-git commit -m "新增銷售Q1分析"
+git commit -m "新增庫存表"
 git push
