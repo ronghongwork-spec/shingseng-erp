@@ -1,17 +1,14 @@
 from datetime import datetime
 from nicegui import ui
 import pandas as pd
-import plotly.express as px
 import requests
 
 # -------------------------------------------------------------------------
 # 1. 鼎新 A1 API 串接與全量資料自動抓取
 # -------------------------------------------------------------------------
-A1_BASE_URL = "http://a1external.digiwin.com"  # 鼎新 A1 外部 API 根目錄
-API_KEY = "YOUR_A1_API_KEY"  # 請填入您的 A1 API Key
-API_SECRET = "YOUR_A1_API_SECRET"  # 請填入您的 A1 密碼或憑證
+A1_BASE_URL = "http://a1external.digiwin.com"
+API_KEY = "YOUR_A1_API_KEY"
 
-# 依據您截圖中的實際倉庫列表
 WAREHOUSES = [
     {"id": "WH01", "name": "食品廠鳳仁倉"},
     {"id": "WH02", "name": "即期品/報廢倉"},
@@ -22,7 +19,6 @@ WAREHOUSES = [
     {"id": "WH07", "name": "供應商-耗材倉"},
 ]
 
-# 依據您截圖中的實際商品分類列表
 CATEGORIES = [
     "(海濤客)_成品11",
     "(海濤客)_原料21",
@@ -46,26 +42,12 @@ def fetch_all_a1_inventory():
   for wh in WAREHOUSES:
     for cat in CATEGORIES:
       try:
-        # 依照鼎新 A1 實際帶入倉庫與分類的 API 端點與參數進行請求
-        # endpoint = f"{A1_BASE_URL}/api/Inventory/GetStock?warehouse={wh['id']}&category={cat}"
-        # response = requests.get(endpoint, headers=headers, timeout=10)
-        # if response.status_code == 200:
-        #     items = response.json()
-        #     for item in items:
-        #         all_data.append({
-        #             "倉庫名稱": wh["name"],
-        #             "商品分類": cat,
-        #             "品號": item.get("productNo"),
-        #             "品名": item.get("productName"),
-        #             "單位": item.get("unit"),
-        #             "庫存數量": item.get("quantity", 0),
-        #             "平均成本": item.get("avgCost", 0)
-        #         })
+        # 實際串接時請在此處發送 API 請求
         pass
       except Exception as e:
         print(f"抓取倉庫 {wh['name']} 分類 {cat} 失敗: {e}")
 
-  # 若 API 尚未正式連線，此處帶入符合您截圖結構的多倉與多分類防呆測試數據
+  # 測試防呆數據
   if not all_data:
     all_data = [
         {
@@ -109,11 +91,11 @@ def fetch_all_a1_inventory():
   return pd.DataFrame(all_data)
 
 
-# 初始化取得全量數據
-df_inventory_global = fetch_all_a1_inventory()
+# 建立全域狀態物件存放 DataFrame
+app_state = {"df": fetch_all_a1_inventory()}
 
 # -------------------------------------------------------------------------
-# 2. NiceGUI 網頁介面設計 (支援多倉切換、分類過濾、關鍵字即時搜尋)
+# 2. NiceGUI 網頁介面設計
 # -------------------------------------------------------------------------
 
 
@@ -129,6 +111,11 @@ def inventory_dashboard():
         </style>
     """)
 
+  def handle_sync():
+    app_state["df"] = fetch_all_a1_inventory()
+    ui.notify("已成功從鼎新 A1 API 抓取所有倉庫與分類資料！", color="positive")
+    update_table()
+
   with ui.row().classes(
       "w-full items-center justify-between bg-white border-b border-[#e2e1dc]"
       " px-8 py-4 sticky top-0 z-50"
@@ -136,24 +123,14 @@ def inventory_dashboard():
     ui.label("興聖集團｜A1 智慧庫存總管理系統").classes(
         "text-base font-black tracking-wider"
     )
-    ui.button(
-        "同步 A1 最新庫存",
-        on_click=lambda: (
-            global_df.setVal(fetch_all_a1_inventory()),
-            ui.notify("已成功從鼎新 A1 API 抓取所有倉庫與分類資料！", color="positive"),
-            update_table(),
-        ),
-    ).classes("sync-btn px-4 py-2 text-xs rounded-none")
-
-  # 用來儲存全域 DataFrame 的容器
-  global_df = ui.label().classes("hidden")
-  global_df.setVal(df_inventory_global)
+    ui.button("同步 A1 最新庫存", on_click=handle_sync).classes(
+        "sync-btn px-4 py-2 text-xs rounded-none"
+    )
 
   with ui.column().classes("w-full p-8 max-w-[1600px] mx-auto"):
     with ui.card().classes(
         "w-full p-6 bg-white border border-[#e2e1dc] shadow-none rounded-none"
     ):
-      # 上方控制列：倉庫切換、商品分類過濾、關鍵字搜尋
       with ui.row().classes(
           "w-full items-center justify-between mb-6 gap-4 flex-wrap"
       ):
@@ -162,21 +139,18 @@ def inventory_dashboard():
         )
 
         with ui.row().classes("items-center gap-3 flex-wrap"):
-          # 倉庫下拉選單 (抓取所有倉庫)
           wh_options = ["全部倉庫"] + [w["name"] for w in WAREHOUSES]
           wh_select = ui.select(options=wh_options, value="全部倉庫").classes(
               "bg-[#f7f6f2] text-zinc-900 rounded-none px-3 py-1 text-xs"
               " font-bold border border-[#e2e1dc]"
           )
 
-          # 商品分類下拉選單 (抓取所有分類)
           cat_options = ["全部分類"] + CATEGORIES
           cat_select = ui.select(options=cat_options, value="全部分類").classes(
               "bg-[#f7f6f2] text-zinc-900 rounded-none px-3 py-1 text-xs"
               " font-bold border border-[#e2e1dc]"
           )
 
-          # 關鍵字搜尋輸入框
           search_input = ui.input(
               placeholder="輸入品號或品名關鍵字..."
           ).classes("w-64 text-xs")
@@ -185,7 +159,7 @@ def inventory_dashboard():
 
       def update_table():
         table_container.clear()
-        df = global_df.value.copy()
+        df = app_state["df"].copy()
 
         # 1. 倉庫篩選
         if wh_select.value and wh_select.value != "全部倉庫":
@@ -195,7 +169,7 @@ def inventory_dashboard():
         if cat_select.value and cat_select.value != "全部分類":
           df = df[df["商品分類"] == cat_select.value]
 
-        # 3. 關鍵字搜尋 (同時比對品號與品名)
+        # 3. 關鍵字搜尋
         keyword = search_input.value.strip()
         if keyword:
           mask = df["品號"].astype(str).str.contains(
@@ -247,12 +221,10 @@ def inventory_dashboard():
               rows=df.to_dict("records"),
           ).classes("w-full")
 
-      # 綁定事件：當選單或搜尋框變動時即時更新表格
       wh_select.on_value_change(lambda e: update_table())
       cat_select.on_value_change(lambda e: update_table())
       search_input.on_value_change(lambda e: update_table())
 
-      # 初始化載入表格
       update_table()
 
 
