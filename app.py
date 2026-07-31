@@ -158,10 +158,13 @@ def fetch_items_map(token):
 
 
 def fetch_all_a1_inventory():
-  """透過 StockBatch API 分頁完整抓取所有商品在各倉庫的庫存資料
+  """透過 StockBatch API，逐倉庫分頁完整抓取所有商品在各倉庫的庫存資料
 
-  手冊 StockBatch[Post]：每頁固定 100 筆（依 品號+倉庫 組合計算），
-  不傳 StartItemID/EndItemID/ItemIDs/WarehouseName 即代表查全部品號、全部倉庫。
+  手冊 StockBatch[Post]：每頁固定 100 筆（依 品號+倉庫 組合計算）。
+  實測發現：不傳 WarehouseName、一次查「全部倉庫」時，分頁的 More 旗標
+  會提前變成 false，導致漏抓後面倉庫的資料。因此改為依 Warehouses[Get]
+  拿到的倉庫清單，逐一倉庫帶入 WarehouseName 分開查詢並各自分頁到底，
+  再合併結果，確保每個倉庫都有查好查滿。
   Response 為 {"Data": [...], "More": bool}，More=true 代表還有下一頁。
   """
   token = get_a1_token()
@@ -179,57 +182,80 @@ def fetch_all_a1_inventory():
   categories_map = fetch_categories(token)
   items_map = fetch_items_map(token)
 
-  all_stock_data = []
-  pagination = 1
-  more_data = True
-
-  # 使用 StockBatch 分頁迴圈抓取全部庫存（含安全上限，避免 More 異常造成無窮迴圈）
-  while more_data and pagination <= MAX_STOCK_PAGES:
+  def fetch_stock_rows(warehouse_name=None):
+    """對單一倉庫（或不指定倉庫）完整分頁抓取 StockBatch 原始資料列"""
     url = f"{A1_BASE_URL}/Stock/Batch"
-    payload = {"Pagination": pagination}
+    rows_collected = []
+    pagination = 1
+    more_data = True
 
-    try:
-      response = requests.post(
-          url, json=payload, headers=headers, timeout=REQUEST_TIMEOUT
-      )
-      if response.status_code == 200:
-        res_json = response.json()
-        # 實際回傳結構依手冊為主，通常包在 Data 欄位中
-        rows = res_json if isinstance(res_json, list) else res_json.get("Data", [])
+    while more_data and pagination <= MAX_STOCK_PAGES:
+      payload = {"Pagination": pagination}
+      if warehouse_name:
+        payload["WarehouseName"] = warehouse_name
 
-        for row in rows:
-          item_id = row.get("ItemID")
-          item_info = items_map.get(item_id, {})
-
-          cat_id = item_info.get("CategoryID")
-          cat_name = categories_map.get(str(cat_id), "未分類")
-
-          all_stock_data.append({
-              "倉庫名稱": row.get("WarehouseName"),
-              "商品分類": cat_name,
-              "品號": item_id,
-              "品名": row.get("ItemName") or item_info.get("Name"),
-              "單位": item_info.get("UnitName", "個"),
-              "庫存數量": row.get("Qty", 0.0),
-              "平均成本": item_info.get("StdPurPrice", 0.0),
-          })
-
-        print(f"StockBatch 第 {pagination} 頁抓取完成，累計 {len(all_stock_data)} 筆")
-
-        # 檢查是否還有下一頁（根據手冊 StockBatch 回傳格式）
-        more_data = (
-            res_json.get("More", False) if isinstance(res_json, dict) else False
+      try:
+        response = requests.post(
+            url, json=payload, headers=headers, timeout=REQUEST_TIMEOUT
         )
-        pagination += 1
-      else:
-        print(f"StockBatch 抓取失敗 [{response.status_code}]: {response.text}")
-        break
-    except requests.exceptions.RequestException as e:
-      print(f"StockBatch 請求異常: {e}")
-      break
+        if response.status_code == 200:
+          res_json = response.json()
+          rows = (
+              res_json if isinstance(res_json, list) else res_json.get("Data", [])
+          )
+          rows_collected.extend(rows)
 
-  if pagination > MAX_STOCK_PAGES:
-    print(f"警告：StockBatch 已達分頁安全上限 {MAX_STOCK_PAGES} 頁，資料可能未抓取完整")
+          more_data = (
+              res_json.get("More", False) if isinstance(res_json, dict) else False
+          )
+          pagination += 1
+        else:
+          print(
+              f"StockBatch 抓取失敗 [{warehouse_name or '全部倉庫'}]"
+              f" [{response.status_code}]: {response.text}"
+          )
+          break
+      except requests.exceptions.RequestException as e:
+        print(f"StockBatch 請求異常 [{warehouse_name or '全部倉庫'}]: {e}")
+        break
+
+    if pagination > MAX_STOCK_PAGES:
+      print(
+          f"警告：StockBatch [{warehouse_name or '全部倉庫'}]"
+          f" 已達分頁安全上限 {MAX_STOCK_PAGES} 頁，資料可能未抓取完整"
+      )
+
+    return rows_collected
+
+  raw_rows = []
+  if warehouses:
+    # 逐倉庫分開查，避免「全部倉庫一次查」時分頁提前中斷漏資料
+    for wh_name in warehouses:
+      wh_rows = fetch_stock_rows(warehouse_name=wh_name)
+      print(f"StockBatch [{wh_name}] 抓取完成，共 {len(wh_rows)} 筆")
+      raw_rows.extend(wh_rows)
+  else:
+    # 沒抓到倉庫清單時，退回原本「不分倉庫」的查詢方式
+    print("警告：未取得倉庫清單，改用不分倉庫的方式查詢 StockBatch")
+    raw_rows = fetch_stock_rows()
+
+  all_stock_data = []
+  for row in raw_rows:
+    item_id = row.get("ItemID")
+    item_info = items_map.get(item_id, {})
+
+    cat_id = item_info.get("CategoryID")
+    cat_name = categories_map.get(str(cat_id), "未分類")
+
+    all_stock_data.append({
+        "倉庫名稱": row.get("WarehouseName"),
+        "商品分類": cat_name,
+        "品號": item_id,
+        "品名": row.get("ItemName") or item_info.get("Name"),
+        "單位": item_info.get("UnitName", "個"),
+        "庫存數量": row.get("Qty", 0.0),
+        "平均成本": item_info.get("StdPurPrice", 0.0),
+    })
 
   # 手冊備註：StockBatch「若商品為新建，未在任何倉庫中有異動，則不會回傳」，
   # 這代表組合品（尤其是[先銷售自動組合]這種不佔實體庫存的類型）很可能完全不會
@@ -417,11 +443,14 @@ def inventory_dashboard():
               placeholder="輸入品號或品名關鍵字..."
           ).classes("w-64 text-xs")
 
+      stats_label = ui.label().classes("text-xs text-zinc-500 mb-3")
+
       table_container = ui.column().classes("w-full")
 
       def update_table():
         table_container.clear()
         df = app_state["df"].copy()
+        total_before_filters = len(df)
 
         # 1. 倉庫篩選
         if wh_select.value and wh_select.value != "全部倉庫":
@@ -442,7 +471,16 @@ def inventory_dashboard():
           df = df[mask]
 
         # 4. 庫存數量篩選：0 不顯示，負數（超賣/盤差）要顯示
+        before_qty_filter = len(df)
         df = df[df["庫存數量"] != 0]
+        hidden_zero_count = before_qty_filter - len(df)
+
+        stats_label.text = (
+            f"同步資料共 {total_before_filters} 列（品號 x 倉庫）｜"
+            f"符合篩選條件 {before_qty_filter} 列｜"
+            f"其中庫存為 0 已隱藏 {hidden_zero_count} 列｜"
+            f"目前顯示 {len(df)} 列"
+        )
 
         with table_container:
           ui.table(
