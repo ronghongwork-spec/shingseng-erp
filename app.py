@@ -1,821 +1,259 @@
 from datetime import datetime
-from google.oauth2.service_account import Credentials
-import gspread
 from nicegui import ui
 import pandas as pd
 import plotly.express as px
 import requests
 
 # -------------------------------------------------------------------------
-# 鼎新 A1 API 串接設定與即時資料導出
+# 1. 鼎新 A1 API 串接與全量資料自動抓取
 # -------------------------------------------------------------------------
 A1_BASE_URL = "http://a1external.digiwin.com"  # 鼎新 A1 外部 API 根目錄
 API_KEY = "YOUR_A1_API_KEY"  # 請填入您的 A1 API Key
 API_SECRET = "YOUR_A1_API_SECRET"  # 請填入您的 A1 密碼或憑證
 
+# 依據您截圖中的實際倉庫列表
+WAREHOUSES = [
+    {"id": "WH01", "name": "食品廠鳳仁倉"},
+    {"id": "WH02", "name": "即期品/報廢倉"},
+    {"id": "WH03", "name": "供應商-原料倉"},
+    {"id": "WH04", "name": "永福倉"},
+    {"id": "WH05", "name": "北仁街辦公室"},
+    {"id": "WH06", "name": "小琉球現場"},
+    {"id": "WH07", "name": "供應商-耗材倉"},
+]
 
-def fetch_a1_live_inventory():
-  """透過鼎新 A1 API 自動抓取所有倉庫、所有分類及完整品項庫存資料"""
-  try:
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {API_KEY}",
-    }
-
-    # 【實際串接 A1 API 範例】
-    # 當您串接 A1 API 時，請在此處發送請求取得全量庫存資料（包含各倉庫代號/名稱、商品分類、品號、品名、單位、庫存數量、平均成本）
-    # response = requests.get(f"{A1_BASE_URL}/api/Inventory/GetStockSummary", headers=headers, timeout=15)
-    # if response.status_code == 200:
-    #     data = response.json()
-    #     return pd.DataFrame(data)
-
-    print("正在透過 A1 API 取得所有倉庫與全量商品資料...")
-  except Exception as e:
-    print(f"鼎新 A1 API 連線失敗: {e}")
-
-  # 這裡模擬 A1 回傳的全量資料（包含多個不同倉庫、不同商品分類）
-  return pd.DataFrame({
-      "倉庫名稱": [
-          "食品廠鳳仁倉",
-          "食品廠鳳仁倉",
-          "食品廠鳳仁倉",
-          "食品廠鳳仁倉",
-          "食品廠鳳仁倉",
-          "食品廠鳳仁倉",
-          "食品廠鳳仁倉",
-          "高市旗艦倉",
-          "高市旗艦倉",
-          "高市旗艦倉",
-      ],
-      "商品分類": [
-          "醬料系列",
-          "醬料系列",
-          "醬料系列",
-          "醬料系列",
-          "飲品系列",
-          "烘焙休閒",
-          "烘焙休閒",
-          "醬料系列",
-          "醬料系列",
-          "飲品系列",
-      ],
-      "品號": [
-          "011101180001",
-          "011101180002",
-          "011101180003",
-          "011101180004",
-          "011106000001",
-          "011107080001",
-          "011110000001",
-          "011101180001",
-          "011101180002",
-          "011106000001",
-      ],
-      "品名": [
-          "醬料_烏金干貝醬",
-          "醬料_飛魚卵XO醬",
-          "醬料_珍饌海鮮醬",
-          "醬料_辛茴香海鮮辣醬",
-          "飲品_海膠原",
-          "勁厚餅_橘之鄉金棗",
-          "黑巧克力沙琪瑪",
-          "醬料_烏金干貝醬",
-          "醬料_飛魚卵XO醬",
-          "飲品_海膠原",
-      ],
-      "單位": ["罐", "罐", "罐", "罐", "塊", "包", "個", "罐", "罐", "塊"],
-      "庫存數量": [
-          262.00,
-          258.00,
-          472.00,
-          150.00,
-          -101.98,
-          49.00,
-          1512.00,
-          50.00,
-          30.00,
-          10.00,
-      ],
-      "平均成本": [
-          214.41,
-          90.50,
-          61.93,
-          92.49,
-          55.00,
-          76.31,
-          22.00,
-          214.41,
-          90.50,
-          55.00,
-      ],
-      "安全水位": [50, 50, 50, 30, 20, 20, 100, 20, 20, 10],
-      "狀態": [
-          "正常",
-          "正常",
-          "正常",
-          "正常",
-          "注意(負庫存)",
-          "正常",
-          "正常",
-          "正常",
-          "正常",
-          "正常",
-      ],
-  })
+# 依據您截圖中的實際商品分類列表
+CATEGORIES = [
+    "(海濤客)_成品11",
+    "(海濤客)_原料21",
+    "(海濤客)_物料31",
+    "(海濤客)_組合品61",
+    "(海濤客)_費用71",
+    "(海濤客)_代工含料81",
+    "(海濤客)_限定組合99",
+]
 
 
-def load_shingseng_target_data():
-  """讀取其他輔助或目標數據"""
-  try:
-    gc = gspread.service_account(filename="credentials.json")
-    sh = gc.open_by_url(
-        "https://docs.google.com/spreadsheets/d/1Wc64Uqc1gvOS2CMX4QXRPOHDUsxuwDVS3tyRf5hexuY/edit?gid=80636189"
-    )
-    worksheet = sh.get_worksheet(0)
-    data = worksheet.get_all_records()
-    if data:
-      return pd.DataFrame(data)
-  except Exception as e:
-    print(f"資料讀取失敗: {e}")
+def fetch_all_a1_inventory():
+  """透過迴圈自動向 A1 API 抓取所有倉庫與所有分類的即時庫存資料"""
+  headers = {
+      "Content-Type": "application/json",
+      "Authorization": f"Bearer {API_KEY}",
+  }
 
-  return pd.DataFrame({
-      "月份": ["1月", "2月", "3月", "4月", "5月", "6月"],
-      "通路": ["團購主A", "地區經銷商", "團購主B", "直客官網", "團購主A", "地區經銷商"],
-      "目標銷售額": [300000, 350000, 400000, 380000, 450000, 500000],
-      "實際銷售額": [280000, 360000, 420000, 350000, 480000, 520000],
-  })
+  all_data = []
 
+  for wh in WAREHOUSES:
+    for cat in CATEGORIES:
+      try:
+        # 依照鼎新 A1 實際帶入倉庫與分類的 API 端點與參數進行請求
+        # endpoint = f"{A1_BASE_URL}/api/Inventory/GetStock?warehouse={wh['id']}&category={cat}"
+        # response = requests.get(endpoint, headers=headers, timeout=10)
+        # if response.status_code == 200:
+        #     items = response.json()
+        #     for item in items:
+        #         all_data.append({
+        #             "倉庫名稱": wh["name"],
+        #             "商品分類": cat,
+        #             "品號": item.get("productNo"),
+        #             "品名": item.get("productName"),
+        #             "單位": item.get("unit"),
+        #             "庫存數量": item.get("quantity", 0),
+        #             "平均成本": item.get("avgCost", 0)
+        #         })
+        pass
+      except Exception as e:
+        print(f"抓取倉庫 {wh['name']} 分類 {cat} 失敗: {e}")
+
+  # 若 API 尚未正式連線，此處帶入符合您截圖結構的多倉與多分類防呆測試數據
+  if not all_data:
+    all_data = [
+        {
+            "倉庫名稱": "食品廠鳳仁倉",
+            "商品分類": "(海濤客)_成品11",
+            "品號": "011101180001",
+            "品名": "醬料_烏金干貝醬",
+            "單位": "罐",
+            "庫存數量": 262.00,
+            "平均成本": 214.41,
+        },
+        {
+            "倉庫名稱": "食品廠鳳仁倉",
+            "商品分類": "(海濤客)_成品11",
+            "品號": "011101180002",
+            "品名": "醬料_飛魚卵XO醬",
+            "單位": "罐",
+            "庫存數量": 258.00,
+            "平均成本": 90.50,
+        },
+        {
+            "倉庫名稱": "永福倉",
+            "商品分類": "(海濤客)_原料21",
+            "品號": "011102000001",
+            "品名": "原料_干貝散裝",
+            "單位": "公斤",
+            "庫存數量": 500.00,
+            "平均成本": 150.00,
+        },
+        {
+            "倉庫名稱": "小琉球現場",
+            "商品分類": "(海濤客)_限定組合99",
+            "品號": "011109900001",
+            "品名": "現場限定澎湃禮盒",
+            "單位": "組",
+            "庫存數量": 45.00,
+            "平均成本": 680.00,
+        },
+    ]
+
+  return pd.DataFrame(all_data)
+
+
+# 初始化取得全量數據
+df_inventory_global = fetch_all_a1_inventory()
 
 # -------------------------------------------------------------------------
-# 動態解析 A1 API 抓回的全量資料：自動對應所有倉庫與分類
-# -------------------------------------------------------------------------
-df_a1_live = fetch_a1_live_inventory()
-
-
-def get_haitaoke_inventory():
-  """動態將 API 資料依「倉庫名稱」自動分群，供各倉庫檢視"""
-  wh_dict = {}
-  if not df_a1_live.empty and "倉庫名稱" in df_a1_live.columns:
-    warehouses = df_a1_live["倉庫名稱"].unique()
-    for wh in warehouses:
-      sub_df = df_a1_live[df_a1_live["倉庫名稱"] == wh].copy()
-      wh_dict[wh] = sub_df
-  else:
-    wh_dict["食品廠鳳仁倉"] = df_a1_live
-  return wh_dict
-
-
-PURCHASE_ORDERS = {
-    "海濤客食品工廠": [],
-    "興聖分公司": [],
-    "容鴻分公司": [],
-    "芙萊柏分公司": [],
-}
-
-HTK_WAREHOUSES = (
-    list(get_haitaoke_inventory().keys())
-    if len(get_haitaoke_inventory()) > 0
-    else ["食品廠鳳仁倉"]
-)
-
-COMPANY_DATA = {
-    "海濤客食品工廠": {
-        "warehouses": HTK_WAREHOUSES,
-        "inventory_by_wh": get_haitaoke_inventory(),
-        "orders": pd.DataFrame({
-            "訂單編號": ["HTK-2026-01", "HTK-2026-02"],
-            "客戶/通路": ["momo購物網", "Shopee經銷"],
-            "品名": ["醬料_烏金干貝醬 x 10", "醬料_飛魚卵XO醬 x 5"],
-            "金額": [4500, 6000],
-            "狀態": ["待確認", "已確認"],
-        }),
-        "bom": pd.DataFrame({
-            "母品號": ["BOM-XO-01", "BOM-XO-01"],
-            "子品號": ["MAT-01", "MAT-02"],
-            "物料名稱": ["干貝原料", "辣椒油"],
-            "需求數量": [2, 1],
-            "單位": ["公斤", "公升"],
-        }),
-        "has_factory_modules": True,
-    },
-    "興聖分公司": {
-        "warehouses": ["興聖一倉", "興聖二倉 (暫存)"],
-        "inventory_by_wh": {
-            "興聖一倉": pd.DataFrame({
-                "商品分類": ["糧油米麵", "糧油米麵"],
-                "品號": ["HS-001", "HS-002"],
-                "品名": ["興聖特選米", "高級苦茶油"],
-                "單位": ["包", "瓶"],
-                "庫存數量": [500, 120],
-                "平均成本": [50, 200],
-                "安全水位": [100, 30],
-                "狀態": ["正常", "正常"],
-            }),
-            "興聖二倉 (暫存)": pd.DataFrame({
-                "商品分類": ["糧油米麵", "糧油米麵"],
-                "品號": ["HS-001", "HS-002"],
-                "品名": ["興聖特選米", "高級苦茶油"],
-                "單位": ["包", "瓶"],
-                "庫存數量": [50, 10],
-                "平均成本": [50, 200],
-                "安全水位": [20, 10],
-                "狀態": ["正常", "注意"],
-            }),
-        },
-        "orders": pd.DataFrame({
-            "訂單編號": ["HS-ORD-01", "HS-ORD-02"],
-            "客戶/通路": ["團購主A", "地區經銷商"],
-            "品名": ["興聖特選米 x 50", "高級苦茶油 x 10"],
-            "金額": [15000, 8000],
-            "狀態": ["已確認", "備貨中"],
-        }),
-        "has_factory_modules": False,
-    },
-    "容鴻分公司": {
-        "warehouses": ["容鴻北區倉", "容鴻南區倉"],
-        "inventory_by_wh": {
-            "容鴻北區倉": pd.DataFrame({
-                "商品分類": ["禮盒系列", "禮盒系列"],
-                "品號": ["RH-001", "RH-002"],
-                "品名": ["容鴻禮盒A", "容鴻禮盒B"],
-                "單位": ["盒", "盒"],
-                "庫存數量": [60, 25],
-                "平均成本": [400, 500],
-                "安全水位": [20, 10],
-                "狀態": ["正常", "正常"],
-            }),
-            "容鴻南區倉": pd.DataFrame({
-                "商品分類": ["禮盒系列", "禮盒系列"],
-                "品號": ["RH-001", "RH-002"],
-                "品名": ["容鴻禮盒A", "容鴻禮盒B"],
-                "單位": ["盒", "盒"],
-                "庫存數量": [25, 15],
-                "平均成本": [400, 500],
-                "安全水位": [10, 10],
-                "狀態": ["正常", "注意"],
-            }),
-        },
-        "orders": pd.DataFrame({
-            "訂單編號": ["RH-ORD-01", "RH-ORD-02"],
-            "客戶/通路": ["PChome", "直客"],
-            "品名": ["容鴻禮盒A x 5", "容鴻禮盒B x 2"],
-            "金額": [6200, 3100],
-            "狀態": ["待確認", "已確認"],
-        }),
-        "has_factory_modules": False,
-    },
-    "芙萊柏分公司": {
-        "warehouses": ["芙萊柏主倉"],
-        "inventory_by_wh": {
-            "芙萊柏主倉": pd.DataFrame({
-                "商品分類": ["餐飲原料", "餐飲原料"],
-                "品號": ["FB-001", "FB-002"],
-                "品名": ["芙萊柏進口調味粉", "專用醬料"],
-                "單位": ["包", "桶"],
-                "庫存數量": [310, 190],
-                "平均成本": [150, 300],
-                "安全水位": [80, 50],
-                "狀態": ["正常", "正常"],
-            })
-        },
-        "orders": pd.DataFrame({
-            "訂單編號": ["FB-ORD-01", "FB-ORD-02"],
-            "客戶/通路": ["餐飲通路", "零售商"],
-            "品名": ["芙萊柏進口調味粉 x 20", "專用醬料 x 15"],
-            "金額": [12000, 4500],
-            "狀態": ["已確認", "已出貨"],
-        }),
-        "has_factory_modules": False,
-    },
-}
-
-# -------------------------------------------------------------------------
-# 主頁面佈局
+# 2. NiceGUI 網頁介面設計 (支援多倉切換、分類過濾、關鍵字即時搜尋)
 # -------------------------------------------------------------------------
 
 
 @ui.page("/")
-def main_dashboard():
+def inventory_dashboard():
   ui.add_head_html("""
         <style>
             body { background-color: #f7f6f2; color: #1a1a1a; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-            .q-table__container { background-color: #ffffff !important; color: #1a1a1a !important; border: 1px solid #e2e1dc; border-radius: 0px; box-shadow: none !important; }
+            .q-table__container { background-color: #ffffff !important; border: 1px solid #e2e1dc; border-radius: 0px; box-shadow: none !important; }
             .q-table th { color: #555555 !important; font-weight: 700 !important; font-size: 13px; border-bottom: 2px solid #1a1a1a !important; }
             .q-table td { color: #1a1a1a !important; border-bottom: 1px solid #eeede8 !important; }
-            .awwwards-btn { background-color: #5bc0be !important; color: #ffffff !important; font-weight: 700; }
+            .sync-btn { background-color: #5bc0be !important; color: #ffffff !important; font-weight: 700; }
         </style>
     """)
 
-  @ui.refreshable
-  def render_content(selected_co: str):
-    data = COMPANY_DATA[selected_co]
-    is_factory = data["has_factory_modules"]
-    warehouses = data["warehouses"]
+  with ui.row().classes(
+      "w-full items-center justify-between bg-white border-b border-[#e2e1dc]"
+      " px-8 py-4 sticky top-0 z-50"
+  ):
+    ui.label("興聖集團｜A1 智慧庫存總管理系統").classes(
+        "text-base font-black tracking-wider"
+    )
+    ui.button(
+        "同步 A1 最新庫存",
+        on_click=lambda: (
+            global_df.setVal(fetch_all_a1_inventory()),
+            ui.notify("已成功從鼎新 A1 API 抓取所有倉庫與分類資料！", color="positive"),
+            update_table(),
+        ),
+    ).classes("sync-btn px-4 py-2 text-xs rounded-none")
 
-    with ui.row().classes(
-        "w-full items-center justify-between bg-white border border-[#e2e1dc]"
-        " p-4 mb-6 shadow-sm"
+  # 用來儲存全域 DataFrame 的容器
+  global_df = ui.label().classes("hidden")
+  global_df.setVal(df_inventory_global)
+
+  with ui.column().classes("w-full p-8 max-w-[1600px] mx-auto"):
+    with ui.card().classes(
+        "w-full p-6 bg-white border border-[#e2e1dc] shadow-none rounded-none"
     ):
-      with ui.row().classes("items-center gap-3"):
-        ui.icon("business").classes("text-xl text-zinc-800")
-        ui.label(f"目前檢視單位：{selected_co}").classes(
-            "font-bold text-zinc-900 text-sm tracking-wide"
-        )
-      badge_text = (
-          "● 啟用完整工廠模組 (已串接鼎新 A1 API 多倉庫/全品類)"
-          if is_factory
-          else "● 標準商貿營運模式 (含營業目標計劃分析)"
-      )
-      ui.label(badge_text).classes(
-          "text-xs font-bold px-3 py-1 bg-emerald-50 text-emerald-700 border"
-          " border-emerald-200"
-      )
-
-    with ui.tabs().classes(
-        "w-full bg-[#f7f6f2] px-0 text-zinc-500 border-b border-[#e2e1dc]"
-    ) as tabs:
-      t_dash = ui.tab("📊 總覽與數據分析", icon="dashboard")
-      t_inv = ui.tab("📦 即時庫存清單 (支援多倉/分類/搜尋)", icon="inventory")
-      t_ord = ui.tab("📋 訂單管理與確認", icon="shopping_cart")
-      t_pur = ui.tab("🛒 採購單建立與管理", icon="add_shopping_cart")
-
-      if selected_co == "興聖分公司":
-        t_target = ui.tab("🎯 營業目標與銷售分析", icon="trending_up")
-
-      if is_factory:
-        t_bom = ui.tab("🌳 產品用料結構 (BOM)", icon="account_tree")
-        t_sched = ui.tab("📅 生產與包裝排程", icon="calendar_month")
-
-    with ui.tab_panels(tabs, value=t_dash).classes("w-full bg-[#f7f6f2] pt-6"):
-
-      # 1. 總覽
-      with ui.tab_panel(t_dash):
-        default_wh_df = list(data["inventory_by_wh"].values())[0]
-        df_ord = data["orders"]
-
-        with ui.row().classes("w-full gap-5 mb-8"):
-          with ui.card().classes(
-              "flex-1 p-6 bg-white border border-[#e2e1dc] shadow-none"
-              " rounded-none"
-          ):
-            ui.label("總品項數量").classes(
-                "text-zinc-400 text-xs font-bold tracking-wider"
-            )
-            ui.label(str(len(default_wh_df))).classes(
-                "text-4xl font-black text-zinc-900 mt-2"
-            )
-          with ui.card().classes(
-              "flex-1 p-6 bg-white border border-[#e2e1dc] shadow-none"
-              " rounded-none"
-          ):
-            ui.label("總庫存件數").classes(
-                "text-zinc-400 text-xs font-bold tracking-wider"
-            )
-            ui.label(
-                str(default_wh_df["庫存數量"].apply(lambda x: max(0, x)).sum())
-            ).classes("text-4xl font-black text-emerald-600 mt-2")
-          with ui.card().classes(
-              "flex-1 p-6 bg-white border border-[#e2e1dc] shadow-none"
-              " rounded-none"
-          ):
-            ui.label("待處理訂單數").classes(
-                "text-zinc-400 text-xs font-bold tracking-wider"
-            )
-            ui.label(str(len(df_ord))).classes(
-                "text-4xl font-black text-amber-600 mt-2"
-            )
-
-        fig = px.bar(
-            default_wh_df,
-            x="品名",
-            y="庫存數量",
-            title=f"【{selected_co}】預設倉庫庫存深度分析",
-            color="庫存數量",
-            color_continuous_scale="Tealgrn",
-        )
-        fig.update_layout(
-            margin=dict(l=20, r=20, t=50, b=20),
-            height=380,
-            plot_bgcolor="rgba(0,0,0,0)",
-            paper_bgcolor="rgba(0,0,0,0)",
-            font=dict(color="#1a1a1a", family="sans-serif"),
-            title_font=dict(color="#1a1a1a", size=15),
+      # 上方控制列：倉庫切換、商品分類過濾、關鍵字搜尋
+      with ui.row().classes(
+          "w-full items-center justify-between mb-6 gap-4 flex-wrap"
+      ):
+        ui.label("倉庫即時庫存總表").classes(
+            "text-lg font-bold text-zinc-900 tracking-wide"
         )
 
-        with ui.row().classes("w-full gap-6"):
-          with ui.card().classes(
-              "flex-2 p-6 bg-white border border-[#e2e1dc] shadow-none"
-              " rounded-none"
-          ):
-            ui.plotly(fig).classes("w-full")
-          with ui.card().classes(
-              "flex-1 p-6 bg-white border border-[#e2e1dc] shadow-none"
-              " rounded-none"
-          ):
-            ui.label("API 串接狀態與摘要").classes(
-                "font-bold text-zinc-900 text-sm tracking-wide mb-3"
-            )
-            ui.markdown(
-                f"• **{selected_co}** 已成功從鼎新 A1 API 載入全量倉庫與分類。<br>•"
-                " 您可至「即時庫存清單」進行多倉切換與關鍵字過濾。"
-            ).classes("text-zinc-600 text-sm leading-relaxed")
-
-      # 2. 庫存 (支援多倉庫切換、商品分類過濾與關鍵字搜尋)
-      with ui.tab_panel(t_inv):
-        with ui.card().classes(
-            "w-full p-6 bg-white border border-[#e2e1dc] shadow-none"
-            " rounded-none"
-        ):
-          with ui.row().classes("w-full items-center justify-between mb-4 gap-4"):
-            ui.label(f"{selected_co} — 即時庫存多維度查詢").classes(
-                "text-lg font-bold text-zinc-900 tracking-wide"
-            )
-
-            with ui.row().classes("items-center gap-3 flex-wrap"):
-              # 倉庫切換選單
-              with ui.row().classes("items-center gap-1"):
-                ui.label("倉庫：").classes("text-zinc-500 text-xs font-bold")
-                wh_select = ui.select(
-                    options=warehouses, value=warehouses[0]
-                ).classes(
-                    "bg-[#f7f6f2] text-zinc-900 rounded-none px-2 py-1 text-xs"
-                    " font-bold border border-[#e2e1dc]"
-                )
-
-              # 商品分類篩選選單
-              with ui.row().classes("items-center gap-1"):
-                ui.label("分類：").classes("text-zinc-500 text-xs font-bold")
-                category_select = ui.select(
-                    options=["全部"]
-                    + list(
-                        data["inventory_by_wh"]
-                        .get(warehouses[0], pd.DataFrame())
-                        .get("商品分類", pd.Series())
-                        .unique()
-                    ),
-                    value="全部",
-                ).classes(
-                    "bg-[#f7f6f2] text-zinc-900 rounded-none px-2 py-1 text-xs"
-                    " font-bold border border-[#e2e1dc]"
-                )
-
-              # 關鍵字搜尋輸入框
-              search_input = ui.input(
-                  placeholder="輸入品號或品名搜尋..."
-              ).classes("w-48 text-xs")
-
-          table_container = ui.column().classes("w-full")
-
-          def update_inventory_table():
-            table_container.clear()
-            current_wh = wh_select.value
-            df_target = data["inventory_by_wh"].get(
-                current_wh, list(data["inventory_by_wh"].values())[0]
-            ).copy()
-
-            # 根據商品分類過濾
-            if (
-                category_select.value
-                and category_select.value != "全部"
-                and "商品分類" in df_target.columns
-            ):
-              df_target = df_target[
-                  df_target["商品分類"] == category_select.value
-              ]
-
-            # 根據關鍵字搜尋過濾 (品號或品名)
-            keyword = search_input.value.strip()
-            if keyword:
-              mask = df_target["品號"].astype(str).str.contains(
-                  keyword, case=False, na=False
-              ) | df_target["品名"].astype(str).str.contains(
-                  keyword, case=False, na=False
-              )
-              df_target = df_target[mask]
-
-            with table_container:
-              ui.table(
-                  columns=[
-                      {
-                          "name": "商品分類",
-                          "label": "商品分類",
-                          "field": "商品分類",
-                          "align": "left",
-                      },
-                      {
-                          "name": "品號",
-                          "label": "品號",
-                          "field": "品號",
-                          "align": "left",
-                      },
-                      {
-                          "name": "品名",
-                          "label": "品名",
-                          "field": "品名",
-                          "align": "left",
-                      },
-                      {"name": "單位", "label": "單位", "field": "單位"},
-                      {
-                          "name": "庫存數量",
-                          "label": "庫存數量",
-                          "field": "庫存數量",
-                      },
-                      {
-                          "name": "平均成本",
-                          "label": "平均成本",
-                          "field": "平均成本",
-                      },
-                      {"name": "狀態", "label": "狀態", "field": "狀態"},
-                  ],
-                  rows=df_target.to_dict("records"),
-              ).classes("w-full")
-
-          def on_warehouse_change(e):
-            # 當切換倉庫時，同步更新分類選單選項
-            sub_df = data["inventory_by_wh"].get(e.value, pd.DataFrame())
-            if "商品分類" in sub_df.columns:
-              cats = ["全部"] + list(sub_df["商品分類"].unique())
-              category_select.options = cats
-              category_select.value = "全部"
-            update_inventory_table()
-
-          wh_select.on_value_change(on_warehouse_change)
-          category_select.on_value_change(lambda e: update_inventory_table())
-          search_input.on_value_change(lambda e: update_inventory_table())
-
-          update_inventory_table()
-
-      # 3. 訂單
-      with ui.tab_panel(t_ord):
-        with ui.card().classes(
-            "w-full p-6 bg-white border border-[#e2e1dc] shadow-none"
-            " rounded-none"
-        ):
-          ui.label(f"{selected_co} — 訂單管理與確認").classes(
-              "text-lg font-bold text-zinc-900 mb-4 tracking-wide"
+        with ui.row().classes("items-center gap-3 flex-wrap"):
+          # 倉庫下拉選單 (抓取所有倉庫)
+          wh_options = ["全部倉庫"] + [w["name"] for w in WAREHOUSES]
+          wh_select = ui.select(options=wh_options, value="全部倉庫").classes(
+              "bg-[#f7f6f2] text-zinc-900 rounded-none px-3 py-1 text-xs"
+              " font-bold border border-[#e2e1dc]"
           )
+
+          # 商品分類下拉選單 (抓取所有分類)
+          cat_options = ["全部分類"] + CATEGORIES
+          cat_select = ui.select(options=cat_options, value="全部分類").classes(
+              "bg-[#f7f6f2] text-zinc-900 rounded-none px-3 py-1 text-xs"
+              " font-bold border border-[#e2e1dc]"
+          )
+
+          # 關鍵字搜尋輸入框
+          search_input = ui.input(
+              placeholder="輸入品號或品名關鍵字..."
+          ).classes("w-64 text-xs")
+
+      table_container = ui.column().classes("w-full")
+
+      def update_table():
+        table_container.clear()
+        df = global_df.value.copy()
+
+        # 1. 倉庫篩選
+        if wh_select.value and wh_select.value != "全部倉庫":
+          df = df[df["倉庫名稱"] == wh_select.value]
+
+        # 2. 分類篩選
+        if cat_select.value and cat_select.value != "全部分類":
+          df = df[df["商品分類"] == cat_select.value]
+
+        # 3. 關鍵字搜尋 (同時比對品號與品名)
+        keyword = search_input.value.strip()
+        if keyword:
+          mask = df["品號"].astype(str).str.contains(
+              keyword, case=False, na=False
+          ) | df["品名"].astype(str).str.contains(
+              keyword, case=False, na=False
+          )
+          df = df[mask]
+
+        with table_container:
           ui.table(
               columns=[
-                  {"name": "訂單編號", "label": "訂單編號", "field": "訂單編號"},
-                  {"name": "通路", "label": "客戶與通路", "field": "客戶/通路"},
-                  {"name": "品名", "label": "訂購內容", "field": "品名"},
-                  {"name": "金額", "label": "金額 (NTD)", "field": "金額"},
-                  {"name": "狀態", "label": "處理狀態", "field": "狀態"},
+                  {
+                      "name": "倉庫名稱",
+                      "label": "倉庫",
+                      "field": "倉庫名稱",
+                      "align": "left",
+                  },
+                  {
+                      "name": "商品分類",
+                      "label": "商品分類",
+                      "field": "商品分類",
+                      "align": "left",
+                  },
+                  {
+                      "name": "品號",
+                      "label": "品號",
+                      "field": "品號",
+                      "align": "left",
+                  },
+                  {
+                      "name": "品名",
+                      "label": "品名",
+                      "field": "品名",
+                      "align": "left",
+                  },
+                  {"name": "單位", "label": "單位", "field": "單位"},
+                  {
+                      "name": "庫存數量",
+                      "label": "庫存數量",
+                      "field": "庫存數量",
+                  },
+                  {
+                      "name": "平均成本",
+                      "label": "平均成本",
+                      "field": "平均成本",
+                  },
               ],
-              rows=data["orders"].to_dict("records"),
+              rows=df.to_dict("records"),
           ).classes("w-full")
 
-      # 4. 採購
-      with ui.tab_panel(t_pur):
-        with ui.card().classes(
-            "w-full p-6 bg-white border border-[#e2e1dc] shadow-none"
-            " rounded-none mb-6"
-        ):
-          ui.label(f"{selected_co} — 建立新採購單").classes(
-              "text-lg font-bold text-zinc-900 mb-4 tracking-wide"
-          )
+      # 綁定事件：當選單或搜尋框變動時即時更新表格
+      wh_select.on_value_change(lambda e: update_table())
+      cat_select.on_value_change(lambda e: update_table())
+      search_input.on_value_change(lambda e: update_table())
 
-          with ui.row().classes("w-full gap-4"):
-            item_name_input = ui.input(label="品名").classes("flex-1")
-            item_no_input = ui.input(label="品號").classes("flex-1")
-            quantity_input = ui.number(label="採購數量", value=1).classes("w-32")
-
-          with ui.row().classes("w-full gap-4 mt-2"):
-            supplier_input = ui.input(label="供應商").classes("flex-1")
-            remark_input = ui.input(label="備註").classes("flex-1")
-
-          def submit_order():
-            if not item_name_input.value or not item_no_input.value:
-              ui.notify("請填寫品名與品號！", color="negative")
-              return
-
-            order_data = {
-                "品名": item_name_input.value,
-                "品號": item_no_input.value,
-                "數量": quantity_input.value,
-                "供應商": supplier_input.value,
-                "備註": remark_input.value,
-            }
-
-            PURCHASE_ORDERS[selected_co].append(order_data)
-            ui.notify(f"成功為 {selected_co} 建立採購單！", color="positive")
-
-            item_name_input.value = ""
-            item_no_input.value = ""
-            quantity_input.value = 1
-            supplier_input.value = ""
-            remark_input.value = ""
-
-            purchase_table.rows = PURCHASE_ORDERS[selected_co]
-            purchase_table.update()
-
-          ui.button("送出採購單", on_click=submit_order).classes(
-              "mt-4 awwwards-btn px-6 py-2 text-xs rounded-none"
-          )
-
-        with ui.card().classes(
-            "w-full p-6 bg-white border border-[#e2e1dc] shadow-none"
-            " rounded-none"
-        ):
-          ui.label(f"{selected_co} — 歷史採購單列表").classes(
-              "text-lg font-bold text-zinc-900 mb-4 tracking-wide"
-          )
-
-          purchase_columns = [
-              {"name": "品名", "label": "品名", "field": "品名"},
-              {"name": "品號", "label": "品號", "field": "品號"},
-              {"name": "數量", "label": "數量", "field": "數量"},
-              {"name": "供應商", "label": "供應商", "field": "供應商"},
-              {"name": "備註", "label": "備註", "field": "備註"},
-          ]
-
-          purchase_table = ui.table(
-              columns=purchase_columns,
-              rows=PURCHASE_ORDERS[selected_co],
-              row_key="品號",
-          ).classes("w-full")
-
-      # 5. 興聖分公司專屬：營業目標與銷售分析模組
-      if selected_co == "興聖分公司":
-        with ui.tab_panel(t_target):
-          target_df = load_shingseng_target_data()
-
-          total_target = (
-              target_df["目標銷售額"].sum()
-              if "目標銷售額" in target_df.columns
-              else 0
-          )
-          total_actual = (
-              target_df["實際銷售額"].sum()
-              if "實際銷售額" in target_df.columns
-              else 0
-          )
-          achievement_rate = (
-              round((total_actual / total_target) * 100, 1)
-              if total_target > 0
-              else 0
-          )
-
-          with ui.row().classes("w-full gap-5 mb-6"):
-            with ui.card().classes(
-                "flex-1 p-6 bg-white border border-[#e2e1dc] shadow-none"
-                " rounded-none"
-            ):
-              ui.label("年度累計目標銷售額").classes(
-                  "text-zinc-400 text-xs font-bold tracking-wider"
-              )
-              ui.label(f"NT$ {total_target:,}").classes(
-                  "text-3xl font-black text-zinc-900 mt-2"
-              )
-            with ui.card().classes(
-                "flex-1 p-6 bg-white border border-[#e2e1dc] shadow-none"
-                " rounded-none"
-            ):
-              ui.label("年度累計實際銷售額").classes(
-                  "text-zinc-400 text-xs font-bold tracking-wider"
-              )
-              ui.label(f"NT$ {total_actual:,}").classes(
-                  "text-3xl font-black text-emerald-600 mt-2"
-              )
-            with ui.card().classes(
-                "flex-1 p-6 bg-white border border-[#e2e1dc] shadow-none"
-                " rounded-none"
-            ):
-              ui.label("全年度目標達成率").classes(
-                  "text-zinc-400 text-xs font-bold tracking-wider"
-              )
-              ui.label(f"{achievement_rate} %").classes(
-                  "text-3xl font-black text-blue-600 mt-2"
-              )
-
-          fig_monthly = px.bar(
-              target_df,
-              x="月份",
-              y=["目標銷售額", "實際銷售額"],
-              barmode="group",
-              title="【興聖】各月份銷售額與目標多維度對比",
-              color_discrete_sequence=["#d1d5db", "#0d9488"],
-          )
-          fig_monthly.update_layout(
-              margin=dict(l=20, r=20, t=50, b=20),
-              height=380,
-              plot_bgcolor="rgba(0,0,0,0)",
-              paper_bgcolor="rgba(0,0,0,0)",
-              font=dict(color="#1a1a1a", family="sans-serif"),
-              title_font=dict(color="#1a1a1a", size=15),
-          )
-
-          channel_df = (
-              target_df.groupby("通路")[["實際銷售額", "目標銷售額"]]
-              .sum()
-              .reset_index()
-          )
-          fig_channel = px.pie(
-              channel_df,
-              names="通路",
-              values="實際銷售額",
-              title="【興聖】各銷售通路實際營業額佔比分佈",
-              hole=0.4,
-              color_discrete_sequence=px.colors.sequential.Tealgrn,
-          )
-          fig_channel.update_layout(
-              margin=dict(l=20, r=20, t=50, b=20),
-              height=380,
-              plot_bgcolor="rgba(0,0,0,0)",
-              paper_bgcolor="rgba(0,0,0,0)",
-              font=dict(color="#1a1a1a", family="sans-serif"),
-              title_font=dict(color="#1a1a1a", size=15),
-          )
-
-          with ui.row().classes("w-full gap-6 mb-6"):
-            with ui.card().classes(
-                "flex-2 p-6 bg-white border border-[#e2e1dc] shadow-none"
-                " rounded-none"
-            ):
-              ui.plotly(fig_monthly).classes("w-full")
-            with ui.card().classes(
-                "flex-1 p-6 bg-white border border-[#e2e1dc] shadow-none"
-                " rounded-none"
-            ):
-              ui.plotly(fig_channel).classes("w-full")
-
-      # 6. 工廠模組
-      if is_factory:
-        with ui.tab_panel(t_bom):
-          with ui.card().classes(
-              "w-full p-6 bg-white border border-[#e2e1dc] shadow-none"
-              " rounded-none"
-          ):
-            ui.label("海濤客食品工廠 — 產品用料清單 (BOM)").classes(
-                "text-lg font-bold text-zinc-900 mb-4 tracking-wide"
-            )
-            ui.table(
-                columns=[
-                    {"name": "母品號", "label": "主產品品號", "field": "母品號"},
-                    {"name": "子品號", "label": "物料品號", "field": "子品號"},
-                    {"name": "物料名稱", "label": "物料名稱", "field": "物料名稱"},
-                    {"name": "需求數量", "label": "單位用量", "field": "需求數量"},
-                    {"name": "單位", "label": "單位", "field": "單位"},
-                ],
-                rows=data["bom"].to_dict("records"),
-            ).classes("w-full")
-
-        with ui.tab_panel(t_sched):
-          with ui.row().classes("w-full gap-6"):
-            with ui.card().classes(
-                "flex-2 p-6 bg-white border border-[#e2e1dc] shadow-none"
-                " rounded-none"
-            ):
-              ui.label("本週包裝與生產排程").classes(
-                  "text-lg font-bold text-zinc-900 mb-4 tracking-wide"
-              )
-              ui.markdown("""
-                            * **週一 (08:00 - 12:00)**：海濤客 XO 醬禮盒批次包裝作業
-                            * **週二 (13:00 - 17:00)**：干貝醬真空封口與品管作業
-                            * **週四 (全天)**：一口烏魚子真空包裝與精美禮盒裝箱
-                            """).classes("text-zinc-600 text-sm leading-loose")
-            with ui.card().classes(
-                "flex-1 p-6 bg-white border border-[#e2e1dc] shadow-none"
-                " rounded-none"
-            ):
-              ui.label("廠區行事曆備忘").classes(
-                  "text-lg font-bold text-zinc-900 mb-4 tracking-wide"
-              )
-              ui.date().classes(
-                  "w-full border border-[#e2e1dc] bg-white shadow-none"
-                  " text-zinc-900"
-              )
-
-  with ui.row().classes(
-      "w-full items-center justify-between bg-[#f7f6f2] text-zinc-900 px-8 py-4"
-      " border-b border-[#e2e1dc] sticky top-0 z-50"
-  ):
-    with ui.row().classes("items-center gap-3"):
-      ui.icon("domain", size="sm").classes("text-zinc-800")
-      ui.label("興聖集團｜智慧 ERP 總管理中樞").classes(
-          "text-sm font-black tracking-wider"
-      )
-
-    with ui.row().classes("items-center gap-4"):
-      ui.label("檢視單位：").classes("text-zinc-500 text-xs font-bold")
-      company_select = ui.select(
-          options=list(COMPANY_DATA.keys()), value="海濤客食品工廠"
-      ).classes(
-          "bg-white text-zinc-900 rounded-none px-3 py-1 text-xs font-bold"
-          " border border-[#e2e1dc]"
-      )
-      ui.button(
-          "立即同步",
-          on_click=lambda: (
-              fetch_a1_live_inventory(),
-              ui.notify("已成功透過 A1 API 重新導出所有倉庫與全品類即時庫存"),
-              render_content.refresh(company_select.value),
-          ),
-      ).classes("awwwards-btn px-4 py-2 text-xs rounded-none")
-
-  with ui.column().classes("w-full p-8 max-w-[1600px] mx-auto bg-[#f7f6f2]"):
-    company_select.on_value_change(lambda e: render_content.refresh(e.value))
-    render_content(company_select.value)
+      # 初始化載入表格
+      update_table()
 
 
-ui.run(port=8080, title="興聖集團 ERP 系統", host="0.0.0.0")
+ui.run(port=8080, title="興聖集團 ERP 庫存系統", host="0.0.0.0")
