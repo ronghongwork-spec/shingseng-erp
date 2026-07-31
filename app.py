@@ -294,6 +294,24 @@ def fetch_all_a1_inventory():
   return pd.DataFrame(all_stock_data), warehouses, list(categories_map.values())
 
 
+def fetch_stock_single_item(token, item_id):
+  """Stock[Get]：查詢單一品號在所有倉庫的庫存量（不分頁，用於交叉驗證 StockBatch）
+
+  回傳 (成功與否, 訊息, [{WarehouseName, Qty}, ...])
+  """
+  url = f"{A1_BASE_URL}/Stock/{item_id}"
+  headers = {"Authorization": token}
+  try:
+    response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+    if response.status_code == 200:
+      data = response.json()
+      rows = data if isinstance(data, list) else [data] if data else []
+      return True, "查詢成功", rows
+    return False, f"[{response.status_code}] {response.text}", []
+  except requests.exceptions.RequestException as e:
+    return False, str(e), []
+
+
 def get_mock_data():
   """提供本地測試用的防呆 DataFrame（A1 連線失敗時的備援顯示資料）"""
   return pd.DataFrame([
@@ -444,6 +462,47 @@ def inventory_dashboard():
           ).classes("w-64 text-xs")
 
       stats_label = ui.label().classes("text-xs text-zinc-500 mb-3")
+
+      with ui.row().classes(
+          "w-full items-center gap-3 mb-4 p-3 bg-[#f7f6f2] border"
+          " border-[#e2e1dc] flex-wrap"
+      ):
+        ui.label("單一品號覆核（直查 A1，不受表格篩選/分頁影響）").classes(
+            "text-xs font-bold text-zinc-700"
+        )
+        verify_input = ui.input(placeholder="輸入完整品號...").classes(
+            "w-56 text-xs"
+        )
+        verify_result = ui.label().classes("text-xs text-zinc-700")
+
+        def handle_verify():
+          item_id = verify_input.value.strip()
+          if not item_id:
+            ui.notify("請輸入品號", color="warning")
+            return
+          token = get_a1_token()
+          if not token:
+            verify_result.text = "無法登入 A1，請確認 API 憑證"
+            return
+          ok, msg, rows = fetch_stock_single_item(token, item_id)
+          if not ok:
+            verify_result.text = f"查詢失敗：{msg}"
+            return
+          if not rows:
+            verify_result.text = (
+                f"A1 回傳：此品號目前在任何倉庫都沒有庫存資料（Stock 查無資料）"
+            )
+            return
+          parts = [
+              f"{r.get('WarehouseName')}: {r.get('Qty')}"
+              for r in rows
+              if r.get("WarehouseName")
+          ]
+          verify_result.text = "A1 即時庫存 → " + "，".join(parts)
+
+        ui.button("查詢", on_click=handle_verify).classes(
+            "sync-btn px-3 py-1 text-xs rounded-none"
+        )
 
       table_container = ui.column().classes("w-full")
 
