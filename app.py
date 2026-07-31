@@ -106,7 +106,8 @@ def fetch_items_map(token):
 
   手冊 Items[Get] 無傳入商品代號時，只回傳 ID/Name，要拿到 CategoryID、
   UnitName、StdPurPrice 等完整欄位，必須逐筆呼叫 Items/{ItemID}。
-  商品數量多時逐一序列呼叫會很慢，這裡改用多執行緒平行抓取明細。
+  商品數量多時逐一序列呼叫會很慢，這裡改用多執行緒平行抓取明細，
+  並針對單筆失敗加入重試，避免暫時性網路錯誤讓某些商品被靜默漏掉。
   """
   url = f"{A1_BASE_URL}/Items"
   headers = {"Authorization": token}
@@ -122,20 +123,22 @@ def fetch_items_map(token):
     print(f"取得商品列表失敗: {e}")
     return items_dict
 
+  ITEM_DETAIL_RETRIES = 2
+
   def fetch_one(item_id):
     detail_url = f"{A1_BASE_URL}/Items/{item_id}"
-    try:
-      detail_res = requests.get(
-          detail_url, headers=headers, timeout=REQUEST_TIMEOUT
-      )
-      if detail_res.status_code == 200:
-        return item_id, detail_res.json()
-      print(
-          f"取得商品明細失敗 [{item_id}]"
-          f" [{detail_res.status_code}]: {detail_res.text}"
-      )
-    except requests.exceptions.RequestException as e:
-      print(f"取得商品明細失敗 [{item_id}]: {e}")
+    last_error = None
+    for attempt in range(1, ITEM_DETAIL_RETRIES + 1):
+      try:
+        detail_res = requests.get(
+            detail_url, headers=headers, timeout=REQUEST_TIMEOUT
+        )
+        if detail_res.status_code == 200:
+          return item_id, detail_res.json()
+        last_error = f"[{detail_res.status_code}]: {detail_res.text}"
+      except requests.exceptions.RequestException as e:
+        last_error = str(e)
+    print(f"取得商品明細失敗（已重試{ITEM_DETAIL_RETRIES}次）[{item_id}] {last_error}")
     return item_id, None
 
   with concurrent.futures.ThreadPoolExecutor(
@@ -144,6 +147,12 @@ def fetch_items_map(token):
     for item_id, detail in executor.map(fetch_one, item_ids):
       if detail:
         items_dict[item_id] = detail
+
+  failed_count = len(item_ids) - len(items_dict)
+  print(
+      f"商品明細抓取完成：品號清單共 {len(item_ids)} 筆，"
+      f"成功取得明細 {len(items_dict)} 筆，失敗 {failed_count} 筆"
+  )
 
   return items_dict
 
@@ -221,6 +230,36 @@ def fetch_all_a1_inventory():
 
   if pagination > MAX_STOCK_PAGES:
     print(f"警告：StockBatch 已達分頁安全上限 {MAX_STOCK_PAGES} 頁，資料可能未抓取完整")
+
+  # 手冊備註：StockBatch「若商品為新建，未在任何倉庫中有異動，則不會回傳」，
+  # 這代表組合品（尤其是[先銷售自動組合]這種不佔實體庫存的類型）很可能完全不會
+  # 出現在 StockBatch 的結果裡。為了讓「各商品分類」的統計不漏掉這些商品，
+  # 這裡以商品主檔（items_map，來自 Items[Get]）為準，把 StockBatch 完全沒提到
+  # 的品號也補一筆進表格，庫存數量顯示 0、倉庫顯示「(無庫存異動)」。
+  covered_item_ids = {row["品號"] for row in all_stock_data}
+  missing_items = [
+      (item_id, info)
+      for item_id, info in items_map.items()
+      if item_id not in covered_item_ids
+  ]
+  for item_id, item_info in missing_items:
+    cat_id = item_info.get("CategoryID")
+    cat_name = categories_map.get(str(cat_id), "未分類")
+    all_stock_data.append({
+        "倉庫名稱": "(無庫存異動)",
+        "商品分類": cat_name,
+        "品號": item_id,
+        "品名": item_info.get("Name"),
+        "單位": item_info.get("UnitName", "個"),
+        "庫存數量": 0.0,
+        "平均成本": item_info.get("StdPurPrice", 0.0),
+    })
+
+  print(
+      f"庫存資料彙整完成：StockBatch 回傳 {len(covered_item_ids)} 個不同品號，"
+      f"另補上 {len(missing_items)} 個從未有庫存異動的品號，"
+      f"總計 {len(all_stock_data)} 列（品號 x 倉庫）"
+  )
 
   # 防呆機制：若 API 無資料或連線失敗，回傳範例資料
   if not all_stock_data:
@@ -401,6 +440,9 @@ def inventory_dashboard():
               keyword, case=False, na=False
           )
           df = df[mask]
+
+        # 4. 庫存數量篩選：0 不顯示，負數（超賣/盤差）要顯示
+        df = df[df["庫存數量"] != 0]
 
         with table_container:
           ui.table(
