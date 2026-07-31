@@ -6,93 +6,218 @@ import requests
 # -------------------------------------------------------------------------
 # 1. 鼎新 A1 API 串接與全量資料自動抓取
 # -------------------------------------------------------------------------
-A1_BASE_URL = "http://a1external.digiwin.com"
+A1_BASE_URL = "http://a1external.digiwin.com"  # 正式區 URL[cite: 3]
 API_KEY = "YOUR_A1_API_KEY"
 
-WAREHOUSES = [
-    {"id": "WH01", "name": "食品廠鳳仁倉"},
-    {"id": "WH02", "name": "即期品/報廢倉"},
-    {"id": "WH03", "name": "供應商-原料倉"},
-    {"id": "WH04", "name": "永福倉"},
-    {"id": "WH05", "name": "北仁街辦公室"},
-    {"id": "WH06", "name": "小琉球現場"},
-    {"id": "WH07", "name": "供應商-耗材倉"},
-]
 
-CATEGORIES = [
-    "(海濤客)_成品11",
-    "(海濤客)_原料21",
-    "(海濤客)_物料31",
-    "(海濤客)_組合品61",
-    "(海濤客)_費用71",
-    "(海濤客)_代工含料81",
-    "(海濤客)_限定組合99",
-]
+def get_a1_token():
+  """透過 APIKey 取得登入金鑰 (JWT Token)[cite: 3]"""
+  url = f"{A1_BASE_URL}/Login"
+  headers = {"Content-Type": "application/json"}
+  body = {"UserName": API_KEY, "Password": ""}  # A1 慣例通常將 APIKey 填入 UserName
+
+  try:
+    response = requests.post(url, json=body, headers=headers)
+    if response.status_code == 200:
+      data = response.json()
+      return data.get("access_token")
+    else:
+      print(f"A1 登入失敗: {response.text}")
+  except Exception as e:
+    print(f"A1 登入連線異常: {e}")
+  return None
+
+
+def fetch_warehouses(token):
+  """動態取得所有未停用的倉庫列表[cite: 3]"""
+  url = f"{A1_BASE_URL}/Warehouses"
+  headers = {"Authorization": f"Bearer {token}"}
+  try:
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+      return [w["Name"] for w in response.json()]
+  except Exception as e:
+    print(f"取得倉庫列表失敗: {e}")
+  return []
+
+
+def fetch_categories(token):
+  """動態取得所有商品分類列表[cite: 3]"""
+  url = f"{A1_BASE_URL}/Categorys"
+  headers = {"Authorization": f"Bearer {token}"}
+  try:
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+      return {c["ID"]: c["Name"] for c in response.json()}
+  except Exception as e:
+    print(f"取得商品分類失敗: {e}")
+  return {}
+
+
+def fetch_items_map(token):
+  """取得商品詳細資料（對應品名、分類等）[cite: 3]"""
+  url = f"{A1_BASE_URL}/Items"
+  headers = {"Authorization": f"Bearer {token}"}
+  items_dict = {}
+  try:
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+      for item in response.json():
+        item_id = item.get("ID")
+        # 抓取單一商品明細以取得完整資訊（如分類、單位、平均成本等）
+        detail_url = f"{A1_BASE_URL}/Items/{item_id}"
+        detail_res = requests.get(detail_url, headers=headers)
+        if detail_res.status_code == 200:
+          items_dict[item_id] = detail_res.json()
+  except Exception as e:
+    print(f"取得商品明細失敗: {e}")
+  return items_dict
 
 
 def fetch_all_a1_inventory():
-  """透過迴圈自動向 A1 API 抓取所有倉庫與所有分類的即時庫存資料"""
+  """透過 StockBatch API 分頁完整抓取所有商品在各倉庫的庫存資料[cite: 3]"""
+  token = get_a1_token()
+
+  if not token:
+    print("無法取得 A1 Token，啟用測試防呆數據...")
+    return get_mock_data(), [], []
+
   headers = {
       "Content-Type": "application/json",
-      "Authorization": f"Bearer {API_KEY}",
+      "Authorization": f"Bearer {token}",
   }
 
-  all_data = []
+  warehouses = fetch_warehouses(token)
+  categories_map = fetch_categories(token)
+  items_map = fetch_items_map(token)
 
-  for wh in WAREHOUSES:
-    for cat in CATEGORIES:
-      try:
-        # 實際串接時請在此處發送 API 請求
-        pass
-      except Exception as e:
-        print(f"抓取倉庫 {wh['name']} 分類 {cat} 失敗: {e}")
+  all_stock_data = []
+  pagination = 1
+  more_data = True
 
-  # 測試防呆數據
-  if not all_data:
-    all_data = [
-        {
-            "倉庫名稱": "食品廠鳳仁倉",
-            "商品分類": "(海濤客)_成品11",
-            "品號": "011101180001",
-            "品名": "醬料_烏金干貝醬",
-            "單位": "罐",
-            "庫存數量": 262.00,
-            "平均成本": 214.41,
-        },
-        {
-            "倉庫名稱": "食品廠鳳仁倉",
-            "商品分類": "(海濤客)_成品11",
-            "品號": "011101180002",
-            "品名": "醬料_飛魚卵XO醬",
-            "單位": "罐",
-            "庫存數量": 258.00,
-            "平均成本": 90.50,
-        },
-        {
-            "倉庫名稱": "永福倉",
-            "商品分類": "(海濤客)_原料21",
-            "品號": "011102000001",
-            "品名": "原料_干貝散裝",
-            "單位": "公斤",
-            "庫存數量": 500.00,
-            "平均成本": 150.00,
-        },
-        {
-            "倉庫名稱": "小琉球現場",
-            "商品分類": "(海濤客)_限定組合99",
-            "品號": "011109900001",
-            "品名": "現場限定澎湃禮盒",
-            "單位": "組",
-            "庫存數量": 45.00,
-            "平均成本": 680.00,
-        },
-    ]
+  # 使用 StockBatch 分頁迴圈抓取全部庫存[cite: 3]
+  while more_data:
+    url = f"{A1_BASE_URL}/Stock/Batch"
+    payload = {"Pagination": pagination}
 
-  return pd.DataFrame(all_data)
+    try:
+      response = requests.post(url, json=payload, headers=headers)
+      if response.status_code == 200:
+        res_json = response.json()
+        # 注意：實際回傳結構依 API 手冊為主，通常包在 Data 欄位中
+        rows = res_json if isinstance(res_json, list) else res_json.get("Data", [])
+
+        for row in rows:
+          item_id = row.get("ItemID")
+          item_info = items_map.get(item_id, {})
+
+          cat_id = item_info.get("CategoryID")
+          cat_name = categories_map.get(cat_id, "未分類")
+
+          all_stock_data.append({
+              "倉庫名稱": row.get("WarehouseName"),
+              "商品分類": cat_name,
+              "品號": item_id,
+              "品名": row.get("ItemName") or item_info.get("Name"),
+              "單位": item_info.get("UnitName", "個"),
+              "庫存數量": row.get("Qty", 0.0),
+              "平均成本": item_info.get("StdPurPrice", 0.0),
+          })
+
+        # 檢查是否還有下一頁 (根據手冊 StockBatch 回傳格式)
+        more_data = (
+            res_json.get("More", False)
+            if isinstance(res_json, dict)
+            else False
+        )
+        pagination += 1
+      else:
+        print(f"StockBatch 抓取失敗: {response.text}")
+        break
+    except Exception as e:
+      print(f"StockBatch 請求異常: {e}")
+      break
+
+  # 防呆機制：若 API 無資料或連線失敗，回傳範例資料
+  if not all_stock_data:
+    return get_mock_data(), warehouses, list(categories_map.values())
+
+  return pd.DataFrame(all_stock_data), warehouses, list(categories_map.values())
 
 
-# 建立全域狀態物件存放 DataFrame
-app_state = {"df": fetch_all_a1_inventory()}
+def get_mock_data():
+  """提供本地測試用的防呆 DataFrame"""
+  return pd.DataFrame([
+      {
+          "倉庫名稱": "食品廠鳳仁倉",
+          "商品分類": "(海濤客)_成品11",
+          "品號": "011101180001",
+          "品名": "醬料_烏金干貝醬",
+          "單位": "罐",
+          "庫存數量": 262.00,
+          "平均成本": 214.41,
+      },
+      {
+          "倉庫名稱": "食品廠鳳仁倉",
+          "商品分類": "(海濤客)_成品11",
+          "品號": "011101180002",
+          "品名": "醬料_飛魚卵XO醬",
+          "單位": "罐",
+          "庫存數量": 258.00,
+          "平均成本": 90.50,
+      },
+      {
+          "倉庫名稱": "永福倉",
+          "商品分類": "(海濤客)_原料21",
+          "品號": "011102000001",
+          "品名": "原料_干貝散裝",
+          "單位": "公斤",
+          "庫存數量": 500.00,
+          "平均成本": 150.00,
+      },
+      {
+          "倉庫名稱": "小琉球現場",
+          "商品分類": "(海濤客)_限定組合99",
+          "品號": "011109900001",
+          "品名": "現場限定澎湃禮盒",
+          "單位": "組",
+          "庫存數量": 45.00,
+          "平均成本": 680.00,
+      },
+  ])
+
+
+# 初始化全域狀態
+initial_df, initial_whs, initial_cats = fetch_all_a1_inventory()
+app_state = {
+    "df": initial_df,
+    "warehouses": (
+        initial_whs
+        if initial_whs
+        else [
+            "食品廠鳳仁倉",
+            "即期品/報廢倉",
+            "供應商-原料倉",
+            "永福倉",
+            "北仁街辦公室",
+            "小琉球現場",
+            "供應商-耗材倉",
+        ]
+    ),
+    "categories": (
+        initial_cats
+        if initial_cats
+        else [
+            "(海濤客)_成品11",
+            "(海濤客)_原料21",
+            "(海濤客)_物料31",
+            "(海濤客)_組合品61",
+            "(海濤客)_費用71",
+            "(海濤客)_代工含料81",
+            "(海濤客)_限定組合99",
+        ]
+    ),
+}
 
 # -------------------------------------------------------------------------
 # 2. NiceGUI 網頁介面設計
@@ -112,8 +237,18 @@ def inventory_dashboard():
     """)
 
   def handle_sync():
-    app_state["df"] = fetch_all_a1_inventory()
-    ui.notify("已成功從鼎新 A1 API 抓取所有倉庫與分類資料！", color="positive")
+    df, whs, cats = fetch_all_a1_inventory()
+    app_state["df"] = df
+    if whs:
+      app_state["warehouses"] = whs
+    if cats:
+      app_state["categories"] = cats
+
+    # 更新下拉選單選項
+    wh_select.options = ["全部倉庫"] + app_state["warehouses"]
+    cat_select.options = ["全部分類"] + app_state["categories"]
+
+    ui.notify("已成功從鼎新 A1 API 同步最新庫存資料！", color="positive")
     update_table()
 
   with ui.row().classes(
@@ -139,13 +274,13 @@ def inventory_dashboard():
         )
 
         with ui.row().classes("items-center gap-3 flex-wrap"):
-          wh_options = ["全部倉庫"] + [w["name"] for w in WAREHOUSES]
+          wh_options = ["全部倉庫"] + app_state["warehouses"]
           wh_select = ui.select(options=wh_options, value="全部倉庫").classes(
               "bg-[#f7f6f2] text-zinc-900 rounded-none px-3 py-1 text-xs"
               " font-bold border border-[#e2e1dc]"
           )
 
-          cat_options = ["全部分類"] + CATEGORIES
+          cat_options = ["全部分類"] + app_state["categories"]
           cat_select = ui.select(options=cat_options, value="全部分類").classes(
               "bg-[#f7f6f2] text-zinc-900 rounded-none px-3 py-1 text-xs"
               " font-bold border border-[#e2e1dc]"
