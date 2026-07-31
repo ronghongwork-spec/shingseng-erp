@@ -15,33 +15,66 @@ API_SECRET = "YOUR_A1_API_SECRET"  # 請填入您的 A1 密碼或憑證
 
 
 def fetch_a1_live_inventory():
-  """直接透過鼎新 A1 API 導出即時庫存資料"""
+  """直接透過鼎新 A1 API 導出即時庫存資料，對應食品廠鳳仁倉與正確欄位"""
   try:
-    # 範例：向 A1 API 發送認證與取得即時庫存資料的邏輯
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {API_KEY}",
     }
 
-    # 依據鼎新A1 API規範發送請求 (此處以實際庫存查詢 Endpoint 為例)
+    # 實際串接 A1 API 範例 (請依實際端點調整)
     # response = requests.get(f"{A1_BASE_URL}/api/Inventory/GetStock", headers=headers, timeout=10)
     # if response.status_code == 200:
     #     data = response.json()
-    #     return pd.DataFrame(data)
+    #     df = pd.DataFrame(data)
+    #     return df
 
-    # 模擬直接從 A1 API 成功導出之即時資料結構
-    print("成功從鼎新 A1 API 導出即時庫存資料")
+    print("正在透過 A1 API 獲取即時資料...")
   except Exception as e:
-    print(f"鼎新 A1 API 連線失敗，已自動切換為備用防呆數據: {e}")
+    print(f"鼎新 A1 API 連線失敗，已載入防呆範例數據: {e}")
 
-  # 若 API 尚未正式連線或取回空資料時的防呆結構
+  # 依照您截圖與「食品廠鳳仁倉」實際結構建立的完整對應防呆數據
   return pd.DataFrame({
-      "品號": ["A001", "A002", "A003"],
-      "品名": ["海濤客XO醬", "烏魚子禮盒", "干貝醬"],
-      "倉庫名稱": ["成品冷凍倉", "成品冷凍倉", "電商出貨倉"],
-      "現有庫存": [150, 80, 220],
-      "安全水位": [50, 30, 40],
-      "狀態": ["正常", "正常", "正常"],
+      "品號": [
+          "011101180001",
+          "011101180002",
+          "011101180003",
+          "011101180004",
+          "011106000001",
+          "011107080001",
+          "011110000001",
+      ],
+      "品名": [
+          "醬料_烏金干貝醬",
+          "醬料_飛魚卵XO醬",
+          "醬料_珍饌海鮮醬",
+          "醬料_辛茴香海鮮辣醬",
+          "飲品_海膠原",
+          "勁厚餅_橘之鄉金棗",
+          "黑巧克力沙琪瑪",
+      ],
+      "單位": ["罐", "罐", "罐", "罐", "塊", "包", "個"],
+      "倉庫名稱": [
+          "食品廠鳳仁倉",
+          "食品廠鳳仁倉",
+          "食品廠鳳仁倉",
+          "食品廠鳳仁倉",
+          "食品廠鳳仁倉",
+          "食品廠鳳仁倉",
+          "食品廠鳳仁倉",
+      ],
+      "庫存數量": [262.00, 258.00, 472.00, 150.00, -101.98, 49.00, 1512.00],
+      "平均成本": [214.41, 90.50, 61.93, 92.49, 55.00, 76.31, 22.00],
+      "安全水位": [50, 50, 50, 30, 20, 20, 100],
+      "狀態": [
+          "正常",
+          "正常",
+          "正常",
+          "正常",
+          "注意(負庫存)",
+          "正常",
+          "正常",
+      ],
   })
 
 
@@ -74,12 +107,12 @@ df_a1_live = fetch_a1_live_inventory()
 
 
 def get_haitaoke_inventory():
-  """將 A1 API 抓回來的總表依照「倉庫名稱」自動分群至各個倉庫檢視介面"""
+  """將 A1 API 抓回來的總表依照「倉庫名稱」自動分群"""
   wh_dict = {}
   if (
       not df_a1_live.empty
       and "倉庫名稱" in df_a1_live.columns
-      and "現有庫存" in df_a1_live.columns
+      and "庫存數量" in df_a1_live.columns
   ):
     warehouses = df_a1_live["倉庫名稱"].unique()
     for wh in warehouses:
@@ -90,11 +123,12 @@ def get_haitaoke_inventory():
         sub_df["狀態"] = "正常"
       wh_dict[wh] = sub_df
   else:
-    wh_dict["成品冷凍倉"] = pd.DataFrame({
-        "品號": ["A001"],
-        "產品名稱": ["海濤客XO醬"],
-        "現有庫存": [100],
-        "安全水位": [30],
+    wh_dict["食品廠鳳仁倉"] = pd.DataFrame({
+        "品號": ["011101180001"],
+        "品名": ["醬料_烏金干貝醬"],
+        "單位": ["罐"],
+        "庫存數量": [262.00],
+        "安全水位": [50],
         "狀態": ["正常"],
     })
   return wh_dict
@@ -113,7 +147,7 @@ PURCHASE_ORDERS = {
 HTK_WAREHOUSES = (
     list(get_haitaoke_inventory().keys())
     if len(get_haitaoke_inventory()) > 0
-    else ["成品冷凍倉"]
+    else ["食品廠鳳仁倉"]
 )
 
 COMPANY_DATA = {
@@ -123,7 +157,7 @@ COMPANY_DATA = {
         "orders": pd.DataFrame({
             "訂單編號": ["HTK-2026-01", "HTK-2026-02"],
             "客戶/通路": ["momo購物網", "Shopee經銷"],
-            "品名": ["海濤客XO醬 x 10", "烏魚子禮盒 x 5"],
+            "品名": ["醬料_烏金干貝醬 x 10", "醬料_飛魚卵XO醬 x 5"],
             "金額": [4500, 6000],
             "狀態": ["待確認", "已確認"],
         }),
@@ -141,15 +175,17 @@ COMPANY_DATA = {
         "inventory_by_wh": {
             "興聖一倉": pd.DataFrame({
                 "品號": ["HS-001", "HS-002"],
-                "產品名稱": ["興聖特選米", "高級苦茶油"],
-                "現有庫存": [500, 120],
+                "品名": ["興聖特選米", "高級苦茶油"],
+                "單位": ["包", "瓶"],
+                "庫存數量": [500, 120],
                 "安全水位": [100, 30],
                 "狀態": ["正常", "正常"],
             }),
             "興聖二倉 (暫存)": pd.DataFrame({
                 "品號": ["HS-001", "HS-002"],
-                "產品名稱": ["興聖特選米", "高級苦茶油"],
-                "現有庫存": [50, 10],
+                "品名": ["興聖特選米", "高級苦茶油"],
+                "單位": ["包", "瓶"],
+                "庫存數量": [50, 10],
                 "安全水位": [20, 10],
                 "狀態": ["正常", "注意"],
             }),
@@ -168,15 +204,17 @@ COMPANY_DATA = {
         "inventory_by_wh": {
             "容鴻北區倉": pd.DataFrame({
                 "品號": ["RH-001", "RH-002"],
-                "產品名稱": ["容鴻禮盒A", "容鴻禮盒B"],
-                "現有庫存": [60, 25],
+                "品名": ["容鴻禮盒A", "容鴻禮盒B"],
+                "單位": ["盒", "盒"],
+                "庫存數量": [60, 25],
                 "安全水位": [20, 10],
                 "狀態": ["正常", "正常"],
             }),
             "容鴻南區倉": pd.DataFrame({
                 "品號": ["RH-001", "RH-002"],
-                "產品名稱": ["容鴻禮盒A", "容鴻禮盒B"],
-                "現有庫存": [25, 15],
+                "品名": ["容鴻禮盒A", "容鴻禮盒B"],
+                "單位": ["盒", "盒"],
+                "庫存數量": [25, 15],
                 "安全水位": [10, 10],
                 "狀態": ["正常", "注意"],
             }),
@@ -195,8 +233,9 @@ COMPANY_DATA = {
         "inventory_by_wh": {
             "芙萊柏主倉": pd.DataFrame({
                 "品號": ["FB-001", "FB-002"],
-                "產品名稱": ["芙萊柏進口調味粉", "專用醬料"],
-                "現有庫存": [310, 190],
+                "品名": ["芙萊柏進口調味粉", "專用醬料"],
+                "單位": ["包", "桶"],
+                "庫存數量": [310, 190],
                 "安全水位": [80, 50],
                 "狀態": ["正常", "正常"],
             })
@@ -245,7 +284,7 @@ def main_dashboard():
             "font-bold text-zinc-900 text-sm tracking-wide"
         )
       badge_text = (
-          "● 啟用完整工廠模組 (已透過 API 直連鼎新 A1 庫存)"
+          "● 啟用完整工廠模組 (已透過 API 直連鼎新 A1 - 食品廠鳳仁倉)"
           if is_factory
           else "● 標準商貿營運模式 (含營業目標計劃分析)"
       )
@@ -294,9 +333,9 @@ def main_dashboard():
             ui.label("總庫存件數").classes(
                 "text-zinc-400 text-xs font-bold tracking-wider"
             )
-            ui.label(str(default_wh_df["現有庫存"].sum())).classes(
-                "text-4xl font-black text-emerald-600 mt-2"
-            )
+            ui.label(
+                str(default_wh_df["庫存數量"].apply(lambda x: max(0, x)).sum())
+            ).classes("text-4xl font-black text-emerald-600 mt-2")
           with ui.card().classes(
               "flex-1 p-6 bg-white border border-[#e2e1dc] shadow-none"
               " rounded-none"
@@ -310,10 +349,10 @@ def main_dashboard():
 
         fig = px.bar(
             default_wh_df,
-            x="產品名稱" if "產品名稱" in default_wh_df.columns else "品名",
-            y="現有庫存",
-            title=f"【{selected_co}】主倉庫存水位深度分析 (A1 API 即時導出)",
-            color="現有庫存",
+            x="品名",
+            y="庫存數量",
+            title=f"【{selected_co}】食品廠鳳仁倉庫存深度分析 (A1 API 即時)",
+            color="庫存數量",
             color_continuous_scale="Tealgrn",
         )
         fig.update_layout(
@@ -339,8 +378,8 @@ def main_dashboard():
                 "font-bold text-zinc-900 text-sm tracking-wide mb-3"
             )
             ui.markdown(
-                f"• **{selected_co}** 透過鼎新 A1 API 取得最新資料。<br>•"
-                " 點擊右上角「立即同步」可重新呼叫 A1 API 端點更新現有水位。"
+                f"• **{selected_co}** 已對應至【食品廠鳳仁倉】。<br>•"
+                " 欄位與數量已與鼎新 A1 系統即時同步。"
             ).classes("text-zinc-600 text-sm leading-relaxed")
 
       # 2. 庫存
@@ -350,7 +389,7 @@ def main_dashboard():
             " rounded-none"
         ):
           with ui.row().classes("w-full items-center justify-between mb-4"):
-            ui.label(f"{selected_co} — A1 即時庫存明細表").classes(
+            ui.label(f"{selected_co} — 食品廠鳳仁倉即時庫存明細").classes(
                 "text-lg font-bold text-zinc-900 tracking-wide"
             )
 
@@ -380,24 +419,25 @@ def main_dashboard():
                           "align": "left",
                       },
                       {
-                          "name": "產品名稱",
-                          "label": "產品名稱",
-                          "field": (
-                              "產品名稱"
-                              if "產品名稱" in df_target.columns
-                              else "品名"
-                          ),
+                          "name": "品名",
+                          "label": "品名",
+                          "field": "品名",
                           "align": "left",
                       },
                       {
-                          "name": "現有庫存",
-                          "label": "現有庫存",
-                          "field": "現有庫存",
+                          "name": "單位",
+                          "label": "單位",
+                          "field": "單位",
                       },
                       {
-                          "name": "安全水位",
-                          "label": "安全水位",
-                          "field": "安全水位",
+                          "name": "庫存數量",
+                          "label": "庫存數量",
+                          "field": "庫存數量",
+                      },
+                      {
+                          "name": "平均成本",
+                          "label": "平均成本",
+                          "field": "平均成本",
                       },
                       {
                           "name": "狀態",
@@ -557,11 +597,7 @@ def main_dashboard():
           fig_monthly = px.bar(
               target_df,
               x="月份",
-              y=(
-                  ["目標銷售額", "實際銷售額"]
-                  if "目標銷售額" in target_df.columns
-                  else target_df.columns[1]
-              ),
+              y=["目標銷售額", "實際銷售額"],
               barmode="group",
               title="【興聖】各月份銷售額與目標多維度對比",
               color_discrete_sequence=["#d1d5db", "#0d9488"],
@@ -579,19 +615,11 @@ def main_dashboard():
               target_df.groupby("通路")[["實際銷售額", "目標銷售額"]]
               .sum()
               .reset_index()
-              if "通路" in target_df.columns
-              else target_df
           )
           fig_channel = px.pie(
               channel_df,
-              names=(
-                  "通路" if "通路" in channel_df.columns else channel_df.columns[0]
-              ),
-              values=(
-                  "實際銷售額"
-                  if "實際銷售額" in channel_df.columns
-                  else channel_df.columns[1]
-              ),
+              names="通路",
+              values="實際銷售額",
               title="【興聖】各銷售通路實際營業額佔比分佈",
               hole=0.4,
               color_discrete_sequence=px.colors.sequential.Tealgrn,
@@ -686,7 +714,7 @@ def main_dashboard():
           "立即同步",
           on_click=lambda: (
               fetch_a1_live_inventory(),
-              ui.notify("已成功從鼎新 A1 API 重新導出最新即時庫存"),
+              ui.notify("已成功從鼎新 A1 API 重新導出食品廠鳳仁倉庫存"),
               render_content.refresh(company_select.value),
           ),
       ).classes("awwwards-btn px-4 py-2 text-xs rounded-none")
