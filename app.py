@@ -1547,12 +1547,29 @@ def generate_month_options(n=7):
   return options
 
 
+def is_finished_or_combo_category(category_name):
+  """5.5 只分析「成品」跟「組合品」這兩類——原料/物料/費用/代工含料這些
+  不是賣給客戶的品項，不該算進銷售預測。用類別名稱是否包含「成品」或
+  「組合品」字樣判斷（對照 A1 目前的分類命名慣例，例如"
+  "「(海濤客)_成品11」「(海濤客)_組合品61」）。如果貴公司分類命名方式
+  不同（例如用「半成品」也會被誤判成「成品」），需要再調整這裡的規則。
+  """
+  category_name = category_name or ""
+  return "成品" in category_name or "組合品" in category_name
+
+
 def compute_monthly_production_sales_forecast(
     sales_history, items_map, bom_map, target_year_month, target_revenue, settings,
     last_year_target_revenue=0,
 ):
   """5.5 月產銷分析：預估目標月份（例如 "2026-08"）的採購量／成本／
   建議採購時間。
+
+  範圍：只分析「成品」跟「組合品」兩個分類的商品（見
+  is_finished_or_combo_category），原料/物料/費用類不列入計算——不只是
+  畫面上濾掉，是連「近3個月平均營收」「去年比例回推」這些基準計算都只
+  看這個範圍，確保分析的樣本跟結果是一致的，不會發生「篩選後看到的」
+  跟「實際拿去算比例的」是兩組不同資料的情況。
 
   參考依據（依需求指定）：
   - 去年同期：目標月份的去年同月（8月 → 去年8月）。如果去年的品號
@@ -1603,6 +1620,10 @@ def compute_monthly_production_sales_forecast(
       qty_recent[item_id][ym] += qty
 
   all_item_ids = set(qty_last_year) | set(qty_recent)
+  all_item_ids = {
+      iid for iid in all_item_ids
+      if is_finished_or_combo_category(items_map.get(iid, {}).get("CategoryName"))
+  }
 
   # 先算好每個品項的「近3月平均」跟「單價」，供「依去年目標營業額比例
   # 回推」使用（權重 = 這個品項近3月營收 ÷ 全部品項近3月營收）
@@ -3693,8 +3714,12 @@ def inventory_dashboard():
                       "w-full p-3 mb-4 bg-[#e8f6f5] border border-[#bfe6e3]"
                   ):
                     ui.label(
-                        "按「計算」時會自動向 A1 抓取「近3個月」與「去年同月」的真實銷售資料"
-                        "（不需要先去 5.3 點、也不用整年硬抓，只拿這兩段還是需要幾秒到十幾秒，"
+                        "分析範圍只看「成品」跟「組合品」兩個分類（原料/物料/費用"
+                        "類不是賣給客戶的品項，不計入）——不只是畫面篩選，連基準"
+                        "銷量、去年比例回推這些底層計算都只用這個範圍，匯出的 "
+                        "xlsx 也只會有這個範圍。按「計算」時會自動向 A1 抓取"
+                        "「近3個月」與「去年同月」的真實銷售資料（不需要先去 5.3 "
+                        "點、也不用整年硬抓，只拿這兩段還是需要幾秒到十幾秒，"
                         "不想自動抓可以在下方關掉）。邏輯：基準預估銷量 = (去年同期銷量 + "
                         "近3個月平均銷量) ÷ 2；若有填目標營業額，會等比例"
                         "校正每個品項的預估量，讓總營收貼近目標；建議採購"
@@ -3799,7 +3824,7 @@ def inventory_dashboard():
                   forecast_channel_table_container = ui.column().classes("w-full")
 
                   # 用來在按分類按鈕時重新篩選，不用重新整包計算一次
-                  forecast_state = {"result": None, "active_category": "全部分類", "channel_rows": []}
+                  forecast_state = {"result": None, "active_category": "全部（成品＋組合品）", "channel_rows": []}
 
                   FORECAST_COLUMNS = [
                       {"name": "品號", "label": "品號", "field": "品號", "align": "left"},
@@ -3828,11 +3853,20 @@ def inventory_dashboard():
                     if result is None:
                       return
                     rows = result["rows"]
-                    if forecast_state["active_category"] != "全部分類":
+                    active = forecast_state["active_category"]
+                    if active == "成品":
                       rows = [
                           r for r in rows
-                          if r["商品分類"] == forecast_state["active_category"]
+                          if "成品" in (r["商品分類"] or "")
                       ]
+                    elif active == "組合品":
+                      rows = [
+                          r for r in rows
+                          if "組合品" in (r["商品分類"] or "")
+                      ]
+                    # active == "全部（成品＋組合品）" 時不額外篩選，因為
+                    # result["rows"] 本來就已經只含這兩類（見計算階段的
+                    # is_finished_or_combo_category 篩選）
                     with forecast_table_container:
                       if not rows:
                         ui.label("這個分類目前沒有預估資料").classes(
@@ -3843,14 +3877,13 @@ def inventory_dashboard():
                             columns=FORECAST_COLUMNS, rows=rows, pagination=10,
                         ).classes("w-full")
 
+                  FORECAST_CATEGORY_OPTIONS = ["全部（成品＋組合品）", "成品", "組合品"]
+
                   def render_forecast_category_buttons():
                     forecast_category_row.clear()
                     result = forecast_state["result"]
                     if result is None:
                       return
-                    categories = ["全部分類"] + sorted(
-                        {r["商品分類"] for r in result["rows"]}
-                    )
 
                     def make_handler(cat):
                       def handler():
@@ -3860,7 +3893,7 @@ def inventory_dashboard():
                       return handler
 
                     with forecast_category_row:
-                      for cat in categories:
+                      for cat in FORECAST_CATEGORY_OPTIONS:
                         is_active = cat == forecast_state["active_category"]
                         ui.button(cat, on_click=make_handler(cat)).classes(
                             "px-3 py-1 text-xs rounded-none "
@@ -3888,7 +3921,7 @@ def inventory_dashboard():
                     forecast_summary_row.clear()
                     forecast_export_row.clear()
                     forecast_state["result"] = None
-                    forecast_state["active_category"] = "全部分類"
+                    forecast_state["active_category"] = "全部（成品＋組合品）"
                     forecast_state["channel_rows"] = []
 
                     target_month = forecast_month_select.value
