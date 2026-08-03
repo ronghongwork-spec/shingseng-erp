@@ -3,7 +3,8 @@ import concurrent.futures
 import json
 import os
 import sys
-from datetime import datetime
+from collections import defaultdict
+from datetime import datetime, timedelta
 
 from nicegui import ui
 import pandas as pd
@@ -74,16 +75,22 @@ BOM_EXCEL_PATH = os.environ.get(
 )
 BOM_EXCEL_SHEET_NAME = "組合明細"
 
-# ---- Google Sheets 版 BOM（正式串接方式，逐步取代上面的 Excel 上傳） ----
+# ---- Google Sheets 串接（正式方案，逐步取代本機 Excel 上傳） ----
 # 需要在 Google Cloud 建立一個服務帳號(Service Account)，下載其 JSON 金鑰，
 # 並把該服務帳號的 email 加入 Google Sheet 的「共用」名單（唯讀權限即可）。
-# 三個環境變數都要設定，系統才會改用 Google Sheets；任一沒設定，就自動
-# 退回上面的本機 Excel 上傳機制（過渡期相容，不會讓頁面壞掉）。
+# 三份資料（BOM／訂單資訊／銷售歷史）建議放在「同一份」Google Sheet 的
+# 三個不同分頁，只設定一組 GOOGLE_SHEET_ID 即可，分頁名稱各自對應。
 GOOGLE_SHEETS_CREDENTIALS_JSON = os.environ.get(
     "GOOGLE_SHEETS_CREDENTIALS_JSON", ""
 )  # 服務帳號 JSON 金鑰的「內容」（整包貼進環境變數），不是檔案路徑
-BOM_GOOGLE_SHEET_ID = os.environ.get("BOM_GOOGLE_SHEET_ID", "")
-BOM_GOOGLE_SHEET_TAB = os.environ.get("BOM_GOOGLE_SHEET_TAB", "組合明細")
+GOOGLE_SHEET_ID = os.environ.get(
+    "GOOGLE_SHEET_ID", os.environ.get("BOM_GOOGLE_SHEET_ID", "")
+)  # 相容舊的 BOM_GOOGLE_SHEET_ID 命名，新專案請直接用 GOOGLE_SHEET_ID
+BOM_GOOGLE_SHEET_TAB = os.environ.get("BOM_GOOGLE_SHEET_TAB", "BOM表")
+ORDERS_GOOGLE_SHEET_TAB = os.environ.get("ORDERS_GOOGLE_SHEET_TAB", "訂單資訊")
+SALES_HISTORY_GOOGLE_SHEET_TAB = os.environ.get(
+    "SALES_HISTORY_GOOGLE_SHEET_TAB", "銷售歷史"
+)
 
 
 def get_a1_token():
@@ -559,25 +566,25 @@ def load_bom_from_excel(path):
   return bom_map
 
 
-def load_bom_from_google_sheet():
-  """讀取 Google Sheet 版的「商品組合明細」（正式串接方式）。
+def _fetch_google_sheet_records(tab_name):
+  """共用的 Google Sheet 讀取邏輯（BOM／訂單資訊／銷售歷史都靠這支）。
 
-  未設定 GOOGLE_SHEETS_CREDENTIALS_JSON / BOM_GOOGLE_SHEET_ID 任一環境變數
-  時，回傳 None（代表「沒有要用 Google Sheets」，呼叫端會自動退回 Excel），
-  跟「有設定但讀取失敗」（回傳空 dict）要分開，才不會誤判成「這個品項真
-  的沒有子件」。
+  回傳 None 代表「沒有設定 Google Sheets」（呼叫端應退回其他備援來源）；
+  回傳空 list 代表「有設定，但讀取失敗，或該分頁本來就沒有資料」。
+  這兩種情況要分開，才不會把「沒設定」誤判成「設定了但是空的」。
 
   設定步驟：
   1. Google Cloud Console 建立服務帳號，下載 JSON 金鑰
   2. 把金鑰 JSON 的完整內容存進環境變數 GOOGLE_SHEETS_CREDENTIALS_JSON
   3. 把該服務帳號的 email（金鑰 JSON 裡的 client_email）加入 Google
      Sheet 的「共用」名單，權限「檢視者」即可
-  4. 設定 BOM_GOOGLE_SHEET_ID（Sheet 網址中 /d/ 與 /edit 中間那串）
-  5. 分頁名稱要跟 BOM_GOOGLE_SHEET_TAB（預設「組合明細」）一致，
-     欄位標題要跟本檔案裡的 BOM_COL_* 常數完全一致
+  4. 設定 GOOGLE_SHEET_ID（Sheet 網址中 /d/ 與 /edit 中間那串）
+  5. 分頁名稱要跟 BOM_GOOGLE_SHEET_TAB／ORDERS_GOOGLE_SHEET_TAB／
+     SALES_HISTORY_GOOGLE_SHEET_TAB 一致，欄位標題要跟本檔案裡的
+     BOM_COL_* / ORDER_COL_* / SALES_COL_* 常數完全一致
   6. requirements.txt 需要加上 gspread、google-auth
   """
-  if not GOOGLE_SHEETS_CREDENTIALS_JSON or not BOM_GOOGLE_SHEET_ID:
+  if not GOOGLE_SHEETS_CREDENTIALS_JSON or not GOOGLE_SHEET_ID:
     return None
 
   try:
@@ -590,29 +597,145 @@ def load_bom_from_google_sheet():
         scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
     )
     gc = gspread.authorize(creds)
-    sh = gc.open_by_key(BOM_GOOGLE_SHEET_ID)
-    ws = sh.worksheet(BOM_GOOGLE_SHEET_TAB)
-    records = ws.get_all_records()
+    sh = gc.open_by_key(GOOGLE_SHEET_ID)
+    ws = sh.worksheet(tab_name)
+    return ws.get_all_records()
   except Exception as e:
-    print(f"讀取 Google Sheet 商品組合明細失敗，暫時改用本機 Excel 備援：{e}")
-    return {}
+    print(f"讀取 Google Sheet「{tab_name}」分頁失敗：{e}")
+    return []
 
+
+def load_bom_from_google_sheet():
+  """讀取 Google Sheet 版的「BOM表」分頁；None＝未設定，[]/dict＝已設定"""
+  records = _fetch_google_sheet_records(BOM_GOOGLE_SHEET_TAB)
+  if records is None:
+    return None
   bom_map = _parse_bom_records(records)
   print(
-      f"Google Sheet 商品組合明細讀取完成：共 {len(bom_map)} 個主件品號、"
+      f"Google Sheet BOM表讀取完成：共 {len(bom_map)} 個主件品號、"
       f"{sum(len(v) for v in bom_map.values())} 筆子件關係"
   )
   return bom_map
 
 
 def load_bom_data():
-  """統一入口：優先讀 Google Sheets，沒設定或設定但失敗時自動退回本機
-  Excel（過渡期相容），回傳 (bom_map, 資料來源標籤)。
+  """統一入口：優先讀 Google Sheets，沒設定時自動退回本機 Excel（過渡期
+  相容），回傳 (bom_map, 資料來源標籤)。
   """
   sheet_result = load_bom_from_google_sheet()
   if sheet_result is not None:
     return sheet_result, "Google Sheets"
   return load_bom_from_excel(BOM_EXCEL_PATH), "本機 Excel（尚未設定 Google Sheets）"
+
+
+# ---- 訂單資訊（Google Sheet，手動覆蓋更新／後續可改自動抓取） ----
+# 因 A1 API 只能上傳訂單、無法查詢訂單（手冊只有 Orders[Post]，沒有對應
+# 的取得端點），出貨排程/缺貨預警需要的「未來訂單」資料改成人工／其他
+# 系統匯出後貼進這份 Google Sheet，程式只負責讀取跟計算。
+ORDER_COL_NO = "訂單編號（選填）"
+ORDER_COL_ITEM_ID = "品號"
+ORDER_COL_ITEM_NAME = "品名（選填，供參考）"
+ORDER_COL_DUE_DATE = "預計出貨日"
+ORDER_COL_QTY = "預計出貨數量"
+ORDER_COL_STATUS = "狀態（選填：未出貨/備貨中/已出貨）"
+ORDER_COL_MEMO = "備註"
+
+
+def _parse_flexible_date(raw):
+  """把 Google Sheet 裡各種日期寫法（2026/8/10、2026-08-10...）轉成
+  Python date；轉不出來就回傳 None，呼叫端會跳過該列，不會讓整批資料
+  因為一列日期寫錯就整個讀取失敗。
+  """
+  if raw in (None, ""):
+    return None
+  try:
+    ts = pd.to_datetime(raw)
+    if pd.isna(ts):
+      return None
+    return ts.date()
+  except (ValueError, TypeError):
+    return None
+
+
+def _parse_order_records(records):
+  orders = []
+  for row in records:
+    item_id = str(row.get(ORDER_COL_ITEM_ID, "") or "").strip()
+    due_date = _parse_flexible_date(row.get(ORDER_COL_DUE_DATE))
+    if not item_id or due_date is None:
+      continue  # 沒填品號或日期格式看不懂的列，直接跳過，不擋整批匯入
+
+    qty_raw = str(row.get(ORDER_COL_QTY, "") or "").strip()
+    try:
+      qty = float(qty_raw) if qty_raw else 0.0
+    except ValueError:
+      qty = 0.0
+
+    status = str(row.get(ORDER_COL_STATUS, "") or "").strip() or "未出貨"
+
+    orders.append({
+        "訂單編號": str(row.get(ORDER_COL_NO, "") or "").strip(),
+        "品號": item_id,
+        "品名": str(row.get(ORDER_COL_ITEM_NAME, "") or "").strip(),
+        "預計出貨日": due_date,
+        "預計出貨數量": qty,
+        "狀態": status,
+        "備註": str(row.get(ORDER_COL_MEMO, "") or "").strip(),
+    })
+  return orders
+
+
+def load_orders_from_google_sheet():
+  """讀取「訂單資訊」分頁。回傳 (orders, configured)。
+
+  configured=False 代表 Google Sheets 根本沒設定；這種情況下畫面要顯示
+  「請先設定 Google Sheets」而不是「目前沒有訂單」，兩種情況給使用者的
+  訊息應該不一樣。
+  """
+  records = _fetch_google_sheet_records(ORDERS_GOOGLE_SHEET_TAB)
+  if records is None:
+    return [], False
+  orders = _parse_order_records(records)
+  print(f"訂單資訊讀取完成：共 {len(orders)} 筆有效訂單列")
+  return orders, True
+
+
+# ---- 銷售歷史（Google Sheet，用於 5.3 庫存週轉率/滯銷品分析） ----
+SALES_COL_YM = "年月"
+SALES_COL_ITEM_ID = "品號"
+SALES_COL_ITEM_NAME = "品名（選填，供參考）"
+SALES_COL_QTY = "銷售數量"
+
+
+def _parse_sales_history_records(records):
+  rows = []
+  for row in records:
+    item_id = str(row.get(SALES_COL_ITEM_ID, "") or "").strip()
+    year_month = str(row.get(SALES_COL_YM, "") or "").strip()
+    if not item_id or not year_month:
+      continue
+    qty_raw = str(row.get(SALES_COL_QTY, "") or "").strip()
+    try:
+      qty = float(qty_raw) if qty_raw else 0.0
+    except ValueError:
+      qty = 0.0
+    rows.append({
+        "年月": year_month,
+        "品號": item_id,
+        "品名": str(row.get(SALES_COL_ITEM_NAME, "") or "").strip(),
+        "銷售數量": qty,
+    })
+  return rows
+
+
+def load_sales_history_from_google_sheet():
+  """讀取「銷售歷史」分頁。回傳 (sales_rows, configured)，意義同上。"""
+  records = _fetch_google_sheet_records(SALES_HISTORY_GOOGLE_SHEET_TAB)
+  if records is None:
+    return [], False
+  rows = _parse_sales_history_records(records)
+  print(f"銷售歷史讀取完成：共 {len(rows)} 筆有效紀錄")
+  return rows, True
 
 
 # -------------------------------------------------------------------------
@@ -621,6 +744,211 @@ def load_bom_data():
 # 之後陸續串接時只要比照 render_hai_tao_ke_page() 的寫法為它們各自建立
 # render_xxx_page() 即可。
 # -------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# 顏色標籤：儀表板／提醒中心統一用這組顏色分辨「嚴重程度」
+# danger=紅（已逾期/缺口大，立即處理）、warning=黃（提前準備）、
+# info=藍綠（一般提醒）、success=綠（狀況良好）
+# -------------------------------------------------------------------------
+SEVERITY_STYLES = {
+    "danger": {
+        "box": "bg-[#fdecea] border-[#f5c2c0]",
+        "text": "text-red-700",
+        "badge": "bg-red-700 text-white",
+        "label": "緊急",
+    },
+    "warning": {
+        "box": "bg-[#fff8e6] border-[#f0dca0]",
+        "text": "text-amber-800",
+        "badge": "bg-amber-500 text-white",
+        "label": "注意",
+    },
+    "info": {
+        "box": "bg-[#e8f6f5] border-[#bfe6e3]",
+        "text": "text-teal-800",
+        "badge": "bg-teal-600 text-white",
+        "label": "提醒",
+    },
+    "success": {
+        "box": "bg-[#eaf6ec] border-[#bfe3c5]",
+        "text": "text-green-800",
+        "badge": "bg-green-700 text-white",
+        "label": "正常",
+    },
+}
+
+
+def compute_order_demand_alerts(orders, items_map, bom_map, stock_lookup, settings, horizon_days=30):
+  """核心運算：把「訂單資訊」Google Sheet 的未來出貨需求，展開 BOM 子件，
+  跟目前庫存比對，算出：
+    1. 未來 horizon_days 天內要出貨、但成品庫存不夠的品項
+    2. 因此連帶需要補的原料/子件缺口，以及建議下單日
+       （建議下單日 = 最早相關出貨日 － 採購前置天數 － 生產工時）
+  這支函式同時餵給「1. 儀表板」「3. 訂單與出貨管理」「4. 生產與包裝排程」，
+  確保三個頁面看到的是同一套邏輯算出來的數字，不會互相矛盾。
+
+  簡化假設（先講清楚，之後有更多資料再精進）：
+  - 沒有追蹤「在途採購量」，缺口＝需求－現有庫存，沒有扣掉已下單未到貨的量
+  - 建議下單日抓「最早相關出貨日」回推，同一原料被多張訂單用到時，用最早
+    那張抓緊
+  """
+  today = datetime.now().date()
+  horizon_end = today + timedelta(days=horizon_days)
+  default_lead_time = settings.get("default_lead_time_days", 7)
+
+  orders_in_horizon = [
+      o
+      for o in orders
+      if o["狀態"] != "已出貨" and today <= o["預計出貨日"] <= horizon_end
+  ]
+
+  demand_by_item = defaultdict(float)
+  earliest_due_by_item = {}
+  for o in orders_in_horizon:
+    demand_by_item[o["品號"]] += o["預計出貨數量"]
+    if o["品號"] not in earliest_due_by_item or o["預計出貨日"] < earliest_due_by_item[o["品號"]]:
+      earliest_due_by_item[o["品號"]] = o["預計出貨日"]
+
+  finished_goods_shortfall = []
+  raw_material_demand = defaultdict(float)
+  raw_material_earliest_due = {}
+  raw_material_work_days = defaultdict(float)
+
+  for item_id, demand_qty in demand_by_item.items():
+    current_stock = stock_lookup.get(item_id, 0.0)
+    shortage = demand_qty - current_stock
+    info = items_map.get(item_id, {})
+    if shortage <= 0:
+      continue
+
+    finished_goods_shortfall.append({
+        "品號": item_id,
+        "品名": info.get("Name"),
+        "未來需求量": demand_qty,
+        "現有庫存": current_stock,
+        "缺口": round(shortage, 2),
+        "最早出貨日": earliest_due_by_item.get(item_id, today).isoformat(),
+    })
+
+    for comp in bom_map.get(item_id, []):
+      loss_rate = comp.get("損耗率") or 0
+      try:
+        loss_rate = float(loss_rate)
+      except (TypeError, ValueError):
+        loss_rate = 0.0
+      try:
+        unit_qty = float(comp.get("用量") or 0)
+      except (TypeError, ValueError):
+        unit_qty = 0.0
+      multiplier = 1 + (loss_rate / 100 if loss_rate else 0)
+      child_id = comp["子件品號"]
+      raw_material_demand[child_id] += shortage * unit_qty * multiplier
+
+      due = earliest_due_by_item.get(item_id, today)
+      if child_id not in raw_material_earliest_due or due < raw_material_earliest_due[child_id]:
+        raw_material_earliest_due[child_id] = due
+
+      work_days = comp.get("生產工時天數") or 0
+      try:
+        work_days = float(work_days)
+      except (TypeError, ValueError):
+        work_days = 0.0
+      raw_material_work_days[child_id] = max(raw_material_work_days[child_id], work_days)
+
+  raw_material_shortfall = []
+  for child_id, need_qty in raw_material_demand.items():
+    current_stock = stock_lookup.get(child_id, 0.0)
+    gap = need_qty - current_stock
+    if gap <= 0:
+      continue
+    info = items_map.get(child_id, {})
+
+    lead_time = None
+    for components in bom_map.values():
+      for comp in components:
+        if comp["子件品號"] == child_id:
+          lt = comp.get("採購前置天數")
+          if isinstance(lt, (int, float)) and lt > 0:
+            lead_time = lt
+      if lead_time is not None:
+        break
+    lead_time = lead_time if lead_time is not None else default_lead_time
+
+    due_date = raw_material_earliest_due.get(child_id, today)
+    work_days = raw_material_work_days.get(child_id, 0)
+    suggested_order_date = due_date - timedelta(days=lead_time + work_days)
+
+    days_until_order = (suggested_order_date - today).days
+    if days_until_order < 0:
+      severity = "danger"
+    elif days_until_order <= 3:
+      severity = "warning"
+    else:
+      severity = "info"
+
+    raw_material_shortfall.append({
+        "品號": child_id,
+        "品名": info.get("Name"),
+        "未來需求量(含損耗)": round(need_qty, 2),
+        "現有庫存": current_stock,
+        "缺口": round(gap, 2),
+        "採購前置天數": lead_time,
+        "建議下單日": suggested_order_date.isoformat(),
+        "severity": severity,
+    })
+
+  raw_material_shortfall.sort(key=lambda r: r["建議下單日"])
+  finished_goods_shortfall.sort(key=lambda r: r["缺口"], reverse=True)
+
+  return {
+      "orders_in_horizon": orders_in_horizon,
+      "finished_goods_shortfall": finished_goods_shortfall,
+      "raw_material_shortfall": raw_material_shortfall,
+  }
+
+
+def compute_turnover_metrics(sales_history, stock_lookup, items_map, slow_moving_days=90):
+  """5.3 庫存週轉率／滯銷品分析：用「銷售歷史」Google Sheet 抓每個品號最近
+  3 個月的月銷量，算出週轉天數 = 現有庫存 ÷ 日均銷量。週轉天數異常長（或
+  完全沒賣出過、但還有庫存）就標記為滯銷。
+  """
+  by_item = defaultdict(list)
+  for row in sales_history:
+    by_item[row["品號"]].append(row)
+
+  results = []
+  for item_id, records in by_item.items():
+    records_sorted = sorted(records, key=lambda r: r["年月"])
+    last3 = records_sorted[-3:]
+    avg_monthly = (
+        sum(r["銷售數量"] for r in last3) / len(last3) if last3 else 0.0
+    )
+    current_stock = stock_lookup.get(item_id, 0.0)
+    daily_avg = avg_monthly / 30 if avg_monthly else 0.0
+    turnover_days = (current_stock / daily_avg) if daily_avg > 0 else None
+
+    info = items_map.get(item_id, {})
+    item_name = info.get("Name") or (records[-1]["品名"] if records else "")
+
+    is_slow_moving = current_stock > 0 and (
+        turnover_days is None or turnover_days > slow_moving_days
+    )
+
+    results.append({
+        "品號": item_id,
+        "品名": item_name,
+        "近3月平均月銷": round(avg_monthly, 1),
+        "現有庫存": current_stock,
+        "庫存週轉天數": round(turnover_days, 1) if turnover_days is not None else "從未銷售",
+        "滯銷": "是" if is_slow_moving else "否",
+    })
+
+  results.sort(
+      key=lambda r: (r["庫存週轉天數"] if isinstance(r["庫存週轉天數"], (int, float)) else 999999),
+      reverse=True,
+  )
+  return results
+
+
 COMPANIES = ["興聖(股)公司", "海濤客食品工業(股)公司", "容鴻(股)公司", "芙萊柏(股)公司"]
 ACTIVE_COMPANY_LABEL = "海濤客食品工業(股)公司"
 
@@ -628,11 +956,17 @@ ACTIVE_COMPANY_LABEL = "海濤客食品工業(股)公司"
 # 初始化全域狀態
 initial_df, initial_whs, initial_cats, initial_items_map = fetch_all_a1_inventory()
 initial_bom_map, initial_bom_source = load_bom_data()
+initial_orders, initial_orders_configured = load_orders_from_google_sheet()
+initial_sales_history, initial_sales_configured = load_sales_history_from_google_sheet()
 app_state = {
     "df": initial_df,
     "items_map": initial_items_map,
     "bom_map": initial_bom_map,
     "bom_source": initial_bom_source,
+    "orders": initial_orders,
+    "orders_configured": initial_orders_configured,
+    "sales_history": initial_sales_history,
+    "sales_history_configured": initial_sales_configured,
     "lot_nos": [],  # 批號資料改成頁籤點開時才抓（避免每次啟動都多打一支 API）
     # 6.1 同步狀態／錯誤日誌：每次 handle_sync 執行後會 append 一筆，
     # 只保留最新 20 筆，供「系統設定」頁籤顯示
@@ -644,6 +978,7 @@ app_state = {
     "settings": {
         "low_stock_alert_ratio": 1.0,  # 庫存 <= 安全庫存 * 此比例 視為風險
         "default_lead_time_days": 7,   # 沒在 BOM 填前置天數時的預設值
+        "slow_moving_days": 90,        # 週轉天數超過此值視為滯銷
     },
     "warehouses": (
         initial_whs
@@ -734,6 +1069,17 @@ def inventory_dashboard():
           if cats:
             app_state["categories"] = cats
 
+          # 同步時順便重新讀取三份 Google Sheet 資料，這樣按一次「同步」
+          # 就能拿到最新的庫存 + BOM + 訂單 + 銷售歷史，不用分開點好幾個
+          # 「重新載入」按鈕
+          app_state["bom_map"], app_state["bom_source"] = load_bom_data()
+          app_state["orders"], app_state["orders_configured"] = (
+              load_orders_from_google_sheet()
+          )
+          app_state["sales_history"], app_state["sales_history_configured"] = (
+              load_sales_history_from_google_sheet()
+          )
+
           is_mock = API_KEY == "" or API_PASSWORD == ""
           status = "成功（防呆資料，未設定 A1 憑證）" if is_mock else "成功"
         except Exception as e:  # 保底：同步過程任何未預期錯誤都不讓頁面掛掉
@@ -770,6 +1116,9 @@ def inventory_dashboard():
             "update_dashboard",
             "update_sync_log",
             "update_procurement_list",
+            "update_orders_list",
+            "update_packing_schedule",
+            "update_turnover_list",
         ):
           if ref_key in refs:
             refs[ref_key]()
@@ -802,31 +1151,51 @@ def inventory_dashboard():
                 "w-full p-6 bg-white border border-[#e2e1dc] shadow-none"
                 " rounded-none"
             ):
-              with ui.row().classes(
-                  "w-full p-3 mb-4 bg-[#e8f6f5] border border-[#bfe6e3]"
-              ):
-                ui.label(
-                    "目前可算的是「現有庫存 vs A1 商品主檔的安全存量"
-                    "(SafetyStock)」——這是 A1 本身就有、但原本沒人在用"
-                    "的欄位。「未來 7/14/30 天出貨預估」「今日預計出貨"
-                    "訂單數」需要訂單/通路需求資料，A1 目前的 API 只能"
-                    "上傳訂單、無法查詢，這塊等通路需求的 Google Sheets "
-                    "串接好之後再補上，屆時這裡會自動更新，不用改版面。"
-                ).classes("text-xs text-teal-800")
-
+              dashboard_source_label = ui.label().classes(
+                  "text-xs text-zinc-500 mb-4"
+              )
               dashboard_kpi_row = ui.row().classes("w-full gap-4 mb-6 flex-wrap")
-              dashboard_alert_label = ui.label().classes(
+
+              ui.label("提醒／公告中心").classes(
                   "text-sm font-bold text-zinc-700 mb-2"
+              )
+              dashboard_announce_container = ui.column().classes("w-full gap-2 mb-6")
+
+              ui.label("低於安全庫存清單（現有庫存 vs A1 安全存量）").classes(
+                  "text-sm font-bold text-zinc-700 mb-2"
+              )
+              dashboard_alert_label = ui.label().classes(
+                  "text-xs text-zinc-500 mb-2"
               )
               dashboard_alert_container = ui.column().classes("w-full")
 
+              def _severity_box(severity, text):
+                style = SEVERITY_STYLES[severity]
+                with ui.row().classes(
+                    f"w-full items-center gap-2 p-2 border {style['box']}"
+                ):
+                  ui.label(style["label"]).classes(
+                      f"text-[11px] px-2 py-0.5 rounded-none font-bold"
+                      f" {style['badge']}"
+                  )
+                  ui.label(text).classes(f"text-xs {style['text']} flex-1")
+
               def update_dashboard():
                 dashboard_kpi_row.clear()
+                dashboard_announce_container.clear()
                 dashboard_alert_container.clear()
 
                 df = app_state["df"].copy()
                 items_map = app_state.get("items_map", {})
+                bom_map = app_state.get("bom_map", {})
+                orders = app_state.get("orders", [])
+                orders_configured = app_state.get("orders_configured", False)
                 settings = app_state["settings"]
+
+                dashboard_source_label.text = (
+                    f"庫存來源：鼎新 A1｜BOM 來源：{app_state.get('bom_source', '未知')}"
+                    f"｜訂單來源：{'Google Sheets' if orders_configured else '尚未設定 Google Sheets'}"
+                )
 
                 # 依品號彙總庫存（同一品號在不同倉庫的加總）
                 if not df.empty:
@@ -839,6 +1208,7 @@ def inventory_dashboard():
                 else:
                   stock_lookup = {}
 
+                # ---- 低於安全庫存清單（沿用原本邏輯）----
                 total_value = 0.0
                 risk_rows = []
                 for item_id, info in items_map.items():
@@ -863,20 +1233,33 @@ def inventory_dashboard():
                         "安全存量": safety_stock,
                         "缺口": round(safety_stock - current_stock, 2),
                     })
-
                 risk_rows.sort(key=lambda r: r["缺口"], reverse=True)
+
+                # ---- 1.1/1.2/1.3：訂單需求 + BOM 展開缺貨預警 ----
+                today = datetime.now().date()
+                result_30 = compute_order_demand_alerts(
+                    orders, items_map, bom_map, stock_lookup, settings,
+                    horizon_days=30,
+                )
+                orders_today = [
+                    o for o in orders
+                    if o["狀態"] != "已出貨" and o["預計出貨日"] == today
+                ]
+                today_qty = sum(o["預計出貨數量"] for o in orders_today)
 
                 with dashboard_kpi_row:
                   kpi_cards = [
                       ("集團／本公司庫存總值（估）", f"NT$ {total_value:,.0f}"),
                       ("低於安全庫存品項數", f"{len(risk_rows)} 項"),
                       (
-                          "建議立即採購品項",
-                          f"{sum(1 for r in risk_rows if r['缺口'] > 0)} 項",
+                          "今日預計出貨訂單數／總量",
+                          f"{len(orders_today)} 張／{today_qty:g}"
+                          if orders_configured else "－（待設定 Google Sheets）",
                       ),
                       (
-                          "今日預計出貨訂單數",
-                          "－（待訂單資料源）",
+                          "未來30天缺貨風險品項",
+                          f"{len(result_30['finished_goods_shortfall']) + len(result_30['raw_material_shortfall'])} 項"
+                          if orders_configured else "－（待設定 Google Sheets）",
                       ),
                   ]
                   for label, value in kpi_cards:
@@ -889,9 +1272,51 @@ def inventory_dashboard():
                           "text-xl font-black text-zinc-900"
                       )
 
+                # ---- 提醒／公告中心：出貨提醒 + 補貨建議，統一用顏色分級 ----
+                with dashboard_announce_container:
+                  if not orders_configured:
+                    ui.label(
+                        "尚未設定 Google Sheets「訂單資訊」分頁，暫時無法"
+                        "顯示出貨與補貨提醒，設定方式見「6. 系統設定」。"
+                    ).classes("text-xs text-zinc-400")
+                  else:
+                    any_announcement = False
+                    for o in sorted(
+                        result_30["orders_in_horizon"],
+                        key=lambda x: x["預計出貨日"],
+                    )[:8]:
+                      days_left = (o["預計出貨日"] - today).days
+                      if days_left <= 1:
+                        severity = "danger"
+                      elif days_left <= 3:
+                        severity = "warning"
+                      else:
+                        severity = "info"
+                      order_label = o["訂單編號"] or o["品號"]
+                      _severity_box(
+                          severity,
+                          f"訂單 {order_label}（{o.get('品名') or o['品號']}）"
+                          f"需於 {o['預計出貨日'].isoformat()} 出貨"
+                          f"（數量 {o['預計出貨數量']:g}）",
+                      )
+                      any_announcement = True
+
+                    for m in result_30["raw_material_shortfall"][:8]:
+                      _severity_box(
+                          m["severity"],
+                          f"建議補貨：{m.get('品名') or m['品號']}"
+                          f"（缺口 {m['缺口']:g}），建議下單日"
+                          f" {m['建議下單日']}",
+                      )
+                      any_announcement = True
+
+                    if not any_announcement:
+                      _severity_box(
+                          "success", "未來 30 天內沒有已知的出貨或補貨提醒"
+                      )
+
                 dashboard_alert_label.text = (
-                    f"缺貨/採購風險清單（依「缺口」由大到小排序，"
-                    f"共 {len(risk_rows)} 項）"
+                    f"依「缺口」由大到小排序，共 {len(risk_rows)} 項"
                 )
                 with dashboard_alert_container:
                   if not risk_rows:
@@ -1552,17 +1977,92 @@ def inventory_dashboard():
                   "text-lg font-bold text-zinc-900 tracking-wide mb-3"
               )
               with ui.row().classes(
-                  "w-full p-4 bg-[#fdecea] border border-[#f5c2c0]"
+                  "w-full p-3 mb-4 bg-[#e8f6f5] border border-[#bfe6e3]"
               ):
                 ui.label(
-                    "⚠ 規劃中，卡在 A1 API 本身的限制：手冊裡 Orders 只有"
-                    "「[Post] 上傳訂單」，沒有對應的查詢/取得端點，訂單資料"
-                    "進得去、拉不出來，所以無法從 A1 直接產生「訂單需求清單」"
-                    "或「出貨量統計」。這塊需要另一個資料來源——例如之前"
-                    "討論的「通路填報」Google Sheet（各通路每月填報的品名/"
-                    "數量），等那份 Sheet 串接完成，這裡就能顯示訂單需求清單"
-                    "與出貨量趨勢，頁面架構已經留好，屆時直接接上就好。"
-                ).classes("text-xs text-red-700")
+                    "資料來源：Google Sheets「訂單資訊」分頁（手動覆蓋更新，"
+                    "非即時自動抓取；A1 本身沒有查詢訂單的 API，只能上傳，"
+                    "所以這裡改讀 Sheet）。只需要維護「品號、預計出貨日、"
+                    "預計出貨數量」，後面的 BOM 表會自動判斷是否需要補貨。"
+                ).classes("text-xs text-teal-800")
+
+              with ui.row().classes("items-center gap-3 flex-wrap mb-3"):
+                orders_search_input = ui.input(
+                    placeholder="輸入品號、品名或訂單編號..."
+                ).classes("w-64 text-xs")
+                orders_status_select = ui.select(
+                    options=["全部狀態", "未出貨", "備貨中", "已出貨"],
+                    value="全部狀態",
+                ).classes(
+                    "bg-[#f7f6f2] text-zinc-900 rounded-none px-3 py-1"
+                    " text-xs font-bold border border-[#e2e1dc]"
+                )
+
+              orders_stats_label = ui.label().classes(
+                  "text-xs text-zinc-500 mb-3"
+              )
+              orders_table_container = ui.column().classes("w-full")
+
+              def update_orders_list():
+                orders_table_container.clear()
+                orders = app_state.get("orders", [])
+                configured = app_state.get("orders_configured", False)
+
+                if not configured:
+                  orders_stats_label.text = ""
+                  with orders_table_container:
+                    ui.label(
+                        "尚未設定 Google Sheets，請見「6. 系統設定」的設定"
+                        "說明。"
+                    ).classes("text-xs text-zinc-400")
+                  return
+
+                rows = list(orders)
+                keyword = (orders_search_input.value or "").strip().lower()
+                if keyword:
+                  rows = [
+                      r for r in rows
+                      if keyword in str(r["品號"]).lower()
+                      or keyword in str(r.get("品名", "")).lower()
+                      or keyword in str(r.get("訂單編號", "")).lower()
+                  ]
+                if orders_status_select.value != "全部狀態":
+                  rows = [r for r in rows if r["狀態"] == orders_status_select.value]
+
+                rows = sorted(rows, key=lambda r: r["預計出貨日"])
+                display_rows = [
+                    {**r, "預計出貨日": r["預計出貨日"].isoformat()}
+                    for r in rows
+                ]
+
+                total_qty = sum(r["預計出貨數量"] for r in rows)
+                orders_stats_label.text = (
+                    f"共 {len(rows)} 筆訂單｜預計出貨總量 {total_qty:g}"
+                )
+
+                with orders_table_container:
+                  if not rows:
+                    ui.label("目前沒有符合條件的訂單資料").classes(
+                        "text-xs text-zinc-400"
+                    )
+                  else:
+                    ui.table(
+                        columns=[
+                            {"name": "訂單編號", "label": "訂單編號", "field": "訂單編號", "align": "left"},
+                            {"name": "品號", "label": "品號", "field": "品號", "align": "left"},
+                            {"name": "品名", "label": "品名", "field": "品名", "align": "left"},
+                            {"name": "預計出貨日", "label": "預計出貨日", "field": "預計出貨日"},
+                            {"name": "預計出貨數量", "label": "預計出貨數量", "field": "預計出貨數量"},
+                            {"name": "狀態", "label": "狀態", "field": "狀態"},
+                            {"name": "備註", "label": "備註", "field": "備註", "align": "left"},
+                        ],
+                        rows=display_rows,
+                    ).classes("w-full")
+
+              orders_search_input.on_value_change(lambda e: update_orders_list())
+              orders_status_select.on_value_change(lambda e: update_orders_list())
+              update_orders_list()
+              refs["update_orders_list"] = update_orders_list
 
           # ==================================================
           # 4. 生產與包裝排程
@@ -1576,14 +2076,118 @@ def inventory_dashboard():
                   "text-lg font-bold text-zinc-900 tracking-wide mb-3"
               )
               with ui.row().classes(
-                  "w-full p-4 bg-[#fdecea] border border-[#f5c2c0]"
+                  "w-full p-3 mb-4 bg-[#e8f6f5] border border-[#bfe6e3]"
               ):
                 ui.label(
-                    "⚠ 規劃中，依賴第 3 點的訂單/出貨需求資料，還沒有資料"
-                    "來源。等訂單需求資料到位後，這裡會結合「商品組合資訊"
-                    "(BOM)」的用量與生產工時，自動算出包裝作業的先後順序，"
-                    "以及開工前需要備齊的原物料清單。"
-                ).classes("text-xs text-red-700")
+                    "依「訂單資訊」的預計出貨日排序，並用「商品組合資訊"
+                    "(BOM)」展開子件用量，跟目前庫存比對——原料/半成品不夠"
+                    "的品項會標示出來，方便提前備料。同一套邏輯跟「1. 儀表板"
+                    "」「3. 訂單與出貨管理」共用，數字會一致。"
+                ).classes("text-xs text-teal-800")
+
+              packing_stats_label = ui.label().classes(
+                  "text-xs text-zinc-500 mb-2"
+              )
+              packing_schedule_container = ui.column().classes("w-full mb-6")
+
+              ui.label("原物料備料需求（未來 30 天內，依建議下單日排序）").classes(
+                  "text-sm font-bold text-zinc-700 mb-2"
+              )
+              packing_material_container = ui.column().classes("w-full")
+
+              def update_packing_schedule():
+                packing_schedule_container.clear()
+                packing_material_container.clear()
+
+                orders = app_state.get("orders", [])
+                configured = app_state.get("orders_configured", False)
+                if not configured:
+                  packing_stats_label.text = ""
+                  with packing_schedule_container:
+                    ui.label(
+                        "尚未設定 Google Sheets，請見「6. 系統設定」的設定"
+                        "說明。"
+                    ).classes("text-xs text-zinc-400")
+                  return
+
+                items_map = app_state.get("items_map", {})
+                bom_map = app_state.get("bom_map", {})
+                df = app_state["df"].copy()
+                settings = app_state["settings"]
+
+                if not df.empty:
+                  stock_by_item = df.groupby("品號", as_index=False)[
+                      "庫存數量"
+                  ].sum()
+                  stock_lookup = dict(
+                      zip(stock_by_item["品號"], stock_by_item["庫存數量"])
+                  )
+                else:
+                  stock_lookup = {}
+
+                result = compute_order_demand_alerts(
+                    orders, items_map, bom_map, stock_lookup, settings,
+                    horizon_days=30,
+                )
+                shortfall_by_item = {
+                    r["品號"]: r for r in result["finished_goods_shortfall"]
+                }
+
+                today = datetime.now().date()
+                schedule_rows = sorted(
+                    result["orders_in_horizon"], key=lambda o: o["預計出貨日"]
+                )
+                packing_stats_label.text = (
+                    f"未來 30 天共 {len(schedule_rows)} 筆待包裝/出貨訂單"
+                )
+
+                with packing_schedule_container:
+                  if not schedule_rows:
+                    ui.label("未來 30 天內沒有待處理的訂單").classes(
+                        "text-xs text-zinc-400"
+                    )
+                  else:
+                    for o in schedule_rows:
+                      days_left = (o["預計出貨日"] - today).days
+                      has_shortage = o["品號"] in shortfall_by_item
+                      severity = (
+                          "danger" if has_shortage and days_left <= 3
+                          else "warning" if has_shortage
+                          else "success" if days_left <= 1
+                          else "info"
+                      )
+                      status_text = (
+                          "⚠ 成品庫存不足，需先確認能否即時生產/組裝"
+                          if has_shortage else "成品庫存足夠，可直接安排包裝"
+                      )
+                      _severity_box(
+                          severity,
+                          f"{o['預計出貨日'].isoformat()}（{days_left}天後）"
+                          f"｜{o.get('品名') or o['品號']}｜數量"
+                          f" {o['預計出貨數量']:g}｜{status_text}",
+                      )
+
+                with packing_material_container:
+                  if not result["raw_material_shortfall"]:
+                    ui.label("目前沒有原物料缺口").classes(
+                        "text-xs text-zinc-400"
+                    )
+                  else:
+                    ui.table(
+                        columns=[
+                            {"name": "品號", "label": "品號", "field": "品號", "align": "left"},
+                            {"name": "品名", "label": "品名", "field": "品名", "align": "left"},
+                            {"name": "未來需求量(含損耗)", "label": "未來需求量(含損耗)", "field": "未來需求量(含損耗)"},
+                            {"name": "現有庫存", "label": "現有庫存", "field": "現有庫存"},
+                            {"name": "缺口", "label": "缺口", "field": "缺口"},
+                            {"name": "採購前置天數", "label": "採購前置天數", "field": "採購前置天數"},
+                            {"name": "建議下單日", "label": "建議下單日", "field": "建議下單日"},
+                        ],
+                        rows=result["raw_material_shortfall"],
+                    ).classes("w-full")
+
+              update_packing_schedule()
+              refs["update_packing_schedule"] = update_packing_schedule
 
           # ==================================================
           # 5. 採購分析與決策支援
@@ -1600,13 +2204,18 @@ def inventory_dashboard():
                   "w-full p-3 mb-4 bg-[#fff8e6] border border-[#f0dca0]"
               ):
                 ui.label(
-                    "目前是簡化版：淨需求只用「安全庫存 − 現有庫存」計算，"
-                    "沒有把未來訂單需求（BOM 展開）算進去，因為訂單資料還沒"
-                    "有來源（見第 3 點）。「供應商歷史採購單價走勢」「庫存"
-                    "週轉率／滯銷品分析」需要銷售歷史資料，目前只有設計、"
-                    "還沒寫進程式碼，之後接上通路填報/銷售歷史 Google Sheet "
-                    "後會自動補上，不用改版面。"
+                    "下方「5.1 簡化版建議採購量」只用「安全庫存 − 現有庫存」"
+                    "計算，沒有把訂單需求算進去；含訂單/BOM 展開的完整版本"
+                    "在「4. 生產與包裝排程」的「原物料備料需求」表，兩者"
+                    "算法不同，用途也不同（這裡是長期安全庫存基準，第4點"
+                    "是短期訂單驅動的緊急採購）。「供應商歷史採購單價走勢」"
+                    "仍是規劃中，需要額外記錄歷次採購單價，目前 A1/Sheets "
+                    "都還沒有這份資料。"
                 ).classes("text-xs text-amber-800")
+
+              ui.label("5.1 簡化版建議採購量（安全庫存基準）").classes(
+                  "text-sm font-bold text-zinc-700 mb-2"
+              )
 
               procurement_stats_label = ui.label().classes(
                   "text-xs text-zinc-500 mb-3"
@@ -1687,6 +2296,83 @@ def inventory_dashboard():
               update_procurement_list()
               refs["update_procurement_list"] = update_procurement_list
 
+              ui.separator().classes("my-6")
+
+              ui.label("5.3 庫存週轉率／滯銷品分析").classes(
+                  "text-sm font-bold text-zinc-700 mb-2"
+              )
+              with ui.row().classes(
+                  "w-full p-3 mb-4 bg-[#e8f6f5] border border-[#bfe6e3]"
+              ):
+                ui.label(
+                    "資料來源：Google Sheets「銷售歷史」分頁。用近 3 個月"
+                    "平均月銷量算週轉天數 = 現有庫存 ÷ 日均銷量；週轉天數"
+                    "超過設定值（預設 90 天）或完全沒賣出過但還有庫存，"
+                    "標記為滯銷。"
+                ).classes("text-xs text-teal-800")
+
+              turnover_stats_label = ui.label().classes(
+                  "text-xs text-zinc-500 mb-3"
+              )
+              turnover_table_container = ui.column().classes("w-full")
+
+              def update_turnover_list():
+                turnover_table_container.clear()
+                sales_history = app_state.get("sales_history", [])
+                configured = app_state.get("sales_history_configured", False)
+
+                if not configured:
+                  turnover_stats_label.text = ""
+                  with turnover_table_container:
+                    ui.label(
+                        "尚未設定 Google Sheets，請見「6. 系統設定」的設定"
+                        "說明。"
+                    ).classes("text-xs text-zinc-400")
+                  return
+
+                df = app_state["df"].copy()
+                items_map = app_state.get("items_map", {})
+                if not df.empty:
+                  stock_by_item = df.groupby("品號", as_index=False)[
+                      "庫存數量"
+                  ].sum()
+                  stock_lookup = dict(
+                      zip(stock_by_item["品號"], stock_by_item["庫存數量"])
+                  )
+                else:
+                  stock_lookup = {}
+
+                slow_moving_days = app_state["settings"]["slow_moving_days"]
+                turnover_rows = compute_turnover_metrics(
+                    sales_history, stock_lookup, items_map, slow_moving_days
+                )
+                slow_count = sum(1 for r in turnover_rows if r["滯銷"] == "是")
+                turnover_stats_label.text = (
+                    f"共 {len(turnover_rows)} 項有銷售紀錄的品項｜"
+                    f"其中 {slow_count} 項判定為滯銷"
+                )
+
+                with turnover_table_container:
+                  if not turnover_rows:
+                    ui.label("尚無銷售歷史資料").classes(
+                        "text-xs text-zinc-400"
+                    )
+                  else:
+                    ui.table(
+                        columns=[
+                            {"name": "品號", "label": "品號", "field": "品號", "align": "left"},
+                            {"name": "品名", "label": "品名", "field": "品名", "align": "left"},
+                            {"name": "近3月平均月銷", "label": "近3月平均月銷", "field": "近3月平均月銷"},
+                            {"name": "現有庫存", "label": "現有庫存", "field": "現有庫存"},
+                            {"name": "庫存週轉天數", "label": "庫存週轉天數", "field": "庫存週轉天數"},
+                            {"name": "滯銷", "label": "滯銷", "field": "滯銷"},
+                        ],
+                        rows=turnover_rows,
+                    ).classes("w-full")
+
+              update_turnover_list()
+              refs["update_turnover_list"] = update_turnover_list
+
           # ==================================================
           # 6. 系統設定與同步管理
           # ==================================================
@@ -1737,14 +2423,17 @@ def inventory_dashboard():
                     "text-lg font-bold text-zinc-900 tracking-wide mb-3"
                 )
                 sheets_configured = bool(
-                    GOOGLE_SHEETS_CREDENTIALS_JSON and BOM_GOOGLE_SHEET_ID
+                    GOOGLE_SHEETS_CREDENTIALS_JSON and GOOGLE_SHEET_ID
                 )
                 ui.label(
                     "狀態："
                     + (
-                        "已設定，正在使用 Google Sheets 作為商品組合明細來源"
+                        "已設定，三份資料（BOM表／訂單資訊／銷售歷史）"
+                        "共用同一份 Google Sheet 讀取"
                         if sheets_configured
-                        else "尚未設定，目前使用本機 Excel 過渡方案"
+                        else "尚未設定。BOM表會退回本機 Excel 過渡方案；"
+                        "訂單資訊與銷售歷史目前沒有備援來源，相關頁面"
+                        "會顯示「尚未設定」"
                     )
                 ).classes(
                     "text-sm mb-2 "
@@ -1752,20 +2441,33 @@ def inventory_dashboard():
                 )
                 with ui.column().classes("gap-1"):
                   ui.label(
-                      f"Sheet ID：{BOM_GOOGLE_SHEET_ID or '（未設定）'}"
-                  ).classes("text-xs text-zinc-600")
-                  ui.label(
-                      f"工作表分頁名稱：{BOM_GOOGLE_SHEET_TAB}"
+                      f"Sheet ID：{GOOGLE_SHEET_ID or '（未設定）'}"
                   ).classes("text-xs text-zinc-600")
                   ui.label(
                       "服務帳號金鑰："
                       + ("已設定" if GOOGLE_SHEETS_CREDENTIALS_JSON else "（未設定）")
                   ).classes("text-xs text-zinc-600")
+                  for label, tab_name, source_state in (
+                      ("BOM表", BOM_GOOGLE_SHEET_TAB, app_state.get("bom_source")),
+                      (
+                          "訂單資訊", ORDERS_GOOGLE_SHEET_TAB,
+                          "Google Sheets" if app_state.get("orders_configured") else "尚未設定",
+                      ),
+                      (
+                          "銷售歷史", SALES_HISTORY_GOOGLE_SHEET_TAB,
+                          "Google Sheets" if app_state.get("sales_history_configured") else "尚未設定",
+                      ),
+                  ):
+                    ui.label(
+                        f"分頁「{tab_name}」（{label}）目前來源：{source_state}"
+                    ).classes("text-xs text-zinc-600")
                 ui.label(
                     "設定方式：環境變數 GOOGLE_SHEETS_CREDENTIALS_JSON（服務"
-                    "帳號金鑰 JSON 內容）、BOM_GOOGLE_SHEET_ID、"
-                    "BOM_GOOGLE_SHEET_TAB。三者皆設定齊全才會啟用，任一缺漏"
-                    "會自動退回本機 Excel，不會讓頁面壞掉。"
+                    "帳號金鑰 JSON 內容）、GOOGLE_SHEET_ID（三份資料共用同一"
+                    "個 Sheet ID，只是分頁不同）。分頁名稱可用"
+                    "BOM_GOOGLE_SHEET_TAB／ORDERS_GOOGLE_SHEET_TAB／"
+                    "SALES_HISTORY_GOOGLE_SHEET_TAB 自訂，預設分別是"
+                    "「BOM表」「訂單資訊」「銷售歷史」。"
                 ).classes("text-xs text-zinc-500 mt-2")
 
               # ---------------- 6.3：參數設定 ----------------
@@ -1804,6 +2506,17 @@ def inventory_dashboard():
                       step=1,
                   ).classes("w-24")
 
+                with ui.row().classes("items-center gap-3 mb-3"):
+                  ui.label("滯銷判定門檻（庫存週轉天數超過此值視為滯銷）").classes(
+                      "text-sm text-zinc-700"
+                  )
+                  slow_moving_input = ui.number(
+                      value=app_state["settings"]["slow_moving_days"],
+                      min=7,
+                      max=365,
+                      step=1,
+                  ).classes("w-24")
+
                 def handle_save_settings():
                   app_state["settings"]["low_stock_alert_ratio"] = (
                       ratio_input.value or 1.0
@@ -1811,15 +2524,23 @@ def inventory_dashboard():
                   app_state["settings"]["default_lead_time_days"] = (
                       lead_time_input.value or 0
                   )
+                  app_state["settings"]["slow_moving_days"] = (
+                      slow_moving_input.value or 90
+                  )
                   ui.notify("參數已更新（僅本次服務執行期間有效）", color="positive")
-                  if "update_dashboard" in refs:
-                    refs["update_dashboard"]()
-                  if "update_procurement_list" in refs:
-                    refs["update_procurement_list"]()
+                  for ref_key in (
+                      "update_dashboard",
+                      "update_procurement_list",
+                      "update_packing_schedule",
+                      "update_turnover_list",
+                  ):
+                    if ref_key in refs:
+                      refs[ref_key]()
 
                 ui.button("儲存參數", on_click=handle_save_settings).classes(
                     "sync-btn px-4 py-2 text-xs rounded-none"
                 )
+
 
   def handle_company_change(e):
     selected = e.value
