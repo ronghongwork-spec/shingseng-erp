@@ -50,6 +50,17 @@ def ceil_qty(value, default=0):
     return default
 
 
+def _safe_sheet_name(name):
+  """Excel 工作表名稱不能包含 \\ / ? * [ ] : ，超過 31 字元也會報錯。
+  之前有個 KPI 彈窗標題含有「/」（成品＋原料/子件），沒清過就直接拿去
+  當 sheet_name，會讓 openpyxl 丟例外、匯出整個失敗——這裡統一清乾淨，
+  避免同類問題在其他地方重演。
+  """
+  for ch in '\\/?*[]:':
+    name = name.replace(ch, "_")
+  return name[:31] or "工作表1"
+
+
 def rows_to_xlsx_bytes(rows, sheet_name="工作表1"):
   """把 list[dict] 轉成 xlsx 檔案的 bytes，供 ui.download() 直接下載，
   不落地寫檔（Render 的檔案系統是暫時的，用記憶體 buffer 比較乾淨）。
@@ -57,7 +68,19 @@ def rows_to_xlsx_bytes(rows, sheet_name="工作表1"):
   df = pd.DataFrame(rows)
   buffer = io.BytesIO()
   with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-    df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+    df.to_excel(writer, index=False, sheet_name=_safe_sheet_name(sheet_name))
+  return buffer.getvalue()
+
+
+def multi_sheet_xlsx_bytes(sheets):
+  """sheets: {分頁名稱: rows(list[dict])}，打包成一個多分頁 xlsx 的
+  bytes，一次匯出「總表」＋「分通路表」這種需要好幾個分頁的情境。
+  """
+  buffer = io.BytesIO()
+  with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+    for name, rows in sheets.items():
+      df = pd.DataFrame(rows)
+      df.to_excel(writer, index=False, sheet_name=_safe_sheet_name(name))
   return buffer.getvalue()
 
 # -------------------------------------------------------------------------
@@ -515,21 +538,11 @@ def fetch_sales_details_range(token, start_date, end_date, endpoint_path, detail
   return all_data
 
 
-def fetch_sales_history_from_a1(token, months_back=3):
-  """用手冊記載的正式端點 GetSales + GetSaleReturns，直接向 A1 抓近
-  N 個月的銷貨／銷退明細，換算成淨銷量（銷貨 − 銷退），彙整成跟
-  Google Sheet「銷售歷史」分頁一樣的格式：
-  [{"年月","品號","品名","銷售數量"}, ...]
-
-  手冊限制查詢區間最長 7 天，所以要切成很多個 7 天視窗逐一呼叫；抓近
-  3 個月大約要跑 13 個視窗 x 2 個端點 ≈ 26 次主要請求（單量大的話還會
-  多幾次分頁），會需要幾秒到十幾秒，所以刻意不放進「同步 A1 最新庫存」
-  或程式啟動流程裡，避免拖慢一般操作——改成 5.3 頁籤裡一個獨立的手動
-  按鈕，需要的時候自己按。
+def _aggregate_sales_history_range(token, start_date, end_date):
+  """核心彙整邏輯：抓指定日期區間（會自動切成 7 天視窗）的銷貨/銷退，
+  換算淨銷量。回傳 (qty_by_month_item, name_by_item)，方便呼叫端把多段
+  不連續的區間（例如「近3個月」+「去年同月」）合併，不用整段硬抓。
   """
-  end_date = datetime.now().date()
-  start_date = end_date - timedelta(days=months_back * 30)
-
   qty_by_month_item = defaultdict(float)
   name_by_item = {}
 
@@ -572,6 +585,10 @@ def fetch_sales_history_from_a1(token, months_back=3):
 
     window_start = window_end + timedelta(days=1)
 
+  return qty_by_month_item, name_by_item
+
+
+def _sales_history_rows_from_aggregate(qty_by_month_item, name_by_item):
   return [
       {
           "年月": year_month,
@@ -581,6 +598,59 @@ def fetch_sales_history_from_a1(token, months_back=3):
       }
       for (year_month, item_id), qty in qty_by_month_item.items()
   ]
+
+
+def fetch_sales_history_from_a1(token, months_back=3):
+  """用手冊記載的正式端點 GetSales + GetSaleReturns，直接向 A1 抓近
+  N 個月的銷貨／銷退明細，換算成淨銷量（銷貨 − 銷退），彙整成跟
+  Google Sheet「銷售歷史」分頁一樣的格式：
+  [{"年月","品號","品名","銷售數量"}, ...]
+
+  手冊限制查詢區間最長 7 天，所以要切成很多個 7 天視窗逐一呼叫；抓近
+  3 個月大約要跑 13 個視窗 x 2 個端點 ≈ 26 次主要請求（單量大的話還會
+  多幾次分頁），會需要幾秒到十幾秒，所以刻意不放進「同步 A1 最新庫存」
+  或程式啟動流程裡，避免拖慢一般操作——改成 5.3 頁籤裡一個獨立的手動
+  按鈕，需要的時候自己按。
+  """
+  end_date = datetime.now().date()
+  start_date = end_date - timedelta(days=months_back * 30)
+  qty, names = _aggregate_sales_history_range(token, start_date, end_date)
+  return _sales_history_rows_from_aggregate(qty, names)
+
+
+def fetch_sales_history_for_forecast(token, target_year_month):
+  """5.5 專用：只抓「近3個月」＋「去年同月」這兩段（都是 5.5 算法會用到
+  的），不是整年硬抓，可以省下大半的 API 呼叫次數跟等待時間——如果抓
+  整年大概要 50+ 個視窗，這樣做大概只要近3個月(~13個視窗) + 去年那個
+  月(~5個視窗) ≈ 18 個視窗 x 2 端點，明顯快很多。
+  """
+  import calendar
+
+  target_year, target_month_num = (int(x) for x in target_year_month.split("-"))
+  today = datetime.now().date()
+
+  recent_start = today - timedelta(days=95)
+  recent_end = today
+
+  last_year = target_year - 1
+  last_day = calendar.monthrange(last_year, target_month_num)[1]
+  last_year_start = datetime(last_year, target_month_num, 1).date()
+  last_year_end = datetime(last_year, target_month_num, last_day).date()
+
+  qty_recent, names_recent = _aggregate_sales_history_range(
+      token, recent_start, recent_end
+  )
+  qty_last_year, names_last_year = _aggregate_sales_history_range(
+      token, last_year_start, last_year_end
+  )
+
+  combined_qty = defaultdict(float)
+  for d in (qty_recent, qty_last_year):
+    for k, v in d.items():
+      combined_qty[k] += v
+  combined_names = {**names_recent, **names_last_year}
+
+  return _sales_history_rows_from_aggregate(combined_qty, combined_names)
 
 
 def fetch_customers(token):
@@ -1589,6 +1659,38 @@ def compute_monthly_production_sales_forecast(
   }
 
 
+PRODUCTION_SALES_CHANNELS = [
+    "官網", "蝦皮", "經銷", "團購", "門市", "KOL", "快閃", "其它通路",
+]
+
+
+def compute_channel_breakdown(forecast_result, channel_percentages, target_revenue):
+  """5.5 通路占比拆分：不對每個品項拆通路（現有資料沒有細到「這個品項
+  在這個通路賣多少」），而是把整體預估結果，依人工填的占比（例如
+  官網50%、蝦皮25%...）等比例分攤，簡單、好懂、好維護——這正是使用者
+  要的「簡化」版本，不是更複雜的逐品項通路分析。
+
+  channel_percentages: {通路名稱: 佔比(0-100)}
+  回傳 (rows, total_pct)
+  """
+  rows = []
+  total_pct = sum(v for v in channel_percentages.values() if v)
+  for channel in PRODUCTION_SALES_CHANNELS:
+    pct = channel_percentages.get(channel) or 0
+    if pct <= 0:
+      continue
+    ratio = pct / 100
+    rows.append({
+        "通路": channel,
+        "佔比(%)": pct,
+        "目標營業額": round(target_revenue * ratio, 0) if target_revenue else None,
+        "預估採購量": ceil_qty(forecast_result["total_est_qty"] * ratio),
+        "預估總成本": round(forecast_result["total_est_cost"] * ratio, 0),
+        "預估總營收": round(forecast_result["total_est_revenue"] * ratio, 0),
+    })
+  return rows, total_pct
+
+
 COMPANIES = ["興聖(股)公司", "海濤客食品工業(股)公司", "容鴻(股)公司", "芙萊柏(股)公司"]
 ACTIVE_COMPANY_LABEL = "海濤客食品工業(股)公司"
 
@@ -1894,11 +1996,18 @@ def inventory_dashboard():
                     ui.table(columns=columns, rows=rows).classes("w-full")
 
                     def handle_export():
-                      xlsx_bytes = rows_to_xlsx_bytes(rows, sheet_name=title)
-                      safe_filename = "".join(
-                          c for c in title if c not in '\\/:*?"<>|'
-                      )
-                      ui.download(xlsx_bytes, f"{safe_filename}.xlsx")
+                      try:
+                        xlsx_bytes = rows_to_xlsx_bytes(rows, sheet_name=title)
+                        safe_filename = "".join(
+                            c for c in title if c not in '\\/:*?"<>|'
+                        ) or "匯出資料"
+                        ui.download(
+                            xlsx_bytes,
+                            f"{safe_filename}.xlsx",
+                            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        )
+                      except Exception as e:
+                        ui.notify(f"匯出失敗：{e}", color="negative")
 
                     ui.button("匯出 xlsx", on_click=handle_export).classes(
                         "sync-btn px-3 py-1 text-xs rounded-none mt-3"
@@ -3549,16 +3658,16 @@ def inventory_dashboard():
                       "w-full p-3 mb-4 bg-[#e8f6f5] border border-[#bfe6e3]"
                   ):
                     ui.label(
-                        "資料來源：跟 5.3 共用同一份「銷售歷史」資料（可以是"
-                        "Google Sheets，也可以是在 5.3 按過「從 A1 抓取」的"
-                        "即時資料）。邏輯：基準預估銷量 = (去年同期銷量 + "
+                        "按「計算」時會自動向 A1 抓取「近3個月」與「去年同月」的真實銷售資料"
+                        "（不需要先去 5.3 點、也不用整年硬抓，只拿這兩段還是需要幾秒到十幾秒，"
+                        "不想自動抓可以在下方關掉）。邏輯：基準預估銷量 = (去年同期銷量 + "
                         "近3個月平均銷量) ÷ 2；若有填目標營業額，會等比例"
                         "校正每個品項的預估量，讓總營收貼近目標；建議採購"
                         "時間 = 目標月份第一天 − 採購前置天數（抓 BOM 表"
                         "設定，沒有則用系統預設值）。"
                     ).classes("text-xs text-teal-800")
 
-                  with ui.row().classes("items-center gap-3 flex-wrap mb-4"):
+                  with ui.row().classes("items-center gap-3 flex-wrap mb-2"):
                     forecast_month_select = ui.select(
                         options=generate_month_options(6),
                         value=generate_month_options(6)[0],
@@ -3572,20 +3681,77 @@ def inventory_dashboard():
                         min=0,
                         step=1000,
                     ).classes("w-64")
+                    forecast_auto_fetch_checkbox = ui.checkbox(
+                        "自動從 A1 抓最新銷售資料（建議開啟）",
+                        value=True,
+                    ).classes("text-xs")
                     forecast_calc_button = ui.button("計算").classes(
                         "sync-btn px-4 py-2 text-xs rounded-none"
                     )
+
+                  forecast_fetch_status_label = ui.label().classes(
+                      "text-xs text-zinc-500 mb-3"
+                  )
+
+                  ui.label("通路占比分配（選填，用於拆分下方「分通路表」）").classes(
+                      "text-sm font-bold text-zinc-700 mb-2"
+                  )
+                  with ui.row().classes(
+                      "w-full p-3 mb-2 bg-[#fff8e6] border border-[#f0dca0]"
+                  ):
+                    ui.label(
+                        "不是逐品項拆通路（目前沒有這麼細的資料），而是把下方"
+                        "「總表」算出來的預估總量/總成本/總營收，依你填的"
+                        "占比直接等比例分攤到各通路，簡單好懂。不需要剛好等於"
+                        "100%，但建議盡量接近，不然各通路加起來會跟總表對不起來。"
+                    ).classes("text-xs text-amber-800")
+
+                  channel_pct_inputs = {}
+                  with ui.row().classes("w-full gap-3 flex-wrap mb-2"):
+                    for channel in PRODUCTION_SALES_CHANNELS:
+                      with ui.column().classes("gap-0"):
+                        ui.label(channel).classes("text-xs text-zinc-600")
+                        channel_pct_inputs[channel] = ui.number(
+                            value=0, min=0, max=100, step=1,
+                        ).classes("w-20")
+
+                  channel_pct_total_label = ui.label().classes(
+                      "text-xs text-zinc-500 mb-4"
+                  )
+
+                  def update_channel_pct_total():
+                    total = sum(
+                        (inp.value or 0) for inp in channel_pct_inputs.values()
+                    )
+                    channel_pct_total_label.text = f"目前合計：{total:g}%"
+                    channel_pct_total_label.classes(
+                        replace="text-xs mb-4 "
+                        + ("text-teal-700" if abs(total - 100) < 0.01 else "text-amber-700")
+                    )
+
+                  for inp in channel_pct_inputs.values():
+                    inp.on_value_change(lambda e: update_channel_pct_total())
+                  update_channel_pct_total()
 
                   forecast_summary_row = ui.row().classes("w-full gap-4 mb-4 flex-wrap")
                   forecast_note_label = ui.label().classes(
                       "text-xs text-zinc-500 mb-3"
                   )
-                  forecast_category_row = ui.row().classes("w-full gap-2 mb-3 flex-wrap")
                   forecast_export_row = ui.row().classes("w-full mb-2")
-                  forecast_table_container = ui.column().classes("w-full")
+
+                  ui.label("總表（逐品項）").classes(
+                      "text-sm font-bold text-zinc-700 mb-2"
+                  )
+                  forecast_category_row = ui.row().classes("w-full gap-2 mb-3 flex-wrap")
+                  forecast_table_container = ui.column().classes("w-full mb-6")
+
+                  ui.label("分通路表（依占比等比例分攤）").classes(
+                      "text-sm font-bold text-zinc-700 mb-2"
+                  )
+                  forecast_channel_table_container = ui.column().classes("w-full")
 
                   # 用來在按分類按鈕時重新篩選，不用重新整包計算一次
-                  forecast_state = {"result": None, "active_category": "全部分類"}
+                  forecast_state = {"result": None, "active_category": "全部分類", "channel_rows": []}
 
                   FORECAST_COLUMNS = [
                       {"name": "品號", "label": "品號", "field": "品號", "align": "left"},
@@ -3597,6 +3763,14 @@ def inventory_dashboard():
                       {"name": "單位成本", "label": "單位成本", "field": "單位成本"},
                       {"name": "預估總成本", "label": "預估總成本", "field": "預估總成本"},
                       {"name": "建議採購時間", "label": "建議採購時間", "field": "建議採購時間"},
+                  ]
+                  CHANNEL_COLUMNS = [
+                      {"name": "通路", "label": "通路", "field": "通路", "align": "left"},
+                      {"name": "佔比(%)", "label": "佔比(%)", "field": "佔比(%)"},
+                      {"name": "目標營業額", "label": "目標營業額", "field": "目標營業額"},
+                      {"name": "預估採購量", "label": "預估採購量", "field": "預估採購量"},
+                      {"name": "預估總成本", "label": "預估總成本", "field": "預估總成本"},
+                      {"name": "預估總營收", "label": "預估總營收", "field": "預估總營收"},
                   ]
 
                   def render_forecast_table():
@@ -3648,25 +3822,75 @@ def inventory_dashboard():
                             )
                         )
 
+                  def render_channel_table():
+                    forecast_channel_table_container.clear()
+                    rows = forecast_state["channel_rows"]
+                    with forecast_channel_table_container:
+                      if not rows:
+                        ui.label(
+                            "尚未填寫通路佔比，或尚未按「計算」"
+                        ).classes("text-xs text-zinc-400")
+                      else:
+                        ui.table(
+                            columns=CHANNEL_COLUMNS, rows=rows, pagination=10,
+                        ).classes("w-full")
+
                   def handle_calc_forecast():
                     forecast_summary_row.clear()
                     forecast_export_row.clear()
                     forecast_state["result"] = None
                     forecast_state["active_category"] = "全部分類"
+                    forecast_state["channel_rows"] = []
+
+                    target_month = forecast_month_select.value
+
+                    if forecast_auto_fetch_checkbox.value:
+                      token = get_a1_token()
+                      if token:
+                        forecast_fetch_status_label.text = (
+                            "正在向 A1 抓取近3個月與去年同月銷售資料，"
+                            "需要幾秒到十幾秒…"
+                        )
+                        try:
+                          fetched_rows = fetch_sales_history_for_forecast(
+                              token, target_month
+                          )
+                        except Exception as e:
+                          fetched_rows = []
+                          ui.notify(f"自動抓取失敗，改用現有資料：{e}", color="warning")
+                        if fetched_rows:
+                          app_state["sales_history"] = fetched_rows
+                          app_state["sales_history_configured"] = True
+                          app_state["sales_history_source"] = (
+                              "鼎新 A1（GetSales/GetSaleReturns，5.5 自動抓取）"
+                          )
+                          forecast_fetch_status_label.text = (
+                              f"已從 A1 抓取 {len(fetched_rows)} 筆銷售歷史彙總資料"
+                          )
+                        else:
+                          forecast_fetch_status_label.text = (
+                              "A1 沒有查到資料，改用目前已有的銷售歷史"
+                          )
+                      else:
+                        forecast_fetch_status_label.text = (
+                            "無法登入 A1，改用目前已有的銷售歷史"
+                        )
+                    else:
+                      forecast_fetch_status_label.text = "使用目前已有的銷售歷史（未勾選自動抓取）"
 
                     sales_history = app_state.get("sales_history", [])
                     if not app_state.get("sales_history_configured", False):
                       forecast_note_label.text = (
                           "尚未有銷售歷史資料來源，請先到 5.3 設定 Google "
-                          "Sheets 或按「從 A1 抓取」。"
+                          "Sheets 或打開上方「自動從 A1 抓取」。"
                       )
                       forecast_category_row.clear()
                       forecast_table_container.clear()
+                      render_channel_table()
                       return
 
                     items_map = app_state.get("items_map", {})
                     bom_map = app_state.get("bom_map", {})
-                    target_month = forecast_month_select.value
                     target_revenue = forecast_revenue_input.value or 0
 
                     result = compute_monthly_production_sales_forecast(
@@ -3705,22 +3929,42 @@ def inventory_dashboard():
                               "text-xl font-black text-zinc-900"
                           )
 
+                    channel_pcts = {
+                        ch: (inp.value or 0)
+                        for ch, inp in channel_pct_inputs.items()
+                    }
+                    channel_rows, total_pct = compute_channel_breakdown(
+                        result, channel_pcts, target_revenue
+                    )
+                    forecast_state["channel_rows"] = channel_rows
+
                     if result["rows"]:
                       def handle_export_forecast():
-                        xlsx_bytes = rows_to_xlsx_bytes(
-                            result["rows"], sheet_name=f"{target_month}月產銷分析"
-                        )
-                        ui.download(xlsx_bytes, f"月產銷分析_{target_month}.xlsx")
+                        try:
+                          xlsx_bytes = multi_sheet_xlsx_bytes({
+                              f"{target_month}總表": result["rows"],
+                              f"{target_month}分通路表": channel_rows,
+                          })
+                          ui.download(
+                              xlsx_bytes,
+                              f"月產銷分析_{target_month}.xlsx",
+                              media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                          )
+                        except Exception as e:
+                          ui.notify(f"匯出失敗：{e}", color="negative")
 
                       with forecast_export_row:
                         ui.button(
-                            "匯出 xlsx", on_click=handle_export_forecast
+                            "匯出 xlsx（總表＋分通路表）",
+                            on_click=handle_export_forecast,
                         ).classes("sync-btn px-3 py-1 text-xs rounded-none")
 
                     render_forecast_category_buttons()
                     render_forecast_table()
+                    render_channel_table()
 
                   forecast_calc_button.on_click(handle_calc_forecast)
+
 
           # ==================================================
           # 6. 系統設定與同步管理
