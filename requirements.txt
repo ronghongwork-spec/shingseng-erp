@@ -2,3 +2,5 @@ nicegui
 pandas
 requests
 python-dotenv
+gspread
+google-auth
