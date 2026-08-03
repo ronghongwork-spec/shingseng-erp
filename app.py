@@ -906,6 +906,100 @@ def compute_order_demand_alerts(orders, items_map, bom_map, stock_lookup, settin
   }
 
 
+def compute_dashboard_announcements(orders, items_map, bom_map, stock_lookup, settings, horizon_days=30):
+  """把 compute_order_demand_alerts() 的結果，整理成 4 種提醒公告：
+    - shipping　　訂單出貨提醒：未來要出貨的訂單
+    - production　生產組裝確認：成品庫存不夠，但原料已經備妥，可以安排組裝/生產
+    - procurement　採購提醒：原料/子件不夠，需要下單
+    - incoming　　進貨提醒：依建議下單日＋前置天數推算的預計到貨日快到了，
+                  提醒去確認廠商到貨狀況（這是推算出來的日期，不是真的追蹤
+                  在途訂單，之後有進貨單資料可以取代這個推算）
+
+  每種都回傳 list[{"text":..., "severity":...}]，供儀表板或個別頁面頂端
+  的提醒橫幅使用；儀表板顯示全部 4 種，頁面各自只顯示跟自己相關的那種，
+  但共用同一套運算結果，數字不會兜不起來。
+  """
+  today = datetime.now().date()
+  result = compute_order_demand_alerts(
+      orders, items_map, bom_map, stock_lookup, settings, horizon_days
+  )
+
+  shipping = []
+  for o in sorted(result["orders_in_horizon"], key=lambda x: x["預計出貨日"]):
+    days_left = (o["預計出貨日"] - today).days
+    severity = "danger" if days_left <= 1 else "warning" if days_left <= 3 else "info"
+    order_label = o["訂單編號"] or o["品號"]
+    shipping.append({
+        "text": (
+            f"訂單 {order_label}（{o.get('品名') or o['品號']}）需於"
+            f" {o['預計出貨日'].isoformat()} 出貨（數量 {o['預計出貨數量']:g}）"
+        ),
+        "severity": severity,
+    })
+
+  # 生產組裝確認：成品有缺口，但它用到的原料都不在「原料缺口清單」裡，
+  # 代表原料已經夠了，可以排組裝/生產把成品補齊
+  raw_shortfall_ids = {r["品號"] for r in result["raw_material_shortfall"]}
+  production = []
+  for r in result["finished_goods_shortfall"]:
+    item_id = r["品號"]
+    components = bom_map.get(item_id, [])
+    blocked = any(c["子件品號"] in raw_shortfall_ids for c in components)
+    if blocked:
+      continue
+    try:
+      due_date = datetime.fromisoformat(r["最早出貨日"]).date()
+      days_left = (due_date - today).days
+    except (ValueError, TypeError):
+      days_left = None
+    severity = "danger" if (days_left is not None and days_left <= 2) else "warning"
+    production.append({
+        "text": (
+            f"生產組裝確認：{r.get('品名') or item_id} 缺口 {r['缺口']:g}，"
+            f"原料已備妥，建議安排組裝／生產（最早出貨日 {r['最早出貨日']}）"
+        ),
+        "severity": severity,
+    })
+
+  procurement = []
+  incoming = []
+  for m in result["raw_material_shortfall"]:
+    procurement.append({
+        "text": (
+            f"採購提醒：{m.get('品名') or m['品號']}（缺口 {m['缺口']:g}），"
+            f"建議下單日 {m['建議下單日']}"
+        ),
+        "severity": m["severity"],
+    })
+    try:
+      order_date = datetime.fromisoformat(m["建議下單日"]).date()
+      lead_time = m.get("採購前置天數") or 0
+      arrival_date = order_date + timedelta(days=lead_time)
+      days_to_arrival = (arrival_date - today).days
+      if days_to_arrival <= 5:
+        arrival_severity = (
+            "danger" if days_to_arrival < 0
+            else "warning" if days_to_arrival <= 2
+            else "info"
+        )
+        incoming.append({
+            "text": (
+                f"進貨提醒：{m.get('品名') or m['品號']} 依前置天數推算"
+                f"預計到貨日 {arrival_date.isoformat()}，請確認廠商到貨狀況"
+            ),
+            "severity": arrival_severity,
+        })
+    except (ValueError, TypeError):
+      pass
+
+  return {
+      "shipping": shipping,
+      "production": production,
+      "procurement": procurement,
+      "incoming": incoming,
+  }
+
+
 def compute_turnover_metrics(sales_history, stock_lookup, items_map, slow_moving_days=90):
   """5.3 庫存週轉率／滯銷品分析：用「銷售歷史」Google Sheet 抓每個品號最近
   3 個月的月銷量，算出週轉天數 = 現有庫存 ÷ 日均銷量。週轉天數異常長（或
@@ -1125,9 +1219,13 @@ def inventory_dashboard():
 
       with ui.column().classes("w-full p-8 max-w-[1600px] mx-auto"):
         with ui.row().classes("w-full items-center justify-between mb-4"):
-          ui.label(ACTIVE_COMPANY_LABEL).classes(
-              "text-lg font-bold text-zinc-900 tracking-wide"
-          )
+          with ui.row().classes("items-center gap-3"):
+            ui.label().classes(
+                "w-1.5 h-8 bg-[#5bc0be]"
+            )  # 左側色塊，強化視覺焦點
+            ui.label(ACTIVE_COMPANY_LABEL).classes(
+                "text-2xl font-black text-zinc-900 tracking-wide"
+            )
           ui.button("同步 A1 最新庫存", on_click=handle_sync).classes(
               "sync-btn px-4 py-2 text-xs rounded-none"
           )
@@ -1179,6 +1277,67 @@ def inventory_dashboard():
                       f" {style['badge']}"
                   )
                   ui.label(text).classes(f"text-xs {style['text']} flex-1")
+
+              def _render_announcements(container, announcements, category_keys, max_each=6):
+                """把 compute_dashboard_announcements() 的結果畫成一疊
+                _severity_box。category_keys 是要顯示哪幾種公告（例如頁面
+                各自只顯示跟自己相關的那種），max_each 限制每種最多顯示
+                幾則，避免公告洗版。
+                """
+                container.clear()
+                any_item = False
+                with container:
+                  for key in category_keys:
+                    for item in announcements.get(key, [])[:max_each]:
+                      _severity_box(item["severity"], item["text"])
+                      any_item = True
+                  if not any_item:
+                    _severity_box("success", "目前沒有相關提醒")
+
+              # KPI 卡片明細彈窗：所有卡片共用同一個 dialog，點擊時換內容
+              with ui.dialog() as kpi_dialog, ui.card().classes(
+                  "min-w-[320px] max-w-[90vw] p-5"
+              ):
+                kpi_dialog_title = ui.label().classes(
+                    "text-base font-bold text-zinc-900 mb-3"
+                )
+                kpi_dialog_body = ui.column().classes("w-full")
+                ui.button("關閉", on_click=kpi_dialog.close).classes(
+                    "sync-btn px-4 py-1 text-xs rounded-none mt-3 self-end"
+                )
+
+              def open_kpi_dialog(title, rows, columns):
+                kpi_dialog_title.text = title
+                kpi_dialog_body.clear()
+                with kpi_dialog_body:
+                  if not rows:
+                    ui.label("目前沒有符合條件的品項").classes(
+                        "text-xs text-zinc-400"
+                    )
+                  else:
+                    ui.table(columns=columns, rows=rows).classes("w-full")
+                kpi_dialog.open()
+
+              def _kpi_card(label, value, severity, on_click=None):
+                style = SEVERITY_STYLES.get(severity, SEVERITY_STYLES["info"])
+                classes = (
+                    f"{style['box']} border p-4 min-w-[200px] flex-1"
+                )
+                if on_click:
+                  classes += " cursor-pointer hover:brightness-95"
+                card = ui.column().classes(classes)
+                with card:
+                  ui.label(label).classes(f"text-xs {style['text']} mb-1")
+                  ui.label(value).classes(
+                      f"text-xl font-black {style['text']}"
+                  )
+                  if on_click:
+                    ui.label("點擊查看明細 →").classes(
+                        f"text-[10px] {style['text']} opacity-70 mt-1"
+                    )
+                if on_click:
+                  card.on("click", on_click)
+                return card
 
               def update_dashboard():
                 dashboard_kpi_row.clear()
@@ -1248,31 +1407,139 @@ def inventory_dashboard():
                 today_qty = sum(o["預計出貨數量"] for o in orders_today)
 
                 with dashboard_kpi_row:
-                  kpi_cards = [
-                      ("集團／本公司庫存總值（估）", f"NT$ {total_value:,.0f}"),
-                      ("低於安全庫存品項數", f"{len(risk_rows)} 項"),
-                      (
-                          "今日預計出貨訂單數／總量",
-                          f"{len(orders_today)} 張／{today_qty:g}"
-                          if orders_configured else "－（待設定 Google Sheets）",
-                      ),
-                      (
-                          "未來30天缺貨風險品項",
-                          f"{len(result_30['finished_goods_shortfall']) + len(result_30['raw_material_shortfall'])} 項"
-                          if orders_configured else "－（待設定 Google Sheets）",
-                      ),
-                  ]
-                  for label, value in kpi_cards:
-                    with ui.column().classes(
-                        "bg-[#f7f6f2] border border-[#e2e1dc] p-4 min-w-[200px]"
-                        " flex-1"
-                    ):
-                      ui.label(label).classes("text-xs text-zinc-500 mb-1")
-                      ui.label(value).classes(
-                          "text-xl font-black text-zinc-900"
-                      )
+                  # ---- 卡片1：庫存總值，點擊看價值最高的品項 ----
+                  value_detail_rows = []
+                  for item_id, info in items_map.items():
+                    current_stock = stock_lookup.get(item_id, 0.0)
+                    unit_cost = info.get("StdPurPrice") or 0
+                    try:
+                      item_value = float(current_stock) * float(unit_cost)
+                    except (TypeError, ValueError):
+                      item_value = 0.0
+                    if item_value > 0:
+                      value_detail_rows.append({
+                          "品號": item_id,
+                          "品名": info.get("Name"),
+                          "庫存量": current_stock,
+                          "單價": unit_cost,
+                          "庫存價值": round(item_value, 0),
+                      })
+                  value_detail_rows.sort(key=lambda r: r["庫存價值"], reverse=True)
+                  value_detail_rows = value_detail_rows[:15]
 
-                # ---- 提醒／公告中心：出貨提醒 + 補貨建議，統一用顏色分級 ----
+                  _kpi_card(
+                      "集團／本公司庫存總值（估）",
+                      f"NT$ {total_value:,.0f}",
+                      "info",
+                      on_click=lambda e=None: open_kpi_dialog(
+                          "庫存價值最高的品項（前 15 名）",
+                          value_detail_rows,
+                          [
+                              {"name": "品號", "label": "品號", "field": "品號", "align": "left"},
+                              {"name": "品名", "label": "品名", "field": "品名", "align": "left"},
+                              {"name": "庫存量", "label": "庫存量", "field": "庫存量"},
+                              {"name": "單價", "label": "單價", "field": "單價"},
+                              {"name": "庫存價值", "label": "庫存價值", "field": "庫存價值"},
+                          ],
+                      ),
+                  )
+
+                  # ---- 卡片2：低於安全庫存，點擊看清單 ----
+                  _kpi_card(
+                      "低於安全庫存品項數",
+                      f"{len(risk_rows)} 項",
+                      "danger" if risk_rows else "success",
+                      on_click=lambda e=None: open_kpi_dialog(
+                          "低於安全庫存品項清單",
+                          risk_rows,
+                          [
+                              {"name": "品號", "label": "品號", "field": "品號", "align": "left"},
+                              {"name": "品名", "label": "品名", "field": "品名", "align": "left"},
+                              {"name": "目前庫存", "label": "目前庫存", "field": "目前庫存"},
+                              {"name": "安全存量", "label": "安全存量", "field": "安全存量"},
+                              {"name": "缺口", "label": "缺口", "field": "缺口"},
+                          ],
+                      ),
+                  )
+
+                  # ---- 卡片3：今日預計出貨 ----
+                  today_display_rows = [
+                      {**o, "預計出貨日": o["預計出貨日"].isoformat()}
+                      for o in orders_today
+                  ]
+                  if orders_configured:
+                    _kpi_card(
+                        "今日預計出貨訂單數／總量",
+                        f"{len(orders_today)} 張／{today_qty:g}",
+                        "warning" if orders_today else "success",
+                        on_click=lambda e=None: open_kpi_dialog(
+                            "今日預計出貨訂單",
+                            today_display_rows,
+                            [
+                                {"name": "訂單編號", "label": "訂單編號", "field": "訂單編號", "align": "left"},
+                                {"name": "品號", "label": "品號", "field": "品號", "align": "left"},
+                                {"name": "品名", "label": "品名", "field": "品名", "align": "left"},
+                                {"name": "預計出貨數量", "label": "預計出貨數量", "field": "預計出貨數量"},
+                                {"name": "狀態", "label": "狀態", "field": "狀態"},
+                            ],
+                        ),
+                    )
+                  else:
+                    _kpi_card(
+                        "今日預計出貨訂單數／總量",
+                        "－（待設定 Google Sheets）",
+                        "info",
+                    )
+
+                  # ---- 卡片4：未來30天缺貨風險，點擊看成品+原料缺口 ----
+                  shortage_count = (
+                      len(result_30["finished_goods_shortfall"])
+                      + len(result_30["raw_material_shortfall"])
+                  )
+                  if orders_configured:
+                    combined_shortage_rows = [
+                        {
+                            "類型": "成品",
+                            "品號": r["品號"],
+                            "品名": r["品名"],
+                            "缺口": r["缺口"],
+                            "說明": f"最早出貨日 {r['最早出貨日']}",
+                        }
+                        for r in result_30["finished_goods_shortfall"]
+                    ] + [
+                        {
+                            "類型": "原料/子件",
+                            "品號": r["品號"],
+                            "品名": r["品名"],
+                            "缺口": r["缺口"],
+                            "說明": f"建議下單日 {r['建議下單日']}",
+                        }
+                        for r in result_30["raw_material_shortfall"]
+                    ]
+                    _kpi_card(
+                        "未來30天缺貨風險品項",
+                        f"{shortage_count} 項",
+                        "danger" if shortage_count else "success",
+                        on_click=lambda e=None: open_kpi_dialog(
+                            "未來30天缺貨風險品項（成品＋原料/子件）",
+                            combined_shortage_rows,
+                            [
+                                {"name": "類型", "label": "類型", "field": "類型", "align": "left"},
+                                {"name": "品號", "label": "品號", "field": "品號", "align": "left"},
+                                {"name": "品名", "label": "品名", "field": "品名", "align": "left"},
+                                {"name": "缺口", "label": "缺口", "field": "缺口"},
+                                {"name": "說明", "label": "說明", "field": "說明", "align": "left"},
+                            ],
+                        ),
+                    )
+                  else:
+                    _kpi_card(
+                        "未來30天缺貨風險品項",
+                        "－（待設定 Google Sheets）",
+                        "info",
+                    )
+
+                # ---- 提醒／公告中心：4 種提醒統一用顏色分級 ----
                 with dashboard_announce_container:
                   if not orders_configured:
                     ui.label(
@@ -1280,39 +1547,32 @@ def inventory_dashboard():
                         "顯示出貨與補貨提醒，設定方式見「6. 系統設定」。"
                     ).classes("text-xs text-zinc-400")
                   else:
+                    announcements = compute_dashboard_announcements(
+                        orders, items_map, bom_map, stock_lookup, settings,
+                        horizon_days=30,
+                    )
+                    category_labels = [
+                        ("shipping", "🚚 訂單出貨提醒"),
+                        ("production", "🏭 生產組裝確認"),
+                        ("procurement", "🛒 採購提醒"),
+                        ("incoming", "📦 進貨提醒"),
+                    ]
                     any_announcement = False
-                    for o in sorted(
-                        result_30["orders_in_horizon"],
-                        key=lambda x: x["預計出貨日"],
-                    )[:8]:
-                      days_left = (o["預計出貨日"] - today).days
-                      if days_left <= 1:
-                        severity = "danger"
-                      elif days_left <= 3:
-                        severity = "warning"
-                      else:
-                        severity = "info"
-                      order_label = o["訂單編號"] or o["品號"]
-                      _severity_box(
-                          severity,
-                          f"訂單 {order_label}（{o.get('品名') or o['品號']}）"
-                          f"需於 {o['預計出貨日'].isoformat()} 出貨"
-                          f"（數量 {o['預計出貨數量']:g}）",
+                    for key, label in category_labels:
+                      items = announcements.get(key, [])[:6]
+                      if not items:
+                        continue
+                      ui.label(label).classes(
+                          "text-xs font-bold text-zinc-600 mt-1"
                       )
-                      any_announcement = True
-
-                    for m in result_30["raw_material_shortfall"][:8]:
-                      _severity_box(
-                          m["severity"],
-                          f"建議補貨：{m.get('品名') or m['品號']}"
-                          f"（缺口 {m['缺口']:g}），建議下單日"
-                          f" {m['建議下單日']}",
-                      )
+                      for item in items:
+                        _severity_box(item["severity"], item["text"])
                       any_announcement = True
 
                     if not any_announcement:
                       _severity_box(
-                          "success", "未來 30 天內沒有已知的出貨或補貨提醒"
+                          "success", "未來 30 天內沒有已知的出貨、生產、"
+                          "採購或進貨提醒"
                       )
 
                 dashboard_alert_label.text = (
@@ -1986,6 +2246,8 @@ def inventory_dashboard():
                     "預計出貨數量」，後面的 BOM 表會自動判斷是否需要補貨。"
                 ).classes("text-xs text-teal-800")
 
+              orders_reminder_container = ui.column().classes("w-full gap-2 mb-4")
+
               with ui.row().classes("items-center gap-3 flex-wrap mb-3"):
                 orders_search_input = ui.input(
                     placeholder="輸入品號、品名或訂單編號..."
@@ -2009,6 +2271,7 @@ def inventory_dashboard():
                 configured = app_state.get("orders_configured", False)
 
                 if not configured:
+                  orders_reminder_container.clear()
                   orders_stats_label.text = ""
                   with orders_table_container:
                     ui.label(
@@ -2016,6 +2279,27 @@ def inventory_dashboard():
                         "說明。"
                     ).classes("text-xs text-zinc-400")
                   return
+
+                items_map = app_state.get("items_map", {})
+                bom_map = app_state.get("bom_map", {})
+                df = app_state["df"].copy()
+                settings = app_state["settings"]
+                if not df.empty:
+                  stock_by_item = df.groupby("品號", as_index=False)[
+                      "庫存數量"
+                  ].sum()
+                  stock_lookup = dict(
+                      zip(stock_by_item["品號"], stock_by_item["庫存數量"])
+                  )
+                else:
+                  stock_lookup = {}
+                announcements = compute_dashboard_announcements(
+                    orders, items_map, bom_map, stock_lookup, settings,
+                    horizon_days=14,
+                )
+                _render_announcements(
+                    orders_reminder_container, announcements, ["shipping"]
+                )
 
                 rows = list(orders)
                 keyword = (orders_search_input.value or "").strip().lower()
@@ -2085,6 +2369,8 @@ def inventory_dashboard():
                     "」「3. 訂單與出貨管理」共用，數字會一致。"
                 ).classes("text-xs text-teal-800")
 
+              packing_reminder_container = ui.column().classes("w-full gap-2 mb-4")
+
               packing_stats_label = ui.label().classes(
                   "text-xs text-zinc-500 mb-2"
               )
@@ -2102,6 +2388,7 @@ def inventory_dashboard():
                 orders = app_state.get("orders", [])
                 configured = app_state.get("orders_configured", False)
                 if not configured:
+                  packing_reminder_container.clear()
                   packing_stats_label.text = ""
                   with packing_schedule_container:
                     ui.label(
@@ -2124,6 +2411,14 @@ def inventory_dashboard():
                   )
                 else:
                   stock_lookup = {}
+
+                announcements = compute_dashboard_announcements(
+                    orders, items_map, bom_map, stock_lookup, settings,
+                    horizon_days=14,
+                )
+                _render_announcements(
+                    packing_reminder_container, announcements, ["production"]
+                )
 
                 result = compute_order_demand_alerts(
                     orders, items_map, bom_map, stock_lookup, settings,
@@ -2213,6 +2508,8 @@ def inventory_dashboard():
                     "都還沒有這份資料。"
                 ).classes("text-xs text-amber-800")
 
+              procurement_reminder_container = ui.column().classes("w-full gap-2 mb-4")
+
               ui.label("5.1 簡化版建議採購量（安全庫存基準）").classes(
                   "text-sm font-bold text-zinc-700 mb-2"
               )
@@ -2227,6 +2524,29 @@ def inventory_dashboard():
                 df = app_state["df"].copy()
                 items_map = app_state.get("items_map", {})
                 bom_map = app_state.get("bom_map", {})
+
+                orders = app_state.get("orders", [])
+                if app_state.get("orders_configured", False):
+                  if not df.empty:
+                    stock_by_item_r = df.groupby("品號", as_index=False)[
+                        "庫存數量"
+                    ].sum()
+                    stock_lookup_r = dict(
+                        zip(stock_by_item_r["品號"], stock_by_item_r["庫存數量"])
+                    )
+                  else:
+                    stock_lookup_r = {}
+                  announcements = compute_dashboard_announcements(
+                      orders, items_map, bom_map, stock_lookup_r,
+                      app_state["settings"], horizon_days=14,
+                  )
+                  _render_announcements(
+                      procurement_reminder_container, announcements,
+                      ["procurement", "incoming"],
+                  )
+                else:
+                  procurement_reminder_container.clear()
+
                 default_lead_time = app_state["settings"][
                     "default_lead_time_days"
                 ]
@@ -2549,18 +2869,36 @@ def inventory_dashboard():
     else:
       render_placeholder_company(selected)
 
+  COMPANY_TAB_COLORS = {
+      "興聖(股)公司": {"text": "#5bc0be", "active_bg": "#5bc0be"},
+      "海濤客食品工業(股)公司": {"text": "#e0824a", "active_bg": "#e0824a"},
+      "容鴻(股)公司": {"text": "#8e7cc3", "active_bg": "#8e7cc3"},
+      "芙萊柏(股)公司": {"text": "#5b8fc0", "active_bg": "#5b8fc0"},
+  }
+  ui.add_head_html(
+      "<style>"
+      + "".join(
+          f".company-tab-{i} {{ color: {c['text']} !important; "
+          f"font-weight: 700 !important; }}"
+          f".company-tab-{i}.q-tab--active {{ background: {c['active_bg']}22 !important; "
+          f"border-bottom: 3px solid {c['active_bg']} !important; }}"
+          for i, c in enumerate(COMPANY_TAB_COLORS.values())
+      )
+      + "</style>"
+  )
+
   with ui.row().classes(
-      "w-full items-center justify-between bg-white border-b border-[#e2e1dc]"
-      " px-8 py-4 sticky top-0 z-50"
+      "w-full flex flex-nowrap items-center justify-between bg-white"
+      " border-b border-[#e2e1dc] px-8 py-4 sticky top-0 z-50"
   ):
     ui.label("興聖集團｜A1 智慧進銷存總管理系統").classes(
-        "text-base font-black tracking-wider"
+        "text-base font-black tracking-wider flex-shrink-0"
     )
     with ui.tabs(on_change=handle_company_change).props(
         "dense no-caps"
-    ) as company_tabs:
-      for c in COMPANIES:
-        ui.tab(c)
+    ).classes("flex-shrink-0 ml-auto") as company_tabs:
+      for i, c in enumerate(COMPANIES):
+        ui.tab(c).classes(f"company-tab-{i}")
     company_tabs.set_value(ACTIVE_COMPANY_LABEL)
 
   render_hai_tao_ke_page()
