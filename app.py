@@ -2,6 +2,7 @@ import base64
 import concurrent.futures
 import io
 import json
+import math
 import os
 import sys
 from collections import defaultdict
@@ -28,6 +29,25 @@ def safe_text(value, default=""):
   except (TypeError, ValueError):
     pass
   return str(value)
+
+
+def ceil_qty(value, default=0):
+  """庫存/銷量這類「數量」欄位統一無條件進位成整數（例如 12.3 顯示成 13），
+  避免小數點讓人誤以為可以訂購零點幾件、或看起來像是算錯了。
+  用 math.ceil 而不是四捨五入，是刻意的——採購/庫存寧可估多一點，不要
+  估少導致真的缺貨。
+  """
+  if value is None:
+    return default
+  try:
+    if pd.isna(value):
+      return default
+  except (TypeError, ValueError):
+    pass
+  try:
+    return int(math.ceil(float(value)))
+  except (TypeError, ValueError):
+    return default
 
 
 def rows_to_xlsx_bytes(rows, sheet_name="工作表1"):
@@ -1427,8 +1447,8 @@ def compute_turnover_metrics(sales_history, stock_lookup, items_map, slow_moving
     results.append({
         "品號": item_id,
         "品名": item_name,
-        "近3月平均月銷": round(avg_monthly, 1),
-        "現有庫存": current_stock,
+        "近3月平均月銷": ceil_qty(avg_monthly),
+        "現有庫存": ceil_qty(current_stock),
         "庫存週轉天數": round(turnover_days, 1) if turnover_days is not None else "從未銷售",
         "滯銷": "是" if is_slow_moving else "否",
     })
@@ -1534,11 +1554,12 @@ def compute_monthly_production_sales_forecast(
     rows.append({
         "品號": item_id,
         "品名": item_name,
-        "去年同期銷量": round(last_year_qty, 1),
-        "近3月平均銷量": round(recent_avg, 1),
-        "基準預估銷量": round(baseline_qty, 1),
+        "商品分類": info.get("CategoryName") or "未分類",
+        "去年同期銷量": ceil_qty(last_year_qty),
+        "近3月平均銷量": ceil_qty(recent_avg),
+        "基準預估銷量": round(baseline_qty, 1),  # 內部用，未四捨五入避免縮放誤差累積
         "單價": unit_price,
-        "標準進價": unit_cost,
+        "單位成本": unit_cost,
         "建議採購時間": suggested_order_date.isoformat(),
     })
 
@@ -1549,17 +1570,18 @@ def compute_monthly_production_sales_forecast(
     scale_factor = 1.0
 
   for r in rows:
-    est_qty = round(r["基準預估銷量"] * scale_factor, 1)
+    est_qty = ceil_qty(r["基準預估銷量"] * scale_factor)
     r["預估採購量"] = est_qty
-    r["預估成本"] = round(est_qty * r["標準進價"], 0)
+    r["預估總成本"] = round(est_qty * r["單位成本"], 0)
+    del r["基準預估銷量"]  # 只是計算用的中間值，不用顯示給使用者
 
-  rows.sort(key=lambda r: r["預估成本"], reverse=True)
+  rows.sort(key=lambda r: r["預估總成本"], reverse=True)
 
   return {
       "rows": rows,
       "scale_factor": round(scale_factor, 3),
       "total_est_qty": sum(r["預估採購量"] for r in rows),
-      "total_est_cost": sum(r["預估成本"] for r in rows),
+      "total_est_cost": sum(r["預估總成本"] for r in rows),
       "total_est_revenue": sum(r["預估採購量"] * r["單價"] for r in rows),
       "earliest_order_date": min((r["建議採購時間"] for r in rows), default=None),
       "last_year_ym": last_year_ym,
@@ -1952,9 +1974,9 @@ def inventory_dashboard():
                     risk_rows.append({
                         "品號": item_id,
                         "品名": info.get("Name"),
-                        "目前庫存": current_stock,
-                        "安全存量": safety_stock,
-                        "缺口": round(safety_stock - current_stock, 2),
+                        "目前庫存": ceil_qty(current_stock),
+                        "安全存量": ceil_qty(safety_stock),
+                        "缺口": ceil_qty(max(safety_stock - current_stock, 0)),
                     })
                 risk_rows.sort(key=lambda r: r["缺口"], reverse=True)
 
@@ -1984,7 +2006,7 @@ def inventory_dashboard():
                       value_detail_rows.append({
                           "品號": item_id,
                           "品名": info.get("Name"),
-                          "庫存量": current_stock,
+                          "庫存量": ceil_qty(current_stock),
                           "單價": unit_cost,
                           "庫存價值": round(item_value, 0),
                       })
@@ -2034,7 +2056,7 @@ def inventory_dashboard():
                   if orders_configured:
                     _kpi_card(
                         "今日預計出貨訂單數／總量",
-                        f"{len(orders_today)} 張／{today_qty:g}",
+                        f"{len(orders_today)} 張／{ceil_qty(today_qty)}",
                         "warning" if orders_today else "success",
                         on_click=lambda e=None: open_kpi_dialog(
                             "今日預計出貨訂單",
@@ -2273,7 +2295,7 @@ def inventory_dashboard():
                               "w-full justify-between text-xs text-zinc-700"
                           ):
                             ui.label(
-                                f"庫存：{row['庫存數量']:g} {safe_text(row['單位'])}"
+                                f"庫存：{ceil_qty(row['庫存數量'])} {safe_text(row['單位'])}"
                             )
                             ui.label(f"成本：{row['平均成本']:.2f}")
 
@@ -2402,6 +2424,9 @@ def inventory_dashboard():
                     )
 
                     with table_container:
+                      display_rows = df.to_dict("records")
+                      for r in display_rows:
+                        r["庫存數量"] = ceil_qty(r.get("庫存數量"))
                       ui.table(
                           columns=[
                               {
@@ -2440,7 +2465,7 @@ def inventory_dashboard():
                                   "field": "平均成本",
                               },
                           ],
-                          rows=df.to_dict("records"),
+                          rows=display_rows,
                       ).classes("w-full")
 
                   wh_select.on_value_change(lambda e: update_inventory_table())
@@ -3152,6 +3177,28 @@ def inventory_dashboard():
                         "bg-[#f7f6f2] text-zinc-900 rounded-none px-3 py-1"
                         " text-xs font-bold border border-[#e2e1dc]"
                     )
+                    procurement_search_input = ui.input(
+                        placeholder="輸入品號或品名關鍵字..."
+                    ).classes("w-64 text-xs")
+                    procurement_scope_select = ui.select(
+                        options=["僅顯示需要採購", "顯示全部商品"],
+                        value="僅顯示需要採購",
+                    ).classes(
+                        "bg-[#f7f6f2] text-zinc-900 rounded-none px-3 py-1"
+                        " text-xs font-bold border border-[#e2e1dc]"
+                    )
+
+                  with ui.row().classes(
+                      "w-full p-2 mb-2 bg-[#e8f6f5] border border-[#bfe6e3]"
+                  ):
+                    ui.label(
+                        "⚠ 預設只顯示「現有庫存 ≤ 安全庫存」的品項。如果你"
+                        "覺得少了很多商品，多半是因為那些商品在 A1 商品主檔"
+                        "裡沒有設定安全存量(SafetyStock)——沒設定就沒有基準"
+                        "可以判斷要不要採購，這裡自動略過。切成「顯示全部"
+                        "商品」可以看到所有品項（含未設定安全存量的），"
+                        "方便你確認、或去 A1 補上安全存量設定。"
+                    ).classes("text-xs text-teal-800")
 
                   procurement_stats_label = ui.label().classes(
                       "text-xs text-zinc-500 mb-3"
@@ -3209,6 +3256,8 @@ def inventory_dashboard():
                         if isinstance(lt, (int, float)) and lt > 0:
                           lead_time_by_child[comp["子件品號"]] = lt
 
+                    show_all = procurement_scope_select.value == "顯示全部商品"
+
                     rows = []
                     for item_id, info in items_map.items():
                       safety_stock = info.get("SafetyStock")
@@ -3216,19 +3265,19 @@ def inventory_dashboard():
                         safety_stock = float(safety_stock)
                       except (TypeError, ValueError):
                         safety_stock = 0.0
-                      if safety_stock <= 0:
-                        continue
                       current_stock = stock_lookup.get(item_id, 0.0)
                       net_need = round(safety_stock - current_stock, 2)
-                      if net_need <= 0:
+
+                      if not show_all and (safety_stock <= 0 or net_need <= 0):
                         continue
+
                       rows.append({
                           "品號": item_id,
                           "品名": info.get("Name"),
                           "商品分類": info.get("CategoryName") or "未分類",
-                          "現有庫存": current_stock,
-                          "安全庫存": safety_stock,
-                          "建議採購量（簡化版）": net_need,
+                          "現有庫存": ceil_qty(current_stock),
+                          "安全庫存": ceil_qty(safety_stock),
+                          "建議採購量（簡化版）": ceil_qty(max(net_need, 0)),
                           "參考前置天數": lead_time_by_child.get(
                               item_id, default_lead_time
                           ),
@@ -3240,15 +3289,24 @@ def inventory_dashboard():
                           if r["商品分類"] == procurement_cat_select.value
                       ]
 
+                    keyword = (procurement_search_input.value or "").strip().lower()
+                    if keyword:
+                      rows = [
+                          r for r in rows
+                          if keyword in str(r["品號"]).lower()
+                          or keyword in str(r["品名"]).lower()
+                      ]
+
                     rows.sort(key=lambda r: r["建議採購量（簡化版）"], reverse=True)
                     procurement_stats_label.text = (
-                        f"共 {len(rows)} 項建議採購品項（安全庫存 > 現有庫存）"
+                        f"共 {len(rows)} 項"
+                        + ("（顯示全部商品）" if show_all else "（僅顯示需要採購的品項）")
                     )
 
                     with procurement_list_container:
                       if not rows:
                         ui.label(
-                            "目前沒有品項需要採購，或商品主檔尚未設定安全庫存"
+                            "目前沒有符合條件的品項，或商品主檔尚未設定安全庫存"
                         ).classes("text-xs text-zinc-400")
                       else:
                         ui.table(
@@ -3261,6 +3319,8 @@ def inventory_dashboard():
                         ).classes("w-full")
 
                   procurement_cat_select.on_value_change(lambda e: update_procurement_list())
+                  procurement_search_input.on_value_change(lambda e: update_procurement_list())
+                  procurement_scope_select.on_value_change(lambda e: update_procurement_list())
                   update_procurement_list()
                   refs["update_procurement_list"] = update_procurement_list
                   refs["procurement_cat_select"] = procurement_cat_select
@@ -3520,11 +3580,79 @@ def inventory_dashboard():
                   forecast_note_label = ui.label().classes(
                       "text-xs text-zinc-500 mb-3"
                   )
+                  forecast_category_row = ui.row().classes("w-full gap-2 mb-3 flex-wrap")
+                  forecast_export_row = ui.row().classes("w-full mb-2")
                   forecast_table_container = ui.column().classes("w-full")
+
+                  # 用來在按分類按鈕時重新篩選，不用重新整包計算一次
+                  forecast_state = {"result": None, "active_category": "全部分類"}
+
+                  FORECAST_COLUMNS = [
+                      {"name": "品號", "label": "品號", "field": "品號", "align": "left"},
+                      {"name": "品名", "label": "品名", "field": "品名", "align": "left"},
+                      {"name": "商品分類", "label": "商品分類", "field": "商品分類", "align": "left"},
+                      {"name": "去年同期銷量", "label": "去年同期銷量", "field": "去年同期銷量"},
+                      {"name": "近3月平均銷量", "label": "近3月平均銷量", "field": "近3月平均銷量"},
+                      {"name": "預估採購量", "label": "預估採購量", "field": "預估採購量"},
+                      {"name": "單位成本", "label": "單位成本", "field": "單位成本"},
+                      {"name": "預估總成本", "label": "預估總成本", "field": "預估總成本"},
+                      {"name": "建議採購時間", "label": "建議採購時間", "field": "建議採購時間"},
+                  ]
+
+                  def render_forecast_table():
+                    forecast_table_container.clear()
+                    result = forecast_state["result"]
+                    if result is None:
+                      return
+                    rows = result["rows"]
+                    if forecast_state["active_category"] != "全部分類":
+                      rows = [
+                          r for r in rows
+                          if r["商品分類"] == forecast_state["active_category"]
+                      ]
+                    with forecast_table_container:
+                      if not rows:
+                        ui.label("這個分類目前沒有預估資料").classes(
+                            "text-xs text-zinc-400"
+                        )
+                      else:
+                        ui.table(
+                            columns=FORECAST_COLUMNS, rows=rows, pagination=10,
+                        ).classes("w-full")
+
+                  def render_forecast_category_buttons():
+                    forecast_category_row.clear()
+                    result = forecast_state["result"]
+                    if result is None:
+                      return
+                    categories = ["全部分類"] + sorted(
+                        {r["商品分類"] for r in result["rows"]}
+                    )
+
+                    def make_handler(cat):
+                      def handler():
+                        forecast_state["active_category"] = cat
+                        render_forecast_category_buttons()
+                        render_forecast_table()
+                      return handler
+
+                    with forecast_category_row:
+                      for cat in categories:
+                        is_active = cat == forecast_state["active_category"]
+                        ui.button(cat, on_click=make_handler(cat)).classes(
+                            "px-3 py-1 text-xs rounded-none "
+                            + (
+                                "sync-btn"
+                                if is_active
+                                else "bg-[#f7f6f2] text-zinc-700 border border-[#e2e1dc]"
+                            )
+                        )
 
                   def handle_calc_forecast():
                     forecast_summary_row.clear()
-                    forecast_table_container.clear()
+                    forecast_export_row.clear()
+                    forecast_state["result"] = None
+                    forecast_state["active_category"] = "全部分類"
 
                     sales_history = app_state.get("sales_history", [])
                     if not app_state.get("sales_history_configured", False):
@@ -3532,6 +3660,8 @@ def inventory_dashboard():
                           "尚未有銷售歷史資料來源，請先到 5.3 設定 Google "
                           "Sheets 或按「從 A1 抓取」。"
                       )
+                      forecast_category_row.clear()
+                      forecast_table_container.clear()
                       return
 
                     items_map = app_state.get("items_map", {})
@@ -3543,6 +3673,7 @@ def inventory_dashboard():
                         sales_history, items_map, bom_map, target_month,
                         target_revenue, app_state["settings"],
                     )
+                    forecast_state["result"] = result
 
                     forecast_note_label.text = (
                         f"參考去年同期（{result['last_year_ym']}）＋近3個月"
@@ -3574,26 +3705,20 @@ def inventory_dashboard():
                               "text-xl font-black text-zinc-900"
                           )
 
-                    with forecast_table_container:
-                      if not result["rows"]:
-                        ui.label(
-                            "沒有可用的銷售歷史資料算出預估值（去年同期跟"
-                            "近3個月都沒有資料）"
-                        ).classes("text-xs text-zinc-400")
-                      else:
-                        ui.table(
-                            columns=[
-                                {"name": "品號", "label": "品號", "field": "品號", "align": "left"},
-                                {"name": "品名", "label": "品名", "field": "品名", "align": "left"},
-                                {"name": "去年同期銷量", "label": "去年同期銷量", "field": "去年同期銷量"},
-                                {"name": "近3月平均銷量", "label": "近3月平均銷量", "field": "近3月平均銷量"},
-                                {"name": "預估採購量", "label": "預估採購量", "field": "預估採購量"},
-                                {"name": "預估成本", "label": "預估成本", "field": "預估成本"},
-                                {"name": "建議採購時間", "label": "建議採購時間", "field": "建議採購時間"},
-                            ],
-                            rows=result["rows"],
-                            pagination=10,
-                        ).classes("w-full")
+                    if result["rows"]:
+                      def handle_export_forecast():
+                        xlsx_bytes = rows_to_xlsx_bytes(
+                            result["rows"], sheet_name=f"{target_month}月產銷分析"
+                        )
+                        ui.download(xlsx_bytes, f"月產銷分析_{target_month}.xlsx")
+
+                      with forecast_export_row:
+                        ui.button(
+                            "匯出 xlsx", on_click=handle_export_forecast
+                        ).classes("sync-btn px-3 py-1 text-xs rounded-none")
+
+                    render_forecast_category_buttons()
+                    render_forecast_table()
 
                   forecast_calc_button.on_click(handle_calc_forecast)
 
