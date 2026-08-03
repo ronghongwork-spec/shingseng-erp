@@ -7,7 +7,7 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timedelta
 
-from nicegui import ui
+from nicegui import app, ui
 import pandas as pd
 import requests
 
@@ -272,7 +272,7 @@ def fetch_all_a1_inventory():
 
   if not token:
     print("無法取得 A1 Token，啟用測試防呆數據...")
-    return get_mock_data(), [], [], {}
+    return get_mock_data(), [], [], {}, {}, {}
 
   headers = {
       "Content-Type": "application/json",
@@ -282,6 +282,8 @@ def fetch_all_a1_inventory():
   warehouses = fetch_warehouses(token)
   categories_map = fetch_categories(token)
   items_map = fetch_items_map(token)
+  customers_map = fetch_customers(token)
+  suppliers_map = fetch_suppliers(token)
 
   def fetch_stock_rows(item_ids_batch=None, warehouse_name=None):
     """依 ItemIDs（品號批次）、可選 WarehouseName，完整分頁抓取 StockBatch 原始資料列"""
@@ -401,13 +403,18 @@ def fetch_all_a1_inventory():
 
   # 防呆機制：若 API 無資料或連線失敗，回傳範例資料
   if not all_stock_data:
-    return get_mock_data(), warehouses, list(categories_map.values()), items_map
+    return (
+        get_mock_data(), warehouses, list(categories_map.values()),
+        items_map, customers_map, suppliers_map,
+    )
 
   return (
       pd.DataFrame(all_stock_data),
       warehouses,
       list(categories_map.values()),
       items_map,
+      customers_map,
+      suppliers_map,
   )
 
 
@@ -444,6 +451,235 @@ def fetch_all_lot_nos(token):
     response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
     if response.status_code == 200:
       return True, response.json()
+    return False, f"[{response.status_code}] {response.text}"
+  except requests.exceptions.RequestException as e:
+    return False, str(e)
+
+
+def fetch_sales_details_range(token, start_date, end_date, endpoint_path, detail_key):
+  """GetSales／GetSaleReturns 共用的抓取邏輯：手冊限制每次查詢區間最長
+  7 天、每頁 50 筆，這裡處理單一區間（呼叫端要自己切 7 天視窗）內的
+  完整分頁抓取，回傳所有單頭資料（每筆單頭底下的 detail_key 陣列
+  就是明細，例如 SaleDetails／SaleReturnDetails）。
+  """
+  url = f"{A1_BASE_URL}{endpoint_path}"
+  headers = {"Content-Type": "application/json", "Authorization": token}
+  all_data = []
+  pagination = 1
+  more = True
+  MAX_PAGES = 200  # 安全上限，避免 More 一直是 true 造成無窮迴圈
+  while more and pagination <= MAX_PAGES:
+    payload = {
+        "StartDate": start_date.strftime("%Y-%m-%d"),
+        "EndDate": end_date.strftime("%Y-%m-%d"),
+        "Pagination": pagination,
+    }
+    try:
+      response = requests.post(
+          url, json=payload, headers=headers, timeout=REQUEST_TIMEOUT
+      )
+      if response.status_code != 200:
+        print(f"{endpoint_path} 抓取失敗 [{response.status_code}]: {response.text}")
+        break
+      res_json = response.json()
+      data = res_json.get("Data", []) if isinstance(res_json, dict) else []
+      all_data.extend(data)
+      more = res_json.get("More", False) if isinstance(res_json, dict) else False
+      pagination += 1
+    except requests.exceptions.RequestException as e:
+      print(f"{endpoint_path} 請求異常: {e}")
+      break
+  return all_data
+
+
+def fetch_sales_history_from_a1(token, months_back=3):
+  """用手冊記載的正式端點 GetSales + GetSaleReturns，直接向 A1 抓近
+  N 個月的銷貨／銷退明細，換算成淨銷量（銷貨 − 銷退），彙整成跟
+  Google Sheet「銷售歷史」分頁一樣的格式：
+  [{"年月","品號","品名","銷售數量"}, ...]
+
+  手冊限制查詢區間最長 7 天，所以要切成很多個 7 天視窗逐一呼叫；抓近
+  3 個月大約要跑 13 個視窗 x 2 個端點 ≈ 26 次主要請求（單量大的話還會
+  多幾次分頁），會需要幾秒到十幾秒，所以刻意不放進「同步 A1 最新庫存」
+  或程式啟動流程裡，避免拖慢一般操作——改成 5.3 頁籤裡一個獨立的手動
+  按鈕，需要的時候自己按。
+  """
+  end_date = datetime.now().date()
+  start_date = end_date - timedelta(days=months_back * 30)
+
+  qty_by_month_item = defaultdict(float)
+  name_by_item = {}
+
+  window_start = start_date
+  while window_start <= end_date:
+    window_end = min(window_start + timedelta(days=6), end_date)
+
+    for sale in fetch_sales_details_range(
+        token, window_start, window_end, "/Sales/PaginationQuery", "SaleDetails"
+    ):
+      year_month = str(sale.get("TradeDate", ""))[:7].replace("/", "-")
+      for detail in sale.get("SaleDetails", []) or []:
+        item_id = detail.get("ItemDetailID")
+        if not item_id:
+          continue
+        try:
+          qty = float(detail.get("Qty") or 0)
+        except (TypeError, ValueError):
+          qty = 0.0
+        qty_by_month_item[(year_month, item_id)] += qty
+        if detail.get("ItemName"):
+          name_by_item[item_id] = detail["ItemName"]
+
+    for ret in fetch_sales_details_range(
+        token, window_start, window_end, "/SaleReturns/PaginationQuery",
+        "SaleReturnDetails",
+    ):
+      year_month = str(ret.get("TradeDate", ""))[:7].replace("/", "-")
+      for detail in ret.get("SaleReturnDetails", []) or []:
+        item_id = detail.get("ItemDetailID")
+        if not item_id:
+          continue
+        try:
+          qty = float(detail.get("Qty") or 0)
+        except (TypeError, ValueError):
+          qty = 0.0
+        qty_by_month_item[(year_month, item_id)] -= qty  # 淨銷量扣掉銷退
+        if detail.get("ItemName"):
+          name_by_item[item_id] = detail["ItemName"]
+
+    window_start = window_end + timedelta(days=1)
+
+  return [
+      {
+          "年月": year_month,
+          "品號": item_id,
+          "品名": name_by_item.get(item_id, ""),
+          "銷售數量": round(qty, 2),
+      }
+      for (year_month, item_id), qty in qty_by_month_item.items()
+  ]
+
+
+def fetch_customers(token):
+  """Customers[Get]（不傳客戶代號）：取得所有客戶列表（ID/Name/ShortName）
+
+  目前系統還沒有畫面直接用到這個，先做成基礎功能備用——之後如果
+  「訂單資訊」Sheet 要加客戶欄位，就能直接對照客戶全名，不用另外維護
+  一份客戶對照表。
+  """
+  url = f"{A1_BASE_URL}/Customers"
+  headers = {"Authorization": token}
+  try:
+    response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+    if response.status_code == 200:
+      return {c["ID"]: c.get("Name") or c.get("ShortName") for c in response.json()}
+    print(f"取得客戶列表失敗 [{response.status_code}]: {response.text}")
+  except requests.exceptions.RequestException as e:
+    print(f"取得客戶列表失敗: {e}")
+  return {}
+
+
+def fetch_suppliers(token):
+  """Suppliers[Get]（不傳廠商代號）：取得所有廠商列表（ID/Name/ShortName）
+
+  同上，先做成基礎功能備用，之後如果 BOM 表要把「主要供應商」從自由
+  文字改成對照 A1 廠商代號，就能直接用這份資料驗證。
+  """
+  url = f"{A1_BASE_URL}/Suppliers"
+  headers = {"Authorization": token}
+  try:
+    response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+    if response.status_code == 200:
+      return {s["ID"]: s.get("Name") or s.get("ShortName") for s in response.json()}
+    print(f"取得廠商列表失敗 [{response.status_code}]: {response.text}")
+  except requests.exceptions.RequestException as e:
+    print(f"取得廠商列表失敗: {e}")
+  return {}
+
+
+# -------------------------------------------------------------------------
+# Orders[Post] 反向同步：把 Google Sheets「訂單資訊」的內容寫回 A1
+# 這是「寫入」正式 A1 系統的動作，刻意做成手動觸發＋確認彈窗，不會自動
+# 執行。手冊要求 CustomerID（客戶代號）、TotalSaleAmount（總金額）、
+# 每個品項的 Amount 都必填，所以「訂單資訊」Sheet 新增了「客戶代號」跟
+# 「金額」兩欄——只有要同步到 A1 才需要填，純粹讀取分析（缺貨預警等）
+# 不需要這兩欄也能正常運作。
+# -------------------------------------------------------------------------
+def build_order_upload_payloads(orders):
+  """把 orders（Sheet 讀到的列，每列＝一個品項）依「訂單編號」分組，組成
+  Orders[Post] 需要的完整格式（一張訂單可以有多個品項）。沒填訂單編號的
+  列，各自當成獨立的單品項訂單處理。
+
+  回傳 (payloads, skipped)：
+    payloads: list[(order_id, payload_dict)]，可以直接上傳的訂單
+    skipped: list[str]，因缺客戶代號或金額而無法組成訂單的說明文字
+  """
+  grouped = defaultdict(list)
+  for idx, o in enumerate(orders):
+    key = o.get("訂單編號") or f"__single__{o['品號']}_{o['預計出貨日'].isoformat()}_{idx}"
+    grouped[key].append(o)
+
+  payloads = []
+  skipped = []
+  today_str = datetime.now().date().strftime("%Y/%m/%d")
+
+  for order_id, lines in grouped.items():
+    customer_id = next(
+        (l["客戶代號"] for l in lines if l.get("客戶代號")), ""
+    )
+    if not customer_id:
+      skipped.append(f"{order_id}：缺「客戶代號」，無法上傳")
+      continue
+
+    missing_amount = [l for l in lines if l.get("金額") is None]
+    if missing_amount:
+      skipped.append(f"{order_id}：有品項缺「金額」，無法上傳")
+      continue
+
+    pre_delivery_date = max(l["預計出貨日"] for l in lines)
+    details = []
+    total_amount = 0.0
+    for i, l in enumerate(lines, start=1):
+      amount = l["金額"]
+      total_amount += amount
+      details.append({
+          "ID": i,
+          "ItemID": l["品號"],
+          "Qty": l["預計出貨數量"],
+          "Amount": amount,
+          "PreDeliveryDate": l["預計出貨日"].strftime("%Y/%m/%d"),
+      })
+
+    display_id = order_id if not order_id.startswith("__single__") else lines[0]["品號"]
+    payload = {
+        "ID": order_id,
+        "TradeDate": today_str,  # Sheet 沒有「下單日」欄位，用上傳當天當交易日期
+        "CustomerID": customer_id,
+        "TotalSaleAmount": round(total_amount, 2),
+        "PreDeliveryDate": pre_delivery_date.strftime("%Y/%m/%d"),
+        "Details": details,
+    }
+    payloads.append((display_id, payload))
+
+  return payloads, skipped
+
+
+def upload_order_to_a1(token, payload):
+  """Orders[Post]：上傳單張訂單。回傳 (成功與否, 訊息)。
+
+  409（唯一辨識碼重複）視為「這張訂單先前已經上傳過」，不當成錯誤，讓
+  呼叫端可以正常統計、不用擔心重複按會出亂子。
+  """
+  url = f"{A1_BASE_URL}/Orders"
+  headers = {"Content-Type": "application/json", "Authorization": token}
+  try:
+    response = requests.post(
+        url, json=payload, headers=headers, timeout=REQUEST_TIMEOUT
+    )
+    if response.status_code == 200:
+      return True, "上傳成功"
+    if response.status_code == 409:
+      return False, "訂單編號重複（先前應該已經上傳過，正常現象）"
     return False, f"[{response.status_code}] {response.text}"
   except requests.exceptions.RequestException as e:
     return False, str(e)
@@ -653,6 +889,8 @@ ORDER_COL_ITEM_NAME = "品名（選填，供參考）"
 ORDER_COL_DUE_DATE = "預計出貨日"
 ORDER_COL_QTY = "預計出貨數量"
 ORDER_COL_STATUS = "狀態（選填：未出貨/備貨中/已出貨）"
+ORDER_COL_CUSTOMER_ID = "客戶代號（同步到A1才需要）"
+ORDER_COL_AMOUNT = "金額（同步到A1才需要）"
 ORDER_COL_MEMO = "備註"
 
 
@@ -688,6 +926,12 @@ def _parse_order_records(records):
 
     status = str(row.get(ORDER_COL_STATUS, "") or "").strip() or "未出貨"
 
+    amount_raw = str(row.get(ORDER_COL_AMOUNT, "") or "").strip()
+    try:
+      amount = float(amount_raw) if amount_raw else None
+    except ValueError:
+      amount = None
+
     orders.append({
         "訂單編號": str(row.get(ORDER_COL_NO, "") or "").strip(),
         "品號": item_id,
@@ -695,6 +939,8 @@ def _parse_order_records(records):
         "預計出貨日": due_date,
         "預計出貨數量": qty,
         "狀態": status,
+        "客戶代號": str(row.get(ORDER_COL_CUSTOMER_ID, "") or "").strip(),
+        "金額": amount,
         "備註": str(row.get(ORDER_COL_MEMO, "") or "").strip(),
     })
   return orders
@@ -1138,9 +1384,20 @@ def compute_turnover_metrics(sales_history, stock_lookup, items_map, slow_moving
 COMPANIES = ["興聖(股)公司", "海濤客食品工業(股)公司", "容鴻(股)公司", "芙萊柏(股)公司"]
 ACTIVE_COMPANY_LABEL = "海濤客食品工業(股)公司"
 
+# -------------------------------------------------------------------------
+# 靜態檔案（Logo 圖片）
+# 把公司 Logo 檔案放在 app.py 同層的 static/ 資料夾裡（例如
+# static/logo.png），系統會自動在網址 /static/logo.png 提供這個檔案，
+# 標題列右側就會顯示出來。沒有放檔案時，那個位置只會是空白，不會報錯。
+# -------------------------------------------------------------------------
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+os.makedirs(STATIC_DIR, exist_ok=True)
+app.add_static_files("/static", STATIC_DIR)
+LOGO_PATH = os.path.join(STATIC_DIR, "logo.png")
+
 
 # 初始化全域狀態
-initial_df, initial_whs, initial_cats, initial_items_map = fetch_all_a1_inventory()
+initial_df, initial_whs, initial_cats, initial_items_map, initial_customers_map, initial_suppliers_map = fetch_all_a1_inventory()
 initial_bom_map, initial_bom_source = load_bom_data()
 initial_orders, initial_orders_configured = load_orders_from_google_sheet()
 initial_sales_history, initial_sales_configured = load_sales_history_from_google_sheet()
@@ -1148,12 +1405,17 @@ initial_receivings, initial_receivings_configured = load_receivings_from_google_
 app_state = {
     "df": initial_df,
     "items_map": initial_items_map,
+    "customers_map": initial_customers_map,
+    "suppliers_map": initial_suppliers_map,
     "bom_map": initial_bom_map,
     "bom_source": initial_bom_source,
     "orders": initial_orders,
     "orders_configured": initial_orders_configured,
     "sales_history": initial_sales_history,
     "sales_history_configured": initial_sales_configured,
+    "sales_history_source": (
+        "Google Sheets" if initial_sales_configured else "尚未設定"
+    ),
     "receivings": initial_receivings,
     "receivings_configured": initial_receivings_configured,
     "lot_nos": [],  # 批號資料改成頁籤點開時才抓（避免每次啟動都多打一支 API）
@@ -1250,9 +1512,11 @@ def inventory_dashboard():
       def handle_sync():
         sync_time = datetime.now()
         try:
-          df, whs, cats, items_map = fetch_all_a1_inventory()
+          df, whs, cats, items_map, customers_map, suppliers_map = fetch_all_a1_inventory()
           app_state["df"] = df
           app_state["items_map"] = items_map
+          app_state["customers_map"] = customers_map
+          app_state["suppliers_map"] = suppliers_map
           if whs:
             app_state["warehouses"] = whs
           if cats:
@@ -1260,14 +1524,19 @@ def inventory_dashboard():
 
           # 同步時順便重新讀取三份 Google Sheet 資料，這樣按一次「同步」
           # 就能拿到最新的庫存 + BOM + 訂單 + 銷售歷史，不用分開點好幾個
-          # 「重新載入」按鈕
+          # 「重新載入」按鈕（若銷售歷史目前是用「5.3 手動從 A1 抓取」的
+          # 結果，這裡就不覆蓋回 Sheets，避免白抓一次又被蓋掉）
           app_state["bom_map"], app_state["bom_source"] = load_bom_data()
           app_state["orders"], app_state["orders_configured"] = (
               load_orders_from_google_sheet()
           )
-          app_state["sales_history"], app_state["sales_history_configured"] = (
-              load_sales_history_from_google_sheet()
-          )
+          if not str(app_state.get("sales_history_source", "")).startswith("鼎新 A1"):
+            sheet_rows, sheet_configured = load_sales_history_from_google_sheet()
+            app_state["sales_history"] = sheet_rows
+            app_state["sales_history_configured"] = sheet_configured
+            app_state["sales_history_source"] = (
+                "Google Sheets" if sheet_configured else "尚未設定"
+            )
           app_state["receivings"], app_state["receivings_configured"] = (
               load_receivings_from_google_sheet()
           )
@@ -1295,6 +1564,8 @@ def inventory_dashboard():
           refs["cat_select"].options = ["全部分類"] + app_state["categories"]
         if "cat_select_p" in refs:
           refs["cat_select_p"].options = ["全部分類"] + app_state["categories"]
+        if "procurement_cat_select" in refs:
+          refs["procurement_cat_select"].options = ["全部分類"] + app_state["categories"]
 
         ui.notify(
             f"已成功從鼎新 A1 API 同步 {COMPANY_NAME} 最新庫存資料！"
@@ -2085,115 +2356,114 @@ def inventory_dashboard():
                         f"目前資料來源：{app_state.get('bom_source', '未知')}"
                     )
 
-                    combo_entries = [
+                    keyword = (combo_search_input.value or "").strip().lower()
+
+                    # 主清單：只列出「商品組合明細」Sheet 裡實際有填資料的主件。
+                    # 之前的版本會把 A1 商品主檔裡所有「商品型態=組合品」的
+                    # 品項都列出來——但 A1 裡光是型態標記就有 100 多筆，跟
+                    # 貴公司實際維護的 BOM 資料量完全對不上，變成滿頁都是
+                    # 「尚未補齊子件明細」的空殼，沒有意義。改成只顯示已經
+                    # 在 Sheet 裡設定過的品項，畫面才會跟你實際填的資料一致。
+                    configured_entries = [
+                        (item_id, components)
+                        for item_id, components in bom_map.items()
+                        if item_id in items_map
+                    ]
+                    if keyword:
+                      configured_entries = [
+                          (item_id, components)
+                          for item_id, components in configured_entries
+                          if keyword in str(item_id).lower()
+                          or keyword in str(items_map[item_id].get("Name", "")).lower()
+                      ]
+
+                    # 次清單：A1 裡標記為組合品、但還沒在 Sheet 建立子件資料的
+                    # 品項——只顯示「數量」跟一個可展開的清單，不要每個都自動
+                    # 展開撐爆頁面
+                    configured_ids = {pid for pid, _ in configured_entries}
+                    unconfigured_entries = [
                         (item_id, info)
                         for item_id, info in items_map.items()
                         if str(info.get("Type")) in ("2", "3")
+                        and item_id not in bom_map
                     ]
-
-                    keyword = (combo_search_input.value or "").strip().lower()
                     if keyword:
-                      combo_entries = [
+                      unconfigured_entries = [
                           (item_id, info)
-                          for item_id, info in combo_entries
+                          for item_id, info in unconfigured_entries
                           if keyword in str(item_id).lower()
                           or keyword in str(info.get("Name", "")).lower()
                       ]
 
-                    filled_count = sum(
-                        1 for item_id, _ in combo_entries if bom_map.get(item_id)
-                    )
                     combo_stats_label.text = (
-                        f"共 {len(combo_entries)} 項組合品｜其中 {filled_count} 項"
-                        f"已補齊子件明細"
+                        f"已設定子件明細的組合品：{len(configured_entries)} 項"
+                        f"｜A1 中標記為組合品但尚未設定：{len(unconfigured_entries)} 項"
                     )
 
                     with combo_list_container:
-                      if not combo_entries:
+                      if not configured_entries and not unconfigured_entries:
                         ui.label(
                             "目前沒有標記為組合品的商品，或尚未同步商品資料"
                         ).classes("text-xs text-zinc-400")
 
-                      for item_id, info in combo_entries:
-                        components = bom_map.get(item_id, [])
+                      for item_id, components in configured_entries:
+                        info = items_map[item_id]
                         type_label = ITEM_TYPE_LABELS.get(
                             str(info.get("Type")), str(info.get("Type"))
                         )
-                        header_suffix = (
-                            f"（{len(components)} 項子件）"
-                            if components
-                            else "（尚未補齊子件明細）"
-                        )
                         with ui.expansion(
                             f"{item_id}｜{info.get('Name', '')}｜{type_label}"
-                            f"{header_suffix}",
+                            f"（{len(components)} 項子件）",
                             icon="inventory_2",
+                            value=True,
                         ).classes(
                             "w-full border border-[#e2e1dc] text-sm"
                         ):
-                          if components:
-                            ui.table(
-                                columns=[
-                                    {
-                                        "name": "子件品號",
-                                        "label": "子件品號",
-                                        "field": "子件品號",
-                                        "align": "left",
-                                    },
-                                    {
-                                        "name": "子件品名",
-                                        "label": "子件品名",
-                                        "field": "子件品名",
-                                        "align": "left",
-                                    },
-                                    {
-                                        "name": "用量",
-                                        "label": "用量",
-                                        "field": "用量",
-                                    },
-                                    {
-                                        "name": "單位",
-                                        "label": "單位",
-                                        "field": "單位",
-                                    },
-                                    {
-                                        "name": "損耗率",
-                                        "label": "損耗率(%)",
-                                        "field": "損耗率",
-                                    },
-                                    {
-                                        "name": "採購前置天數",
-                                        "label": "採購前置天數",
-                                        "field": "採購前置天數",
-                                    },
-                                    {
-                                        "name": "生產工時天數",
-                                        "label": "生產工時(天)",
-                                        "field": "生產工時天數",
-                                    },
-                                    {
-                                        "name": "供應商",
-                                        "label": "供應商",
-                                        "field": "供應商",
-                                        "align": "left",
-                                    },
-                                    {
-                                        "name": "備註",
-                                        "label": "備註",
-                                        "field": "備註",
-                                        "align": "left",
-                                    },
-                                ],
-                                rows=components,
-                            ).classes("w-full")
-                          else:
-                            ui.label(
-                                "尚未在「商品組合明細」資料中新增此品號的子件"
-                                "資料，請於 Google Sheets（或過渡用 Excel）"
-                                "新增一列，主件品號填此品號。"
-                            ).classes("text-xs text-zinc-400 p-2")
+                          ui.table(
+                              columns=[
+                                  {"name": "子件品號", "label": "子件品號", "field": "子件品號", "align": "left"},
+                                  {"name": "子件品名", "label": "子件品名", "field": "子件品名", "align": "left"},
+                                  {"name": "用量", "label": "用量", "field": "用量"},
+                                  {"name": "單位", "label": "單位", "field": "單位"},
+                                  {"name": "損耗率", "label": "損耗率(%)", "field": "損耗率"},
+                                  {"name": "採購前置天數", "label": "採購前置天數", "field": "採購前置天數"},
+                                  {"name": "生產工時天數", "label": "生產工時(天)", "field": "生產工時天數"},
+                                  {"name": "供應商", "label": "供應商", "field": "供應商", "align": "left"},
+                                  {"name": "備註", "label": "備註", "field": "備註", "align": "left"},
+                              ],
+                              rows=components,
+                          ).classes("w-full")
 
-                      # 提醒：Excel 裡有填，但目前 A1 商品主檔查無此品號的主件
+                      if unconfigured_entries:
+                        with ui.expansion(
+                            f"A1 中另有 {len(unconfigured_entries)} 個品項標記為"
+                            f"組合品，但尚未在商品組合明細中設定子件（點擊展開"
+                            f"清單）",
+                            icon="help_outline",
+                            value=False,
+                        ).classes(
+                            "w-full border border-[#e2e1dc] text-sm text-zinc-500"
+                        ):
+                          ui.table(
+                              columns=[
+                                  {"name": "品號", "label": "品號", "field": "品號", "align": "left"},
+                                  {"name": "品名", "label": "品名", "field": "品名", "align": "left"},
+                                  {"name": "商品型態", "label": "商品型態", "field": "商品型態", "align": "left"},
+                              ],
+                              rows=[
+                                  {
+                                      "品號": item_id,
+                                      "品名": info.get("Name"),
+                                      "商品型態": ITEM_TYPE_LABELS.get(
+                                          str(info.get("Type")), str(info.get("Type"))
+                                      ),
+                                  }
+                                  for item_id, info in unconfigured_entries
+                              ],
+                              pagination=10,
+                          ).classes("w-full")
+
+                      # 提醒：Sheet 裡有填，但目前 A1 商品主檔查無此品號的主件
                       # （可能是品號打錯，或該商品已停售）
                       orphan_ids = [
                           pid for pid in bom_map if pid not in items_map
@@ -2322,8 +2592,87 @@ def inventory_dashboard():
                     "資料來源：Google Sheets「訂單資訊」分頁（手動覆蓋更新，"
                     "非即時自動抓取；A1 本身沒有查詢訂單的 API，只能上傳，"
                     "所以這裡改讀 Sheet）。只需要維護「品號、預計出貨日、"
-                    "預計出貨數量」，後面的 BOM 表會自動判斷是否需要補貨。"
+                    "預計出貨數量」，後面的 BOM 表會自動判斷是否需要補貨；"
+                    "「客戶代號」「金額」只有要同步到 A1（下方按鈕）才需要"
+                    "填寫。"
                 ).classes("text-xs text-teal-800")
+
+              # 反向同步到 A1：這是「寫入」正式系統的動作，故意做成手動
+              # 觸發＋確認彈窗，不會自動執行，避免誤觸
+              with ui.dialog() as order_sync_dialog, ui.card().classes(
+                  "min-w-[360px] max-w-[90vw] p-5"
+              ):
+                order_sync_dialog_body = ui.column().classes("w-full gap-2")
+                with ui.row().classes("w-full justify-end gap-2 mt-4"):
+                  ui.button(
+                      "取消", on_click=order_sync_dialog.close
+                  ).classes("px-4 py-1 text-xs rounded-none")
+                  order_sync_confirm_button = ui.button("確認上傳").classes(
+                      "sync-btn px-4 py-1 text-xs rounded-none"
+                  )
+
+              def handle_order_sync_click():
+                orders = app_state.get("orders", [])
+                payloads, skipped = build_order_upload_payloads(orders)
+                order_sync_dialog_body.clear()
+                with order_sync_dialog_body:
+                  ui.label("確認上傳訂單到 A1").classes(
+                      "text-base font-bold text-zinc-900"
+                  )
+                  ui.label(
+                      f"準備上傳 {len(payloads)} 張訂單到正式 A1 系統"
+                      f"（Orders[Post]）。這個動作會寫入你們正式的進銷存"
+                      f"資料，請確認客戶代號、金額都正確再繼續。"
+                  ).classes("text-xs text-zinc-700")
+                  if skipped:
+                    ui.label(
+                        f"另有 {len(skipped)} 張因缺客戶代號或金額，"
+                        f"這次不會上傳（可在下方查看明細）。"
+                    ).classes("text-xs text-amber-700")
+                    with ui.expansion("查看略過明細").classes("w-full text-xs"):
+                      for s in skipped[:20]:
+                        ui.label(s).classes("text-xs text-zinc-500")
+
+                def handle_confirm_upload():
+                  token = get_a1_token()
+                  if not token:
+                    ui.notify("無法登入 A1，請確認 API 憑證", color="warning")
+                    return
+                  success, duplicate, failed = 0, 0, []
+                  for display_id, payload in payloads:
+                    ok, msg = upload_order_to_a1(token, payload)
+                    if ok:
+                      success += 1
+                    elif "重複" in msg:
+                      duplicate += 1
+                    else:
+                      failed.append(f"{display_id}: {msg}")
+                  order_sync_dialog.close()
+                  summary = (
+                      f"上傳完成：成功 {success} 張／已存在略過 {duplicate}"
+                      f" 張／失敗 {len(failed)} 張"
+                  )
+                  ui.notify(
+                      summary, color="positive" if not failed else "warning"
+                  )
+                  if failed:
+                    print("Orders[Post] 上傳失敗明細:\n" + "\n".join(failed))
+
+                order_sync_confirm_button.on_click(handle_confirm_upload)
+                order_sync_dialog.open()
+
+              with ui.row().classes("items-center gap-3 flex-wrap mb-4"):
+                ui.button(
+                    "同步訂單到 A1（寫入正式系統）",
+                    on_click=handle_order_sync_click,
+                ).classes(
+                    "px-3 py-1 text-xs rounded-none bg-amber-600 text-white"
+                    " font-bold"
+                )
+                ui.label(
+                    "⚠ 會實際寫入 A1，上傳前請先確認 Sheet 裡的客戶代號／"
+                    "金額都填對"
+                ).classes("text-xs text-amber-700")
 
               orders_reminder_container = ui.column().classes("w-full gap-2 mb-4")
 
@@ -2593,6 +2942,15 @@ def inventory_dashboard():
                   "text-sm font-bold text-zinc-700 mb-2"
               )
 
+              with ui.row().classes("items-center gap-3 flex-wrap mb-2"):
+                procurement_cat_options = ["全部分類"] + app_state["categories"]
+                procurement_cat_select = ui.select(
+                    options=procurement_cat_options, value="全部分類"
+                ).classes(
+                    "bg-[#f7f6f2] text-zinc-900 rounded-none px-3 py-1"
+                    " text-xs font-bold border border-[#e2e1dc]"
+                )
+
               procurement_stats_label = ui.label().classes(
                   "text-xs text-zinc-500 mb-3"
               )
@@ -2665,6 +3023,7 @@ def inventory_dashboard():
                   rows.append({
                       "品號": item_id,
                       "品名": info.get("Name"),
+                      "商品分類": info.get("CategoryName") or "未分類",
                       "現有庫存": current_stock,
                       "安全庫存": safety_stock,
                       "建議採購量（簡化版）": net_need,
@@ -2672,6 +3031,12 @@ def inventory_dashboard():
                           item_id, default_lead_time
                       ),
                   })
+
+                if procurement_cat_select.value and procurement_cat_select.value != "全部分類":
+                  rows = [
+                      r for r in rows
+                      if r["商品分類"] == procurement_cat_select.value
+                  ]
 
                 rows.sort(key=lambda r: r["建議採購量（簡化版）"], reverse=True)
                 procurement_stats_label.text = (
@@ -2686,14 +3051,17 @@ def inventory_dashboard():
                   else:
                     ui.table(
                         columns=[
-                            {"name": c, "label": c, "field": c, "align": "left" if c in ("品號", "品名") else "right"}
+                            {"name": c, "label": c, "field": c, "align": "left" if c in ("品號", "品名", "商品分類") else "right"}
                             for c in rows[0].keys()
                         ],
                         rows=rows,
+                        pagination=10,
                     ).classes("w-full")
 
+              procurement_cat_select.on_value_change(lambda e: update_procurement_list())
               update_procurement_list()
               refs["update_procurement_list"] = update_procurement_list
+              refs["procurement_cat_select"] = procurement_cat_select
 
               ui.separator().classes("my-6")
 
@@ -2704,11 +3072,52 @@ def inventory_dashboard():
                   "w-full p-3 mb-4 bg-[#e8f6f5] border border-[#bfe6e3]"
               ):
                 ui.label(
-                    "資料來源：Google Sheets「銷售歷史」分頁。用近 3 個月"
-                    "平均月銷量算週轉天數 = 現有庫存 ÷ 日均銷量；週轉天數"
-                    "超過設定值（預設 90 天）或完全沒賣出過但還有庫存，"
-                    "標記為滯銷。"
+                    "資料來源可以是 Google Sheets「銷售歷史」分頁，或直接用"
+                    "手冊記載的 GetSales／GetSaleReturns 端點向 A1 即時抓取"
+                    "（下方按鈕）。用近 3 個月平均月銷量算週轉天數 = 現有"
+                    "庫存 ÷ 日均銷量；週轉天數超過設定值（預設 90 天）或"
+                    "完全沒賣出過但還有庫存，標記為滯銷。"
                 ).classes("text-xs text-teal-800")
+
+              with ui.row().classes("items-center gap-3 flex-wrap mb-2"):
+                turnover_source_label = ui.label().classes(
+                    "text-xs text-zinc-500"
+                )
+
+                def handle_fetch_sales_from_a1():
+                  token = get_a1_token()
+                  if not token:
+                    ui.notify("無法登入 A1，請確認 API 憑證", color="warning")
+                    return
+                  ui.notify(
+                      "開始向 A1 抓取近 3 個月銷貨/銷退資料，需要幾秒到"
+                      "十幾秒，請稍候…",
+                      color="info",
+                  )
+                  try:
+                    rows = fetch_sales_history_from_a1(token, months_back=3)
+                  except Exception as e:
+                    ui.notify(f"抓取失敗：{e}", color="negative")
+                    return
+                  if not rows:
+                    ui.notify(
+                        "A1 近 3 個月沒有查到銷貨資料（可能該期間確實無"
+                        "交易，或帳號無此權限）",
+                        color="warning",
+                    )
+                    return
+                  app_state["sales_history"] = rows
+                  app_state["sales_history_configured"] = True
+                  app_state["sales_history_source"] = "鼎新 A1（GetSales/GetSaleReturns，近3個月）"
+                  ui.notify(
+                      f"已從 A1 抓取 {len(rows)} 筆銷售歷史彙總資料",
+                      color="positive",
+                  )
+                  update_turnover_list()
+
+                ui.button(
+                    "從 A1 抓取近3個月銷售歷史", on_click=handle_fetch_sales_from_a1
+                ).classes("sync-btn px-3 py-1 text-xs rounded-none")
 
               turnover_stats_label = ui.label().classes(
                   "text-xs text-zinc-500 mb-3"
@@ -2719,6 +3128,9 @@ def inventory_dashboard():
                 turnover_table_container.clear()
                 sales_history = app_state.get("sales_history", [])
                 configured = app_state.get("sales_history_configured", False)
+                turnover_source_label.text = (
+                    f"目前資料來源：{app_state.get('sales_history_source', '尚未設定')}"
+                )
 
                 if not configured:
                   turnover_stats_label.text = ""
@@ -3060,9 +3472,15 @@ def inventory_dashboard():
       "w-full flex flex-nowrap items-center justify-between bg-white"
       " border-b border-[#e2e1dc] px-8 py-4 sticky top-0 z-50"
   ):
-    ui.label("興聖集團｜A1 智慧進銷存總管理系統").classes(
-        "text-base font-black tracking-wider flex-shrink-0"
-    )
+    with ui.row().classes("items-center gap-3 flex-shrink-0"):
+      ui.label("興聖集團｜A1 智慧進銷存總管理系統").classes(
+          "text-base font-black tracking-wider"
+      )
+      # Logo 放置位置：把檔案存成 static/logo.png（跟 app.py 同層的
+      # static 資料夾）就會自動顯示在這裡，不用改程式碼。沒有檔案時
+      # 這裡會是空白，不影響頁面運作。
+      if os.path.exists(LOGO_PATH):
+        ui.image("/static/logo.png").classes("h-8 w-auto")
     with ui.tabs(on_change=handle_company_change).props(
         "dense no-caps"
     ).classes("flex-shrink-0 ml-auto") as company_tabs:
