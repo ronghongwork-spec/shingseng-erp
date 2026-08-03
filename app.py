@@ -106,6 +106,9 @@ SALES_HISTORY_GOOGLE_SHEET_TAB = os.environ.get(
 RECEIVING_GOOGLE_SHEET_TAB = os.environ.get(
     "RECEIVING_GOOGLE_SHEET_TAB", "進貨明細"
 )
+CHANNEL_SALES_GOOGLE_SHEET_TAB = os.environ.get(
+    "CHANNEL_SALES_GOOGLE_SHEET_TAB", "通路銷售明細"
+)
 
 
 def get_a1_token():
@@ -1053,6 +1056,62 @@ def load_receivings_from_google_sheet():
   return rows, True
 
 
+# ---- 通路銷售明細（Google Sheet；供未來「通路別分析」使用） ----
+# 這份跟「銷售歷史」不同：銷售歷史是單純的「年月/品號/數量」彙總，
+# 給 5.3 週轉率、5.5 月產銷分析用；這份多了通路分類、客戶、成本，是
+# 更細的原始明細，供之後要做「哪個通路賺最多」「哪個客戶貢獻最大」這類
+# 分析時使用。目前系統還沒有畫面直接呈現這份資料，先把讀取功能建好。
+CHANNEL_COL_YM = "年月"
+CHANNEL_COL_CATEGORY = "通路分類（官網/蝦皮/門市/經銷(團購)/KOL）"
+CHANNEL_COL_CUSTOMER = "客戶（選填）"
+CHANNEL_COL_ITEM_ID = "品號（選填，供對照）"
+CHANNEL_COL_ITEM_NAME = "品名"
+CHANNEL_COL_QTY = "數量"
+CHANNEL_COL_COST = "成本"
+
+
+def _parse_channel_sales_records(records):
+  rows = []
+  for row in records:
+    item_name = str(row.get(CHANNEL_COL_ITEM_NAME, "") or "").strip()
+    year_month = str(row.get(CHANNEL_COL_YM, "") or "").strip()
+    if not item_name or not year_month:
+      continue
+
+    qty_raw = str(row.get(CHANNEL_COL_QTY, "") or "").strip()
+    try:
+      qty = float(qty_raw) if qty_raw else 0.0
+    except ValueError:
+      qty = 0.0
+
+    cost_raw = str(row.get(CHANNEL_COL_COST, "") or "").strip()
+    try:
+      cost = float(cost_raw) if cost_raw else 0.0
+    except ValueError:
+      cost = 0.0
+
+    rows.append({
+        "年月": year_month,
+        "通路分類": str(row.get(CHANNEL_COL_CATEGORY, "") or "").strip(),
+        "客戶": str(row.get(CHANNEL_COL_CUSTOMER, "") or "").strip(),
+        "品號": str(row.get(CHANNEL_COL_ITEM_ID, "") or "").strip(),
+        "品名": item_name,
+        "數量": qty,
+        "成本": cost,
+    })
+  return rows
+
+
+def load_channel_sales_from_google_sheet():
+  """讀取「通路銷售明細」分頁。回傳 (rows, configured)。"""
+  records = _fetch_google_sheet_records(CHANNEL_SALES_GOOGLE_SHEET_TAB)
+  if records is None:
+    return [], False
+  rows = _parse_channel_sales_records(records)
+  print(f"通路銷售明細讀取完成：共 {len(rows)} 筆有效紀錄")
+  return rows, True
+
+
 # -------------------------------------------------------------------------
 # 興聖集團旗下分公司清單（右上角切換用）
 # 目前僅「海濤客食品工業(股)公司」已完成 A1 API 串接，其餘分公司頁面預留、
@@ -1381,6 +1440,133 @@ def compute_turnover_metrics(sales_history, stock_lookup, items_map, slow_moving
   return results
 
 
+def generate_month_options(n=6):
+  """產生「今天之後」的 N 個月份選項（YYYY-MM），供 5.5 月份選單用，
+  預設第一個選項就是下個月。
+  """
+  today = datetime.now().date()
+  options = []
+  y, m = today.year, today.month
+  for _ in range(n):
+    m += 1
+    if m > 12:
+      m = 1
+      y += 1
+    options.append(f"{y}-{m:02d}")
+  return options
+
+
+def compute_monthly_production_sales_forecast(
+    sales_history, items_map, bom_map, target_year_month, target_revenue, settings
+):
+  """5.5 月產銷分析：預估目標月份（例如 "2026-08"）的採購量／成本／
+  建議採購時間。
+
+  參考依據（依需求指定）：
+  - 去年同期：目標月份的去年同月（8月 → 去年8月）
+  - 近3個月平均：目標月份往前推 3 個「完整月」（8月 → 5、6、7月平均）
+  - 基準預估銷量 = 兩者平均
+  - 若有填「目標營業額」，用「目標營業額 ÷ 基準預估總營收」的比例，
+    等比例縮放每個品項的預估銷量，讓由下而上算出來的總營收貼近業務
+    設定的目標（由上而下校正），沒填就直接用基準預估量
+  - 預估採購量＝校正後的預估銷量（先不額外疊加安全庫存，這是最基本
+    版本，之後可以再疊加安全庫存邏輯）
+  - 預估成本＝預估採購量 × 標準進價（StdPurPrice，A1 商品主檔既有欄位）
+  - 建議採購時間＝目標月份第一天 − 採購前置天數（優先抓 BOM 表裡這個
+    品項「作為子件」登記的前置天數，沒有就用系統預設值）
+  """
+  target_year, target_month_num = (int(x) for x in target_year_month.split("-"))
+  last_year_ym = f"{target_year - 1}-{target_month_num:02d}"
+
+  recent_months = []
+  y, m = target_year, target_month_num
+  for _ in range(3):
+    m -= 1
+    if m == 0:
+      m = 12
+      y -= 1
+    recent_months.append(f"{y}-{m:02d}")
+
+  qty_last_year = defaultdict(float)
+  qty_recent = defaultdict(lambda: defaultdict(float))
+  name_by_item = {}
+
+  for row in sales_history:
+    ym = row.get("年月")
+    item_id = row.get("品號")
+    if not item_id:
+      continue
+    qty = row.get("銷售數量") or 0
+    if row.get("品名"):
+      name_by_item[item_id] = row["品名"]
+    if ym == last_year_ym:
+      qty_last_year[item_id] += qty
+    if ym in recent_months:
+      qty_recent[item_id][ym] += qty
+
+  all_item_ids = set(qty_last_year) | set(qty_recent)
+
+  lead_time_by_child = {}
+  for components in bom_map.values():
+    for comp in components:
+      lt = comp.get("採購前置天數")
+      if isinstance(lt, (int, float)) and lt > 0:
+        lead_time_by_child[comp["子件品號"]] = lt
+  default_lead_time = settings.get("default_lead_time_days", 7)
+  target_month_start = datetime(target_year, target_month_num, 1).date()
+
+  rows = []
+  for item_id in all_item_ids:
+    last_year_qty = qty_last_year.get(item_id, 0.0)
+    recent_qty_dict = qty_recent.get(item_id, {})
+    recent_avg = sum(recent_qty_dict.values()) / 3 if recent_qty_dict else 0.0
+    baseline_qty = (last_year_qty + recent_avg) / 2
+    if baseline_qty <= 0:
+      continue
+
+    info = items_map.get(item_id, {})
+    item_name = info.get("Name") or name_by_item.get(item_id, "")
+    unit_cost = info.get("StdPurPrice") or 0
+    unit_price = info.get("SalesPrice") or 0
+    lead_time = lead_time_by_child.get(item_id, default_lead_time)
+    suggested_order_date = target_month_start - timedelta(days=lead_time)
+
+    rows.append({
+        "品號": item_id,
+        "品名": item_name,
+        "去年同期銷量": round(last_year_qty, 1),
+        "近3月平均銷量": round(recent_avg, 1),
+        "基準預估銷量": round(baseline_qty, 1),
+        "單價": unit_price,
+        "標準進價": unit_cost,
+        "建議採購時間": suggested_order_date.isoformat(),
+    })
+
+  baseline_total_revenue = sum(r["基準預估銷量"] * r["單價"] for r in rows)
+  if target_revenue and baseline_total_revenue > 0:
+    scale_factor = target_revenue / baseline_total_revenue
+  else:
+    scale_factor = 1.0
+
+  for r in rows:
+    est_qty = round(r["基準預估銷量"] * scale_factor, 1)
+    r["預估採購量"] = est_qty
+    r["預估成本"] = round(est_qty * r["標準進價"], 0)
+
+  rows.sort(key=lambda r: r["預估成本"], reverse=True)
+
+  return {
+      "rows": rows,
+      "scale_factor": round(scale_factor, 3),
+      "total_est_qty": sum(r["預估採購量"] for r in rows),
+      "total_est_cost": sum(r["預估成本"] for r in rows),
+      "total_est_revenue": sum(r["預估採購量"] * r["單價"] for r in rows),
+      "earliest_order_date": min((r["建議採購時間"] for r in rows), default=None),
+      "last_year_ym": last_year_ym,
+      "recent_months": recent_months,
+  }
+
+
 COMPANIES = ["興聖(股)公司", "海濤客食品工業(股)公司", "容鴻(股)公司", "芙萊柏(股)公司"]
 ACTIVE_COMPANY_LABEL = "海濤客食品工業(股)公司"
 
@@ -1402,6 +1588,7 @@ initial_bom_map, initial_bom_source = load_bom_data()
 initial_orders, initial_orders_configured = load_orders_from_google_sheet()
 initial_sales_history, initial_sales_configured = load_sales_history_from_google_sheet()
 initial_receivings, initial_receivings_configured = load_receivings_from_google_sheet()
+initial_channel_sales, initial_channel_sales_configured = load_channel_sales_from_google_sheet()
 app_state = {
     "df": initial_df,
     "items_map": initial_items_map,
@@ -1416,6 +1603,8 @@ app_state = {
     "sales_history_source": (
         "Google Sheets" if initial_sales_configured else "尚未設定"
     ),
+    "channel_sales": initial_channel_sales,
+    "channel_sales_configured": initial_channel_sales_configured,
     "receivings": initial_receivings,
     "receivings_configured": initial_receivings_configured,
     "lot_nos": [],  # 批號資料改成頁籤點開時才抓（避免每次啟動都多打一支 API）
@@ -1539,6 +1728,9 @@ def inventory_dashboard():
             )
           app_state["receivings"], app_state["receivings_configured"] = (
               load_receivings_from_google_sheet()
+          )
+          app_state["channel_sales"], app_state["channel_sales_configured"] = (
+              load_channel_sales_from_google_sheet()
           )
 
           is_mock = API_KEY == "" or API_PASSWORD == ""
@@ -2916,358 +3108,494 @@ def inventory_dashboard():
           # 5. 採購分析與決策支援
           # ==================================================
           with ui.tab_panel(tab_procurement):
-            with ui.card().classes(
-                "w-full p-6 bg-white border border-[#e2e1dc] shadow-none"
-                " rounded-none"
+            ui.label("採購分析與決策支援").classes(
+                "text-lg font-bold text-zinc-900 tracking-wide mb-2"
+            )
+            with ui.row().classes(
+                "w-full p-3 mb-4 bg-[#fff8e6] border border-[#f0dca0]"
             ):
-              ui.label("採購分析與決策支援").classes(
-                  "text-lg font-bold text-zinc-900 tracking-wide mb-2"
-              )
-              with ui.row().classes(
-                  "w-full p-3 mb-4 bg-[#fff8e6] border border-[#f0dca0]"
-              ):
-                ui.label(
-                    "下方「5.1 簡化版建議採購量」只用「安全庫存 − 現有庫存」"
-                    "計算，沒有把訂單需求算進去；含訂單/BOM 展開的完整版本"
-                    "在「4. 生產與包裝排程」的「原物料備料需求」表，兩者"
-                    "算法不同，用途也不同（這裡是長期安全庫存基準，第4點"
-                    "是短期訂單驅動的緊急採購）。「供應商歷史採購單價走勢」"
-                    "仍是規劃中，需要額外記錄歷次採購單價，目前 A1/Sheets "
-                    "都還沒有這份資料。"
-                ).classes("text-xs text-amber-800")
+              ui.label(
+                  "「5.1 簡化版建議採購量」只用「安全庫存 − 現有庫存」計算，"
+                  "沒有把訂單需求算進去；含訂單/BOM 展開的完整版本在"
+                  "「4. 生產與包裝排程」的「原物料備料需求」表，兩者算法"
+                  "不同、用途也不同（這裡是長期安全庫存基準，第4點是短期"
+                  "訂單驅動的緊急採購）。「供應商歷史採購單價走勢」仍是"
+                  "規劃中，需要額外記錄歷次採購單價，目前 A1/Sheets 都還"
+                  "沒有這份資料。"
+              ).classes("text-xs text-amber-800")
 
-              procurement_reminder_container = ui.column().classes("w-full gap-2 mb-4")
+            with ui.tabs().classes("w-full mb-2") as sub_tabs_procurement:
+              tab_procurement_51 = ui.tab("5.1 簡化版建議採購量")
+              tab_procurement_53 = ui.tab("5.3 庫存週轉率／滯銷品分析")
+              tab_procurement_54 = ui.tab("5.4 進貨明細")
+              tab_procurement_55 = ui.tab("5.5 月產銷分析")
 
-              ui.label("5.1 簡化版建議採購量（安全庫存基準）").classes(
-                  "text-sm font-bold text-zinc-700 mb-2"
-              )
+            with ui.tab_panels(
+                sub_tabs_procurement, value=tab_procurement_51
+            ).classes("w-full bg-transparent"):
+              with ui.tab_panel(tab_procurement_51):
+                with ui.card().classes(
+                    "w-full p-6 bg-white border border-[#e2e1dc] shadow-none"
+                    " rounded-none"
+                ):
+                  procurement_reminder_container = ui.column().classes("w-full gap-2 mb-4")
 
-              with ui.row().classes("items-center gap-3 flex-wrap mb-2"):
-                procurement_cat_options = ["全部分類"] + app_state["categories"]
-                procurement_cat_select = ui.select(
-                    options=procurement_cat_options, value="全部分類"
-                ).classes(
-                    "bg-[#f7f6f2] text-zinc-900 rounded-none px-3 py-1"
-                    " text-xs font-bold border border-[#e2e1dc]"
-                )
+                  ui.label("5.1 簡化版建議採購量（安全庫存基準）").classes(
+                      "text-sm font-bold text-zinc-700 mb-2"
+                  )
 
-              procurement_stats_label = ui.label().classes(
-                  "text-xs text-zinc-500 mb-3"
-              )
-              procurement_list_container = ui.column().classes("w-full")
-
-              def update_procurement_list():
-                procurement_list_container.clear()
-                df = app_state["df"].copy()
-                items_map = app_state.get("items_map", {})
-                bom_map = app_state.get("bom_map", {})
-
-                orders = app_state.get("orders", [])
-                if app_state.get("orders_configured", False):
-                  if not df.empty:
-                    stock_by_item_r = df.groupby("品號", as_index=False)[
-                        "庫存數量"
-                    ].sum()
-                    stock_lookup_r = dict(
-                        zip(stock_by_item_r["品號"], stock_by_item_r["庫存數量"])
+                  with ui.row().classes("items-center gap-3 flex-wrap mb-2"):
+                    procurement_cat_options = ["全部分類"] + app_state["categories"]
+                    procurement_cat_select = ui.select(
+                        options=procurement_cat_options, value="全部分類"
+                    ).classes(
+                        "bg-[#f7f6f2] text-zinc-900 rounded-none px-3 py-1"
+                        " text-xs font-bold border border-[#e2e1dc]"
                     )
-                  else:
-                    stock_lookup_r = {}
-                  announcements = compute_dashboard_announcements(
-                      orders, items_map, bom_map, stock_lookup_r,
-                      app_state["settings"], horizon_days=14,
+
+                  procurement_stats_label = ui.label().classes(
+                      "text-xs text-zinc-500 mb-3"
                   )
-                  _render_announcements(
-                      procurement_reminder_container, announcements,
-                      ["procurement", "incoming"],
+                  procurement_list_container = ui.column().classes("w-full")
+
+                  def update_procurement_list():
+                    procurement_list_container.clear()
+                    df = app_state["df"].copy()
+                    items_map = app_state.get("items_map", {})
+                    bom_map = app_state.get("bom_map", {})
+
+                    orders = app_state.get("orders", [])
+                    if app_state.get("orders_configured", False):
+                      if not df.empty:
+                        stock_by_item_r = df.groupby("品號", as_index=False)[
+                            "庫存數量"
+                        ].sum()
+                        stock_lookup_r = dict(
+                            zip(stock_by_item_r["品號"], stock_by_item_r["庫存數量"])
+                        )
+                      else:
+                        stock_lookup_r = {}
+                      announcements = compute_dashboard_announcements(
+                          orders, items_map, bom_map, stock_lookup_r,
+                          app_state["settings"], horizon_days=14,
+                      )
+                      _render_announcements(
+                          procurement_reminder_container, announcements,
+                          ["procurement", "incoming"],
+                      )
+                    else:
+                      procurement_reminder_container.clear()
+
+                    default_lead_time = app_state["settings"][
+                        "default_lead_time_days"
+                    ]
+
+                    if not df.empty:
+                      stock_by_item = df.groupby("品號", as_index=False)[
+                          "庫存數量"
+                      ].sum()
+                      stock_lookup = dict(
+                          zip(stock_by_item["品號"], stock_by_item["庫存數量"])
+                      )
+                    else:
+                      stock_lookup = {}
+
+                    # 找出每個品項在 BOM 裡「作為子件」時登記的採購前置天數，
+                    # 沒有的話用系統預設值
+                    lead_time_by_child = {}
+                    for components in bom_map.values():
+                      for comp in components:
+                        lt = comp.get("採購前置天數")
+                        if isinstance(lt, (int, float)) and lt > 0:
+                          lead_time_by_child[comp["子件品號"]] = lt
+
+                    rows = []
+                    for item_id, info in items_map.items():
+                      safety_stock = info.get("SafetyStock")
+                      try:
+                        safety_stock = float(safety_stock)
+                      except (TypeError, ValueError):
+                        safety_stock = 0.0
+                      if safety_stock <= 0:
+                        continue
+                      current_stock = stock_lookup.get(item_id, 0.0)
+                      net_need = round(safety_stock - current_stock, 2)
+                      if net_need <= 0:
+                        continue
+                      rows.append({
+                          "品號": item_id,
+                          "品名": info.get("Name"),
+                          "商品分類": info.get("CategoryName") or "未分類",
+                          "現有庫存": current_stock,
+                          "安全庫存": safety_stock,
+                          "建議採購量（簡化版）": net_need,
+                          "參考前置天數": lead_time_by_child.get(
+                              item_id, default_lead_time
+                          ),
+                      })
+
+                    if procurement_cat_select.value and procurement_cat_select.value != "全部分類":
+                      rows = [
+                          r for r in rows
+                          if r["商品分類"] == procurement_cat_select.value
+                      ]
+
+                    rows.sort(key=lambda r: r["建議採購量（簡化版）"], reverse=True)
+                    procurement_stats_label.text = (
+                        f"共 {len(rows)} 項建議採購品項（安全庫存 > 現有庫存）"
+                    )
+
+                    with procurement_list_container:
+                      if not rows:
+                        ui.label(
+                            "目前沒有品項需要採購，或商品主檔尚未設定安全庫存"
+                        ).classes("text-xs text-zinc-400")
+                      else:
+                        ui.table(
+                            columns=[
+                                {"name": c, "label": c, "field": c, "align": "left" if c in ("品號", "品名", "商品分類") else "right"}
+                                for c in rows[0].keys()
+                            ],
+                            rows=rows,
+                            pagination=10,
+                        ).classes("w-full")
+
+                  procurement_cat_select.on_value_change(lambda e: update_procurement_list())
+                  update_procurement_list()
+                  refs["update_procurement_list"] = update_procurement_list
+                  refs["procurement_cat_select"] = procurement_cat_select
+
+              with ui.tab_panel(tab_procurement_53):
+                with ui.card().classes(
+                    "w-full p-6 bg-white border border-[#e2e1dc] shadow-none"
+                    " rounded-none"
+                ):
+                  ui.label("5.3 庫存週轉率／滯銷品分析").classes(
+                      "text-sm font-bold text-zinc-700 mb-2"
                   )
-                else:
-                  procurement_reminder_container.clear()
-
-                default_lead_time = app_state["settings"][
-                    "default_lead_time_days"
-                ]
-
-                if not df.empty:
-                  stock_by_item = df.groupby("品號", as_index=False)[
-                      "庫存數量"
-                  ].sum()
-                  stock_lookup = dict(
-                      zip(stock_by_item["品號"], stock_by_item["庫存數量"])
-                  )
-                else:
-                  stock_lookup = {}
-
-                # 找出每個品項在 BOM 裡「作為子件」時登記的採購前置天數，
-                # 沒有的話用系統預設值
-                lead_time_by_child = {}
-                for components in bom_map.values():
-                  for comp in components:
-                    lt = comp.get("採購前置天數")
-                    if isinstance(lt, (int, float)) and lt > 0:
-                      lead_time_by_child[comp["子件品號"]] = lt
-
-                rows = []
-                for item_id, info in items_map.items():
-                  safety_stock = info.get("SafetyStock")
-                  try:
-                    safety_stock = float(safety_stock)
-                  except (TypeError, ValueError):
-                    safety_stock = 0.0
-                  if safety_stock <= 0:
-                    continue
-                  current_stock = stock_lookup.get(item_id, 0.0)
-                  net_need = round(safety_stock - current_stock, 2)
-                  if net_need <= 0:
-                    continue
-                  rows.append({
-                      "品號": item_id,
-                      "品名": info.get("Name"),
-                      "商品分類": info.get("CategoryName") or "未分類",
-                      "現有庫存": current_stock,
-                      "安全庫存": safety_stock,
-                      "建議採購量（簡化版）": net_need,
-                      "參考前置天數": lead_time_by_child.get(
-                          item_id, default_lead_time
-                      ),
-                  })
-
-                if procurement_cat_select.value and procurement_cat_select.value != "全部分類":
-                  rows = [
-                      r for r in rows
-                      if r["商品分類"] == procurement_cat_select.value
-                  ]
-
-                rows.sort(key=lambda r: r["建議採購量（簡化版）"], reverse=True)
-                procurement_stats_label.text = (
-                    f"共 {len(rows)} 項建議採購品項（安全庫存 > 現有庫存）"
-                )
-
-                with procurement_list_container:
-                  if not rows:
+                  with ui.row().classes(
+                      "w-full p-3 mb-4 bg-[#e8f6f5] border border-[#bfe6e3]"
+                  ):
                     ui.label(
-                        "目前沒有品項需要採購，或商品主檔尚未設定安全庫存"
-                    ).classes("text-xs text-zinc-400")
-                  else:
-                    ui.table(
-                        columns=[
-                            {"name": c, "label": c, "field": c, "align": "left" if c in ("品號", "品名", "商品分類") else "right"}
-                            for c in rows[0].keys()
-                        ],
-                        rows=rows,
-                        pagination=10,
-                    ).classes("w-full")
+                        "資料來源可以是 Google Sheets「銷售歷史」分頁，或直接用"
+                        "手冊記載的 GetSales／GetSaleReturns 端點向 A1 即時抓取"
+                        "（下方按鈕）。用近 3 個月平均月銷量算週轉天數 = 現有"
+                        "庫存 ÷ 日均銷量；週轉天數超過設定值（預設 90 天）或"
+                        "完全沒賣出過但還有庫存，標記為滯銷。"
+                    ).classes("text-xs text-teal-800")
 
-              procurement_cat_select.on_value_change(lambda e: update_procurement_list())
-              update_procurement_list()
-              refs["update_procurement_list"] = update_procurement_list
-              refs["procurement_cat_select"] = procurement_cat_select
-
-              ui.separator().classes("my-6")
-
-              ui.label("5.3 庫存週轉率／滯銷品分析").classes(
-                  "text-sm font-bold text-zinc-700 mb-2"
-              )
-              with ui.row().classes(
-                  "w-full p-3 mb-4 bg-[#e8f6f5] border border-[#bfe6e3]"
-              ):
-                ui.label(
-                    "資料來源可以是 Google Sheets「銷售歷史」分頁，或直接用"
-                    "手冊記載的 GetSales／GetSaleReturns 端點向 A1 即時抓取"
-                    "（下方按鈕）。用近 3 個月平均月銷量算週轉天數 = 現有"
-                    "庫存 ÷ 日均銷量；週轉天數超過設定值（預設 90 天）或"
-                    "完全沒賣出過但還有庫存，標記為滯銷。"
-                ).classes("text-xs text-teal-800")
-
-              with ui.row().classes("items-center gap-3 flex-wrap mb-2"):
-                turnover_source_label = ui.label().classes(
-                    "text-xs text-zinc-500"
-                )
-
-                def handle_fetch_sales_from_a1():
-                  token = get_a1_token()
-                  if not token:
-                    ui.notify("無法登入 A1，請確認 API 憑證", color="warning")
-                    return
-                  ui.notify(
-                      "開始向 A1 抓取近 3 個月銷貨/銷退資料，需要幾秒到"
-                      "十幾秒，請稍候…",
-                      color="info",
-                  )
-                  try:
-                    rows = fetch_sales_history_from_a1(token, months_back=3)
-                  except Exception as e:
-                    ui.notify(f"抓取失敗：{e}", color="negative")
-                    return
-                  if not rows:
-                    ui.notify(
-                        "A1 近 3 個月沒有查到銷貨資料（可能該期間確實無"
-                        "交易，或帳號無此權限）",
-                        color="warning",
+                  with ui.row().classes("items-center gap-3 flex-wrap mb-2"):
+                    turnover_source_label = ui.label().classes(
+                        "text-xs text-zinc-500"
                     )
-                    return
-                  app_state["sales_history"] = rows
-                  app_state["sales_history_configured"] = True
-                  app_state["sales_history_source"] = "鼎新 A1（GetSales/GetSaleReturns，近3個月）"
-                  ui.notify(
-                      f"已從 A1 抓取 {len(rows)} 筆銷售歷史彙總資料",
-                      color="positive",
+
+                    def handle_fetch_sales_from_a1():
+                      token = get_a1_token()
+                      if not token:
+                        ui.notify("無法登入 A1，請確認 API 憑證", color="warning")
+                        return
+                      ui.notify(
+                          "開始向 A1 抓取近 3 個月銷貨/銷退資料，需要幾秒到"
+                          "十幾秒，請稍候…",
+                          color="info",
+                      )
+                      try:
+                        rows = fetch_sales_history_from_a1(token, months_back=3)
+                      except Exception as e:
+                        ui.notify(f"抓取失敗：{e}", color="negative")
+                        return
+                      if not rows:
+                        ui.notify(
+                            "A1 近 3 個月沒有查到銷貨資料（可能該期間確實無"
+                            "交易，或帳號無此權限）",
+                            color="warning",
+                        )
+                        return
+                      app_state["sales_history"] = rows
+                      app_state["sales_history_configured"] = True
+                      app_state["sales_history_source"] = "鼎新 A1（GetSales/GetSaleReturns，近3個月）"
+                      ui.notify(
+                          f"已從 A1 抓取 {len(rows)} 筆銷售歷史彙總資料",
+                          color="positive",
+                      )
+                      update_turnover_list()
+
+                    ui.button(
+                        "從 A1 抓取近3個月銷售歷史", on_click=handle_fetch_sales_from_a1
+                    ).classes("sync-btn px-3 py-1 text-xs rounded-none")
+
+                  turnover_stats_label = ui.label().classes(
+                      "text-xs text-zinc-500 mb-3"
                   )
+                  turnover_table_container = ui.column().classes("w-full")
+
+                  def update_turnover_list():
+                    turnover_table_container.clear()
+                    sales_history = app_state.get("sales_history", [])
+                    configured = app_state.get("sales_history_configured", False)
+                    turnover_source_label.text = (
+                        f"目前資料來源：{app_state.get('sales_history_source', '尚未設定')}"
+                    )
+
+                    if not configured:
+                      turnover_stats_label.text = ""
+                      with turnover_table_container:
+                        ui.label(
+                            "尚未設定 Google Sheets，請見「6. 系統設定」的設定"
+                            "說明。"
+                        ).classes("text-xs text-zinc-400")
+                      return
+
+                    df = app_state["df"].copy()
+                    items_map = app_state.get("items_map", {})
+                    if not df.empty:
+                      stock_by_item = df.groupby("品號", as_index=False)[
+                          "庫存數量"
+                      ].sum()
+                      stock_lookup = dict(
+                          zip(stock_by_item["品號"], stock_by_item["庫存數量"])
+                      )
+                    else:
+                      stock_lookup = {}
+
+                    slow_moving_days = app_state["settings"]["slow_moving_days"]
+                    turnover_rows = compute_turnover_metrics(
+                        sales_history, stock_lookup, items_map, slow_moving_days
+                    )
+                    slow_count = sum(1 for r in turnover_rows if r["滯銷"] == "是")
+                    turnover_stats_label.text = (
+                        f"共 {len(turnover_rows)} 項有銷售紀錄的品項｜"
+                        f"其中 {slow_count} 項判定為滯銷"
+                    )
+
+                    with turnover_table_container:
+                      if not turnover_rows:
+                        ui.label("尚無銷售歷史資料").classes(
+                            "text-xs text-zinc-400"
+                        )
+                      else:
+                        ui.table(
+                            columns=[
+                                {"name": "品號", "label": "品號", "field": "品號", "align": "left"},
+                                {"name": "品名", "label": "品名", "field": "品名", "align": "left"},
+                                {"name": "近3月平均月銷", "label": "近3月平均月銷", "field": "近3月平均月銷"},
+                                {"name": "現有庫存", "label": "現有庫存", "field": "現有庫存"},
+                                {"name": "庫存週轉天數", "label": "庫存週轉天數", "field": "庫存週轉天數"},
+                                {"name": "滯銷", "label": "滯銷", "field": "滯銷"},
+                            ],
+                            rows=turnover_rows,
+                        ).classes("w-full")
+
                   update_turnover_list()
+                  refs["update_turnover_list"] = update_turnover_list
 
-                ui.button(
-                    "從 A1 抓取近3個月銷售歷史", on_click=handle_fetch_sales_from_a1
-                ).classes("sync-btn px-3 py-1 text-xs rounded-none")
-
-              turnover_stats_label = ui.label().classes(
-                  "text-xs text-zinc-500 mb-3"
-              )
-              turnover_table_container = ui.column().classes("w-full")
-
-              def update_turnover_list():
-                turnover_table_container.clear()
-                sales_history = app_state.get("sales_history", [])
-                configured = app_state.get("sales_history_configured", False)
-                turnover_source_label.text = (
-                    f"目前資料來源：{app_state.get('sales_history_source', '尚未設定')}"
-                )
-
-                if not configured:
-                  turnover_stats_label.text = ""
-                  with turnover_table_container:
-                    ui.label(
-                        "尚未設定 Google Sheets，請見「6. 系統設定」的設定"
-                        "說明。"
-                    ).classes("text-xs text-zinc-400")
-                  return
-
-                df = app_state["df"].copy()
-                items_map = app_state.get("items_map", {})
-                if not df.empty:
-                  stock_by_item = df.groupby("品號", as_index=False)[
-                      "庫存數量"
-                  ].sum()
-                  stock_lookup = dict(
-                      zip(stock_by_item["品號"], stock_by_item["庫存數量"])
+              with ui.tab_panel(tab_procurement_54):
+                with ui.card().classes(
+                    "w-full p-6 bg-white border border-[#e2e1dc] shadow-none"
+                    " rounded-none"
+                ):
+                  ui.label("5.4 進貨明細").classes(
+                      "text-sm font-bold text-zinc-700 mb-2"
                   )
-                else:
-                  stock_lookup = {}
-
-                slow_moving_days = app_state["settings"]["slow_moving_days"]
-                turnover_rows = compute_turnover_metrics(
-                    sales_history, stock_lookup, items_map, slow_moving_days
-                )
-                slow_count = sum(1 for r in turnover_rows if r["滯銷"] == "是")
-                turnover_stats_label.text = (
-                    f"共 {len(turnover_rows)} 項有銷售紀錄的品項｜"
-                    f"其中 {slow_count} 項判定為滯銷"
-                )
-
-                with turnover_table_container:
-                  if not turnover_rows:
-                    ui.label("尚無銷售歷史資料").classes(
-                        "text-xs text-zinc-400"
-                    )
-                  else:
-                    ui.table(
-                        columns=[
-                            {"name": "品號", "label": "品號", "field": "品號", "align": "left"},
-                            {"name": "品名", "label": "品名", "field": "品名", "align": "left"},
-                            {"name": "近3月平均月銷", "label": "近3月平均月銷", "field": "近3月平均月銷"},
-                            {"name": "現有庫存", "label": "現有庫存", "field": "現有庫存"},
-                            {"name": "庫存週轉天數", "label": "庫存週轉天數", "field": "庫存週轉天數"},
-                            {"name": "滯銷", "label": "滯銷", "field": "滯銷"},
-                        ],
-                        rows=turnover_rows,
-                    ).classes("w-full")
-
-              update_turnover_list()
-              refs["update_turnover_list"] = update_turnover_list
-
-              ui.separator().classes("my-6")
-
-              ui.label("5.4 進貨明細").classes(
-                  "text-sm font-bold text-zinc-700 mb-2"
-              )
-              with ui.row().classes(
-                  "w-full p-3 mb-4 bg-[#e8f6f5] border border-[#bfe6e3]"
-              ):
-                ui.label(
-                    "資料來源：Google Sheets「進貨明細」分頁。A1 的"
-                    "「進銷存報表」雖然能在後台匯出進退貨明細表，但那是"
-                    "後台網頁報表，這份 API 串接手冊（1.0.35）裡 Receives "
-                    "只有 [Post] 上傳、沒有對應的查詢端點，所以沒辦法直接"
-                    "用 API 抓，改用 Sheet 維護（可以把 A1 匯出的報表複製"
-                    "貼上進來，比一筆一筆手動輸入快）。"
-                ).classes("text-xs text-teal-800")
-
-              with ui.row().classes("items-center gap-3 flex-wrap mb-3"):
-                receiving_search_input = ui.input(
-                    placeholder="輸入品號、品名或供應商..."
-                ).classes("w-64 text-xs")
-
-              receiving_stats_label = ui.label().classes(
-                  "text-xs text-zinc-500 mb-3"
-              )
-              receiving_table_container = ui.column().classes("w-full")
-
-              def update_receivings_list():
-                receiving_table_container.clear()
-                receivings = app_state.get("receivings", [])
-                configured = app_state.get("receivings_configured", False)
-
-                if not configured:
-                  receiving_stats_label.text = ""
-                  with receiving_table_container:
+                  with ui.row().classes(
+                      "w-full p-3 mb-4 bg-[#e8f6f5] border border-[#bfe6e3]"
+                  ):
                     ui.label(
-                        "尚未設定 Google Sheets，請見「6. 系統設定」的設定"
-                        "說明。"
-                    ).classes("text-xs text-zinc-400")
-                  return
+                        "資料來源：Google Sheets「進貨明細」分頁。A1 的"
+                        "「進銷存報表」雖然能在後台匯出進退貨明細表，但那是"
+                        "後台網頁報表，這份 API 串接手冊（1.0.35）裡 Receives "
+                        "只有 [Post] 上傳、沒有對應的查詢端點，所以沒辦法直接"
+                        "用 API 抓，改用 Sheet 維護（可以把 A1 匯出的報表複製"
+                        "貼上進來，比一筆一筆手動輸入快）。"
+                    ).classes("text-xs text-teal-800")
 
-                rows = list(receivings)
-                keyword = (receiving_search_input.value or "").strip().lower()
-                if keyword:
-                  rows = [
-                      r for r in rows
-                      if keyword in str(r["品號"]).lower()
-                      or keyword in str(r.get("品名", "")).lower()
-                      or keyword in str(r.get("供應商", "")).lower()
-                  ]
+                  with ui.row().classes("items-center gap-3 flex-wrap mb-3"):
+                    receiving_search_input = ui.input(
+                        placeholder="輸入品號、品名或供應商..."
+                    ).classes("w-64 text-xs")
 
-                rows = sorted(rows, key=lambda r: r["進貨日期"], reverse=True)
-                display_rows = [
-                    {**r, "進貨日期": r["進貨日期"].isoformat()}
-                    for r in rows
-                ]
+                  receiving_stats_label = ui.label().classes(
+                      "text-xs text-zinc-500 mb-3"
+                  )
+                  receiving_table_container = ui.column().classes("w-full")
 
-                total_qty = sum(r["進貨數量"] for r in rows)
-                receiving_stats_label.text = (
-                    f"共 {len(rows)} 筆進貨紀錄｜總進貨數量 {total_qty:g}"
-                )
+                  def update_receivings_list():
+                    receiving_table_container.clear()
+                    receivings = app_state.get("receivings", [])
+                    configured = app_state.get("receivings_configured", False)
 
-                with receiving_table_container:
-                  if not rows:
-                    ui.label("目前沒有符合條件的進貨紀錄").classes(
-                        "text-xs text-zinc-400"
+                    if not configured:
+                      receiving_stats_label.text = ""
+                      with receiving_table_container:
+                        ui.label(
+                            "尚未設定 Google Sheets，請見「6. 系統設定」的設定"
+                            "說明。"
+                        ).classes("text-xs text-zinc-400")
+                      return
+
+                    rows = list(receivings)
+                    keyword = (receiving_search_input.value or "").strip().lower()
+                    if keyword:
+                      rows = [
+                          r for r in rows
+                          if keyword in str(r["品號"]).lower()
+                          or keyword in str(r.get("品名", "")).lower()
+                          or keyword in str(r.get("供應商", "")).lower()
+                      ]
+
+                    rows = sorted(rows, key=lambda r: r["進貨日期"], reverse=True)
+                    display_rows = [
+                        {**r, "進貨日期": r["進貨日期"].isoformat()}
+                        for r in rows
+                    ]
+
+                    total_qty = sum(r["進貨數量"] for r in rows)
+                    receiving_stats_label.text = (
+                        f"共 {len(rows)} 筆進貨紀錄｜總進貨數量 {total_qty:g}"
                     )
-                  else:
-                    ui.table(
-                        columns=[
-                            {"name": "進貨日期", "label": "進貨日期", "field": "進貨日期"},
-                            {"name": "品號", "label": "品號", "field": "品號", "align": "left"},
-                            {"name": "品名", "label": "品名", "field": "品名", "align": "left"},
-                            {"name": "進貨數量", "label": "進貨數量", "field": "進貨數量"},
-                            {"name": "單價", "label": "單價", "field": "單價"},
-                            {"name": "供應商", "label": "供應商", "field": "供應商", "align": "left"},
-                            {"name": "備註", "label": "備註", "field": "備註", "align": "left"},
-                        ],
-                        rows=display_rows,
-                    ).classes("w-full")
 
-              receiving_search_input.on_value_change(lambda e: update_receivings_list())
-              update_receivings_list()
-              refs["update_receivings_list"] = update_receivings_list
+                    with receiving_table_container:
+                      if not rows:
+                        ui.label("目前沒有符合條件的進貨紀錄").classes(
+                            "text-xs text-zinc-400"
+                        )
+                      else:
+                        ui.table(
+                            columns=[
+                                {"name": "進貨日期", "label": "進貨日期", "field": "進貨日期"},
+                                {"name": "品號", "label": "品號", "field": "品號", "align": "left"},
+                                {"name": "品名", "label": "品名", "field": "品名", "align": "left"},
+                                {"name": "進貨數量", "label": "進貨數量", "field": "進貨數量"},
+                                {"name": "單價", "label": "單價", "field": "單價"},
+                                {"name": "供應商", "label": "供應商", "field": "供應商", "align": "left"},
+                                {"name": "備註", "label": "備註", "field": "備註", "align": "left"},
+                            ],
+                            rows=display_rows,
+                        ).classes("w-full")
+
+                  receiving_search_input.on_value_change(lambda e: update_receivings_list())
+                  update_receivings_list()
+                  refs["update_receivings_list"] = update_receivings_list
+
+              with ui.tab_panel(tab_procurement_55):
+                with ui.card().classes(
+                    "w-full p-6 bg-white border border-[#e2e1dc] shadow-none"
+                    " rounded-none"
+                ):
+                  ui.label("5.5 月產銷分析").classes(
+                      "text-lg font-bold text-zinc-900 tracking-wide mb-2"
+                  )
+                  with ui.row().classes(
+                      "w-full p-3 mb-4 bg-[#e8f6f5] border border-[#bfe6e3]"
+                  ):
+                    ui.label(
+                        "資料來源：跟 5.3 共用同一份「銷售歷史」資料（可以是"
+                        "Google Sheets，也可以是在 5.3 按過「從 A1 抓取」的"
+                        "即時資料）。邏輯：基準預估銷量 = (去年同期銷量 + "
+                        "近3個月平均銷量) ÷ 2；若有填目標營業額，會等比例"
+                        "校正每個品項的預估量，讓總營收貼近目標；建議採購"
+                        "時間 = 目標月份第一天 − 採購前置天數（抓 BOM 表"
+                        "設定，沒有則用系統預設值）。"
+                    ).classes("text-xs text-teal-800")
+
+                  with ui.row().classes("items-center gap-3 flex-wrap mb-4"):
+                    forecast_month_select = ui.select(
+                        options=generate_month_options(6),
+                        value=generate_month_options(6)[0],
+                        label="預估月份",
+                    ).classes(
+                        "bg-[#f7f6f2] text-zinc-900 rounded-none px-3 py-1"
+                        " text-xs font-bold border border-[#e2e1dc] w-32"
+                    )
+                    forecast_revenue_input = ui.number(
+                        label="目標營業額（選填，不填則用基準預估量）",
+                        min=0,
+                        step=1000,
+                    ).classes("w-64")
+                    forecast_calc_button = ui.button("計算").classes(
+                        "sync-btn px-4 py-2 text-xs rounded-none"
+                    )
+
+                  forecast_summary_row = ui.row().classes("w-full gap-4 mb-4 flex-wrap")
+                  forecast_note_label = ui.label().classes(
+                      "text-xs text-zinc-500 mb-3"
+                  )
+                  forecast_table_container = ui.column().classes("w-full")
+
+                  def handle_calc_forecast():
+                    forecast_summary_row.clear()
+                    forecast_table_container.clear()
+
+                    sales_history = app_state.get("sales_history", [])
+                    if not app_state.get("sales_history_configured", False):
+                      forecast_note_label.text = (
+                          "尚未有銷售歷史資料來源，請先到 5.3 設定 Google "
+                          "Sheets 或按「從 A1 抓取」。"
+                      )
+                      return
+
+                    items_map = app_state.get("items_map", {})
+                    bom_map = app_state.get("bom_map", {})
+                    target_month = forecast_month_select.value
+                    target_revenue = forecast_revenue_input.value or 0
+
+                    result = compute_monthly_production_sales_forecast(
+                        sales_history, items_map, bom_map, target_month,
+                        target_revenue, app_state["settings"],
+                    )
+
+                    forecast_note_label.text = (
+                        f"參考去年同期（{result['last_year_ym']}）＋近3個月"
+                        f"（{'、'.join(reversed(result['recent_months']))}）"
+                        f"平均｜共 {len(result['rows'])} 項有預估值的品項"
+                        + (
+                            f"｜營收校正倍數：{result['scale_factor']}"
+                            if target_revenue else "｜未填目標營業額，使用基準預估量"
+                        )
+                    )
+
+                    with forecast_summary_row:
+                      summary_cards = [
+                          ("預估採購總量", f"{result['total_est_qty']:,.0f}"),
+                          ("預估總成本", f"NT$ {result['total_est_cost']:,.0f}"),
+                          ("預估總營收（核對用）", f"NT$ {result['total_est_revenue']:,.0f}"),
+                          (
+                              "建議最早開始採購日",
+                              result["earliest_order_date"] or "－",
+                          ),
+                      ]
+                      for label, value in summary_cards:
+                        with ui.column().classes(
+                            "bg-[#f7f6f2] border border-[#e2e1dc] p-4"
+                            " min-w-[200px] flex-1"
+                        ):
+                          ui.label(label).classes("text-xs text-zinc-500 mb-1")
+                          ui.label(value).classes(
+                              "text-xl font-black text-zinc-900"
+                          )
+
+                    with forecast_table_container:
+                      if not result["rows"]:
+                        ui.label(
+                            "沒有可用的銷售歷史資料算出預估值（去年同期跟"
+                            "近3個月都沒有資料）"
+                        ).classes("text-xs text-zinc-400")
+                      else:
+                        ui.table(
+                            columns=[
+                                {"name": "品號", "label": "品號", "field": "品號", "align": "left"},
+                                {"name": "品名", "label": "品名", "field": "品名", "align": "left"},
+                                {"name": "去年同期銷量", "label": "去年同期銷量", "field": "去年同期銷量"},
+                                {"name": "近3月平均銷量", "label": "近3月平均銷量", "field": "近3月平均銷量"},
+                                {"name": "預估採購量", "label": "預估採購量", "field": "預估採購量"},
+                                {"name": "預估成本", "label": "預估成本", "field": "預估成本"},
+                                {"name": "建議採購時間", "label": "建議採購時間", "field": "建議採購時間"},
+                            ],
+                            rows=result["rows"],
+                            pagination=10,
+                        ).classes("w-full")
+
+                  forecast_calc_button.on_click(handle_calc_forecast)
 
           # ==================================================
           # 6. 系統設定與同步管理
@@ -3351,11 +3679,15 @@ def inventory_dashboard():
                       ),
                       (
                           "銷售歷史", SALES_HISTORY_GOOGLE_SHEET_TAB,
-                          "Google Sheets" if app_state.get("sales_history_configured") else "尚未設定",
+                          app_state.get("sales_history_source", "尚未設定"),
                       ),
                       (
                           "進貨明細", RECEIVING_GOOGLE_SHEET_TAB,
                           "Google Sheets" if app_state.get("receivings_configured") else "尚未設定",
+                      ),
+                      (
+                          "通路銷售明細", CHANNEL_SALES_GOOGLE_SHEET_TAB,
+                          "Google Sheets" if app_state.get("channel_sales_configured") else "尚未設定",
                       ),
                   ):
                     ui.label(
@@ -3363,12 +3695,14 @@ def inventory_dashboard():
                     ).classes("text-xs text-zinc-600")
                 ui.label(
                     "設定方式：環境變數 GOOGLE_SHEETS_CREDENTIALS_JSON（服務"
-                    "帳號金鑰 JSON 內容）、GOOGLE_SHEET_ID（四份資料共用同一"
+                    "帳號金鑰 JSON 內容）、GOOGLE_SHEET_ID（五份資料共用同一"
                     "個 Sheet ID，只是分頁不同）。分頁名稱可用"
                     "BOM_GOOGLE_SHEET_TAB／ORDERS_GOOGLE_SHEET_TAB／"
                     "SALES_HISTORY_GOOGLE_SHEET_TAB／"
-                    "RECEIVING_GOOGLE_SHEET_TAB 自訂，預設分別是"
-                    "「BOM表」「訂單資訊」「銷售歷史」「進貨明細」。"
+                    "RECEIVING_GOOGLE_SHEET_TAB／"
+                    "CHANNEL_SALES_GOOGLE_SHEET_TAB 自訂，預設分別是"
+                    "「BOM表」「訂單資訊」「銷售歷史」「進貨明細」"
+                    "「通路銷售明細」。"
                 ).classes("text-xs text-zinc-500 mt-2")
 
               # ---------------- 6.3：參數設定 ----------------
