@@ -1530,38 +1530,46 @@ def compute_turnover_metrics(sales_history, stock_lookup, items_map, slow_moving
   return results
 
 
-def generate_month_options(n=6):
-  """產生「今天之後」的 N 個月份選項（YYYY-MM），供 5.5 月份選單用，
-  預設第一個選項就是下個月。
+def generate_month_options(n=7):
+  """產生「從本月開始」的 N 個月份選項（YYYY-MM），供 5.5 月份選單用。
+  第一個選項是當月（方便月中還想針對當月剩餘天數抓貨），後面接著未來
+  幾個月。
   """
   today = datetime.now().date()
   options = []
   y, m = today.year, today.month
   for _ in range(n):
+    options.append(f"{y}-{m:02d}")
     m += 1
     if m > 12:
       m = 1
       y += 1
-    options.append(f"{y}-{m:02d}")
   return options
 
 
 def compute_monthly_production_sales_forecast(
-    sales_history, items_map, bom_map, target_year_month, target_revenue, settings
+    sales_history, items_map, bom_map, target_year_month, target_revenue, settings,
+    last_year_target_revenue=0,
 ):
   """5.5 月產銷分析：預估目標月份（例如 "2026-08"）的採購量／成本／
   建議採購時間。
 
   參考依據（依需求指定）：
-  - 去年同期：目標月份的去年同月（8月 → 去年8月）
+  - 去年同期：目標月份的去年同月（8月 → 去年8月）。如果去年的品號
+    編碼跟今年不一樣（常見情況：換過品號規則），會完全比對不到，這時
+    改用「去年目標營業額」等比例回推——用「近3個月」的營收佔比當作
+    權重，把去年目標營業額依同樣的權重分攤回各品項，再除以單價換算
+    回數量。這是估算，不是實際數字，畫面會用「去年銷量來源」欄位
+    標明是「實際」還是「依比例推算」。
   - 近3個月平均：目標月份往前推 3 個「完整月」（8月 → 5、6、7月平均）
   - 基準預估銷量 = 兩者平均
   - 若有填「目標營業額」，用「目標營業額 ÷ 基準預估總營收」的比例，
     等比例縮放每個品項的預估銷量，讓由下而上算出來的總營收貼近業務
     設定的目標（由上而下校正），沒填就直接用基準預估量
-  - 預估採購量＝校正後的預估銷量（先不額外疊加安全庫存，這是最基本
+  - 目標採購量＝校正後的預估銷量（先不額外疊加安全庫存，這是最基本
     版本，之後可以再疊加安全庫存邏輯）
-  - 預估成本＝預估採購量 × 標準進價（StdPurPrice，A1 商品主檔既有欄位）
+  - 預估總成本＝目標採購量 × 單位成本（StdPurPrice，A1 商品主檔既有
+    欄位）
   - 建議採購時間＝目標月份第一天 − 採購前置天數（優先抓 BOM 表裡這個
     品項「作為子件」登記的前置天數，沒有就用系統預設值）
   """
@@ -1596,6 +1604,22 @@ def compute_monthly_production_sales_forecast(
 
   all_item_ids = set(qty_last_year) | set(qty_recent)
 
+  # 先算好每個品項的「近3月平均」跟「單價」，供「依去年目標營業額比例
+  # 回推」使用（權重 = 這個品項近3月營收 ÷ 全部品項近3月營收）
+  recent_avg_by_item = {}
+  unit_price_by_item = {}
+  for item_id in all_item_ids:
+    recent_qty_dict = qty_recent.get(item_id, {})
+    recent_avg_by_item[item_id] = (
+        sum(recent_qty_dict.values()) / 3 if recent_qty_dict else 0.0
+    )
+    info = items_map.get(item_id, {})
+    unit_price_by_item[item_id] = info.get("SalesPrice") or 0
+
+  total_recent_revenue = sum(
+      recent_avg_by_item[i] * unit_price_by_item[i] for i in all_item_ids
+  )
+
   lead_time_by_child = {}
   for components in bom_map.values():
     for comp in components:
@@ -1607,9 +1631,20 @@ def compute_monthly_production_sales_forecast(
 
   rows = []
   for item_id in all_item_ids:
-    last_year_qty = qty_last_year.get(item_id, 0.0)
-    recent_qty_dict = qty_recent.get(item_id, {})
-    recent_avg = sum(recent_qty_dict.values()) / 3 if recent_qty_dict else 0.0
+    last_year_qty_actual = qty_last_year.get(item_id, 0.0)
+    recent_avg = recent_avg_by_item[item_id]
+    unit_price = unit_price_by_item[item_id]
+
+    last_year_qty = last_year_qty_actual
+    last_year_source = "實際"
+    if last_year_qty_actual <= 0:
+      if last_year_target_revenue and total_recent_revenue > 0 and unit_price > 0:
+        revenue_share = (recent_avg * unit_price) / total_recent_revenue
+        last_year_qty = (last_year_target_revenue * revenue_share) / unit_price
+        last_year_source = "依去年目標營業額比例推算"
+      else:
+        last_year_source = "無資料"
+
     baseline_qty = (last_year_qty + recent_avg) / 2
     if baseline_qty <= 0:
       continue
@@ -1617,7 +1652,6 @@ def compute_monthly_production_sales_forecast(
     info = items_map.get(item_id, {})
     item_name = info.get("Name") or name_by_item.get(item_id, "")
     unit_cost = info.get("StdPurPrice") or 0
-    unit_price = info.get("SalesPrice") or 0
     lead_time = lead_time_by_child.get(item_id, default_lead_time)
     suggested_order_date = target_month_start - timedelta(days=lead_time)
 
@@ -1626,6 +1660,7 @@ def compute_monthly_production_sales_forecast(
         "品名": item_name,
         "商品分類": info.get("CategoryName") or "未分類",
         "去年同期銷量": ceil_qty(last_year_qty),
+        "去年銷量來源": last_year_source,
         "近3月平均銷量": ceil_qty(recent_avg),
         "基準預估銷量": round(baseline_qty, 1),  # 內部用，未四捨五入避免縮放誤差累積
         "單價": unit_price,
@@ -1641,7 +1676,7 @@ def compute_monthly_production_sales_forecast(
 
   for r in rows:
     est_qty = ceil_qty(r["基準預估銷量"] * scale_factor)
-    r["預估採購量"] = est_qty
+    r["目標採購量"] = est_qty
     r["預估總成本"] = round(est_qty * r["單位成本"], 0)
     del r["基準預估銷量"]  # 只是計算用的中間值，不用顯示給使用者
 
@@ -1650,9 +1685,9 @@ def compute_monthly_production_sales_forecast(
   return {
       "rows": rows,
       "scale_factor": round(scale_factor, 3),
-      "total_est_qty": sum(r["預估採購量"] for r in rows),
+      "total_est_qty": sum(r["目標採購量"] for r in rows),
       "total_est_cost": sum(r["預估總成本"] for r in rows),
-      "total_est_revenue": sum(r["預估採購量"] * r["單價"] for r in rows),
+      "total_est_revenue": sum(r["目標採購量"] * r["單價"] for r in rows),
       "earliest_order_date": min((r["建議採購時間"] for r in rows), default=None),
       "last_year_ym": last_year_ym,
       "recent_months": recent_months,
@@ -1684,7 +1719,7 @@ def compute_channel_breakdown(forecast_result, channel_percentages, target_reven
         "通路": channel,
         "佔比(%)": pct,
         "目標營業額": round(target_revenue * ratio, 0) if target_revenue else None,
-        "預估採購量": ceil_qty(forecast_result["total_est_qty"] * ratio),
+        "目標採購量": ceil_qty(forecast_result["total_est_qty"] * ratio),
         "預估總成本": round(forecast_result["total_est_cost"] * ratio, 0),
         "預估總營收": round(forecast_result["total_est_revenue"] * ratio, 0),
     })
@@ -3681,6 +3716,11 @@ def inventory_dashboard():
                         min=0,
                         step=1000,
                     ).classes("w-64")
+                    forecast_last_year_revenue_input = ui.number(
+                        label="去年目標營業額（選填，品號對不上時用比例回推）",
+                        min=0,
+                        step=1000,
+                    ).classes("w-72")
                     forecast_auto_fetch_checkbox = ui.checkbox(
                         "自動從 A1 抓最新銷售資料（建議開啟）",
                         value=True,
@@ -3690,8 +3730,16 @@ def inventory_dashboard():
                     )
 
                   forecast_fetch_status_label = ui.label().classes(
-                      "text-xs text-zinc-500 mb-3"
+                      "text-xs text-zinc-500 mb-1"
                   )
+                  ui.label(
+                      "⚠ 若去年的品號編碼跟今年不一樣，系統會完全比對不到"
+                      "「去年同期銷量」（一律顯示為 0）。這時可以填「去年"
+                      "目標營業額」，系統會用「近3個月」的營收佔比當權重，"
+                      "把這個數字依同樣比例分攤回各品項、換算回數量，當作"
+                      "去年同期的替代估計值——這是推算，不是實際數字，總表"
+                      "會用「去年銷量來源」欄位標明。"
+                  ).classes("text-xs text-zinc-500 mb-3")
 
                   ui.label("通路占比分配（選填，用於拆分下方「分通路表」）").classes(
                       "text-sm font-bold text-zinc-700 mb-2"
@@ -3758,8 +3806,9 @@ def inventory_dashboard():
                       {"name": "品名", "label": "品名", "field": "品名", "align": "left"},
                       {"name": "商品分類", "label": "商品分類", "field": "商品分類", "align": "left"},
                       {"name": "去年同期銷量", "label": "去年同期銷量", "field": "去年同期銷量"},
+                      {"name": "去年銷量來源", "label": "去年銷量來源", "field": "去年銷量來源", "align": "left"},
                       {"name": "近3月平均銷量", "label": "近3月平均銷量", "field": "近3月平均銷量"},
-                      {"name": "預估採購量", "label": "預估採購量", "field": "預估採購量"},
+                      {"name": "目標採購量", "label": "目標採購量", "field": "目標採購量"},
                       {"name": "單位成本", "label": "單位成本", "field": "單位成本"},
                       {"name": "預估總成本", "label": "預估總成本", "field": "預估總成本"},
                       {"name": "建議採購時間", "label": "建議採購時間", "field": "建議採購時間"},
@@ -3768,7 +3817,7 @@ def inventory_dashboard():
                       {"name": "通路", "label": "通路", "field": "通路", "align": "left"},
                       {"name": "佔比(%)", "label": "佔比(%)", "field": "佔比(%)"},
                       {"name": "目標營業額", "label": "目標營業額", "field": "目標營業額"},
-                      {"name": "預估採購量", "label": "預估採購量", "field": "預估採購量"},
+                      {"name": "目標採購量", "label": "目標採購量", "field": "目標採購量"},
                       {"name": "預估總成本", "label": "預估總成本", "field": "預估總成本"},
                       {"name": "預估總營收", "label": "預估總營收", "field": "預估總營收"},
                   ]
@@ -3892,10 +3941,12 @@ def inventory_dashboard():
                     items_map = app_state.get("items_map", {})
                     bom_map = app_state.get("bom_map", {})
                     target_revenue = forecast_revenue_input.value or 0
+                    last_year_target_revenue = forecast_last_year_revenue_input.value or 0
 
                     result = compute_monthly_production_sales_forecast(
                         sales_history, items_map, bom_map, target_month,
                         target_revenue, app_state["settings"],
+                        last_year_target_revenue=last_year_target_revenue,
                     )
                     forecast_state["result"] = result
 
@@ -3907,11 +3958,15 @@ def inventory_dashboard():
                             f"｜營收校正倍數：{result['scale_factor']}"
                             if target_revenue else "｜未填目標營業額，使用基準預估量"
                         )
+                        + (
+                            "｜去年同期已用比例推算補齊"
+                            if last_year_target_revenue else ""
+                        )
                     )
 
                     with forecast_summary_row:
                       summary_cards = [
-                          ("預估採購總量", f"{result['total_est_qty']:,.0f}"),
+                          ("目標採購總量", f"{result['total_est_qty']:,.0f}"),
                           ("預估總成本", f"NT$ {result['total_est_cost']:,.0f}"),
                           ("預估總營收（核對用）", f"NT$ {result['total_est_revenue']:,.0f}"),
                           (
