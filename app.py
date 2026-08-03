@@ -1,5 +1,6 @@
 import base64
 import concurrent.futures
+import io
 import json
 import os
 import sys
@@ -27,6 +28,17 @@ def safe_text(value, default=""):
   except (TypeError, ValueError):
     pass
   return str(value)
+
+
+def rows_to_xlsx_bytes(rows, sheet_name="工作表1"):
+  """把 list[dict] 轉成 xlsx 檔案的 bytes，供 ui.download() 直接下載，
+  不落地寫檔（Render 的檔案系統是暫時的，用記憶體 buffer 比較乾淨）。
+  """
+  df = pd.DataFrame(rows)
+  buffer = io.BytesIO()
+  with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+    df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+  return buffer.getvalue()
 
 # -------------------------------------------------------------------------
 # 1. 鼎新 A1 API 串接與全量資料自動抓取
@@ -90,6 +102,9 @@ BOM_GOOGLE_SHEET_TAB = os.environ.get("BOM_GOOGLE_SHEET_TAB", "BOM表")
 ORDERS_GOOGLE_SHEET_TAB = os.environ.get("ORDERS_GOOGLE_SHEET_TAB", "訂單資訊")
 SALES_HISTORY_GOOGLE_SHEET_TAB = os.environ.get(
     "SALES_HISTORY_GOOGLE_SHEET_TAB", "銷售歷史"
+)
+RECEIVING_GOOGLE_SHEET_TAB = os.environ.get(
+    "RECEIVING_GOOGLE_SHEET_TAB", "進貨明細"
 )
 
 
@@ -738,6 +753,60 @@ def load_sales_history_from_google_sheet():
   return rows, True
 
 
+# ---- 進貨明細（Google Sheet；A1 只有 Receives[Post] 上傳、沒有查詢端點，
+#      所以「進貨明細」跟訂單資訊/銷售歷史一樣改用 Sheet 維護。詳見本次
+#      回覆中的 A1 報表匯出可行性說明） ----
+RECEIVING_COL_DATE = "進貨日期"
+RECEIVING_COL_ITEM_ID = "品號"
+RECEIVING_COL_ITEM_NAME = "品名（選填，供參考）"
+RECEIVING_COL_QTY = "進貨數量"
+RECEIVING_COL_UNIT_PRICE = "單價（選填）"
+RECEIVING_COL_SUPPLIER = "供應商（選填）"
+RECEIVING_COL_MEMO = "備註"
+
+
+def _parse_receiving_records(records):
+  rows = []
+  for row in records:
+    item_id = str(row.get(RECEIVING_COL_ITEM_ID, "") or "").strip()
+    receiving_date = _parse_flexible_date(row.get(RECEIVING_COL_DATE))
+    if not item_id or receiving_date is None:
+      continue
+
+    qty_raw = str(row.get(RECEIVING_COL_QTY, "") or "").strip()
+    try:
+      qty = float(qty_raw) if qty_raw else 0.0
+    except ValueError:
+      qty = 0.0
+
+    price_raw = str(row.get(RECEIVING_COL_UNIT_PRICE, "") or "").strip()
+    try:
+      unit_price = float(price_raw) if price_raw else None
+    except ValueError:
+      unit_price = None
+
+    rows.append({
+        "進貨日期": receiving_date,
+        "品號": item_id,
+        "品名": str(row.get(RECEIVING_COL_ITEM_NAME, "") or "").strip(),
+        "進貨數量": qty,
+        "單價": unit_price,
+        "供應商": str(row.get(RECEIVING_COL_SUPPLIER, "") or "").strip(),
+        "備註": str(row.get(RECEIVING_COL_MEMO, "") or "").strip(),
+    })
+  return rows
+
+
+def load_receivings_from_google_sheet():
+  """讀取「進貨明細」分頁。回傳 (receivings, configured)，意義同訂單資訊。"""
+  records = _fetch_google_sheet_records(RECEIVING_GOOGLE_SHEET_TAB)
+  if records is None:
+    return [], False
+  rows = _parse_receiving_records(records)
+  print(f"進貨明細讀取完成：共 {len(rows)} 筆有效紀錄")
+  return rows, True
+
+
 # -------------------------------------------------------------------------
 # 興聖集團旗下分公司清單（右上角切換用）
 # 目前僅「海濤客食品工業(股)公司」已完成 A1 API 串接，其餘分公司頁面預留、
@@ -961,6 +1030,28 @@ def compute_dashboard_announcements(orders, items_map, bom_map, stock_lookup, se
         "severity": severity,
     })
 
+  # 建議採購成品（只看母件）：未來需求 > 現有庫存的成品，不論原料夠不夠，
+  # 都先讓管理者看到「這個成品接下來會不夠」，可以決定要生產還是外購
+  finished_goods = []
+  for r in result["finished_goods_shortfall"]:
+    try:
+      due_date = datetime.fromisoformat(r["最早出貨日"]).date()
+      days_left = (due_date - today).days
+    except (ValueError, TypeError):
+      days_left = None
+    severity = (
+        "danger" if (days_left is not None and days_left <= 3)
+        else "warning"
+    )
+    finished_goods.append({
+        "text": (
+            f"建議採購成品：{r.get('品名') or r['品號']} 未來需求"
+            f" {r['未來需求量']:g}，現有庫存 {r['現有庫存']:g}，"
+            f"缺口 {r['缺口']:g}（最早出貨日 {r['最早出貨日']}）"
+        ),
+        "severity": severity,
+    })
+
   procurement = []
   incoming = []
   for m in result["raw_material_shortfall"]:
@@ -995,6 +1086,7 @@ def compute_dashboard_announcements(orders, items_map, bom_map, stock_lookup, se
   return {
       "shipping": shipping,
       "production": production,
+      "finished_goods": finished_goods,
       "procurement": procurement,
       "incoming": incoming,
   }
@@ -1052,6 +1144,7 @@ initial_df, initial_whs, initial_cats, initial_items_map = fetch_all_a1_inventor
 initial_bom_map, initial_bom_source = load_bom_data()
 initial_orders, initial_orders_configured = load_orders_from_google_sheet()
 initial_sales_history, initial_sales_configured = load_sales_history_from_google_sheet()
+initial_receivings, initial_receivings_configured = load_receivings_from_google_sheet()
 app_state = {
     "df": initial_df,
     "items_map": initial_items_map,
@@ -1061,6 +1154,8 @@ app_state = {
     "orders_configured": initial_orders_configured,
     "sales_history": initial_sales_history,
     "sales_history_configured": initial_sales_configured,
+    "receivings": initial_receivings,
+    "receivings_configured": initial_receivings_configured,
     "lot_nos": [],  # 批號資料改成頁籤點開時才抓（避免每次啟動都多打一支 API）
     # 6.1 同步狀態／錯誤日誌：每次 handle_sync 執行後會 append 一筆，
     # 只保留最新 20 筆，供「系統設定」頁籤顯示
@@ -1173,6 +1268,9 @@ def inventory_dashboard():
           app_state["sales_history"], app_state["sales_history_configured"] = (
               load_sales_history_from_google_sheet()
           )
+          app_state["receivings"], app_state["receivings_configured"] = (
+              load_receivings_from_google_sheet()
+          )
 
           is_mock = API_KEY == "" or API_PASSWORD == ""
           status = "成功（防呆資料，未設定 A1 憑證）" if is_mock else "成功"
@@ -1213,6 +1311,7 @@ def inventory_dashboard():
             "update_orders_list",
             "update_packing_schedule",
             "update_turnover_list",
+            "update_receivings_list",
         ):
           if ref_key in refs:
             refs[ref_key]()
@@ -1258,14 +1357,6 @@ def inventory_dashboard():
                   "text-sm font-bold text-zinc-700 mb-2"
               )
               dashboard_announce_container = ui.column().classes("w-full gap-2 mb-6")
-
-              ui.label("低於安全庫存清單（現有庫存 vs A1 安全存量）").classes(
-                  "text-sm font-bold text-zinc-700 mb-2"
-              )
-              dashboard_alert_label = ui.label().classes(
-                  "text-xs text-zinc-500 mb-2"
-              )
-              dashboard_alert_container = ui.column().classes("w-full")
 
               def _severity_box(severity, text):
                 style = SEVERITY_STYLES[severity]
@@ -1316,6 +1407,17 @@ def inventory_dashboard():
                     )
                   else:
                     ui.table(columns=columns, rows=rows).classes("w-full")
+
+                    def handle_export():
+                      xlsx_bytes = rows_to_xlsx_bytes(rows, sheet_name=title)
+                      safe_filename = "".join(
+                          c for c in title if c not in '\\/:*?"<>|'
+                      )
+                      ui.download(xlsx_bytes, f"{safe_filename}.xlsx")
+
+                    ui.button("匯出 xlsx", on_click=handle_export).classes(
+                        "sync-btn px-3 py-1 text-xs rounded-none mt-3"
+                    )
                 kpi_dialog.open()
 
               def _kpi_card(label, value, severity, on_click=None):
@@ -1342,7 +1444,6 @@ def inventory_dashboard():
               def update_dashboard():
                 dashboard_kpi_row.clear()
                 dashboard_announce_container.clear()
-                dashboard_alert_container.clear()
 
                 df = app_state["df"].copy()
                 items_map = app_state.get("items_map", {})
@@ -1554,8 +1655,7 @@ def inventory_dashboard():
                     category_labels = [
                         ("shipping", "🚚 訂單出貨提醒"),
                         ("production", "🏭 生產組裝確認"),
-                        ("procurement", "🛒 採購提醒"),
-                        ("incoming", "📦 進貨提醒"),
+                        ("finished_goods", "🧾 建議採購成品（母件）"),
                     ]
                     any_announcement = False
                     for key, label in category_labels:
@@ -1574,27 +1674,6 @@ def inventory_dashboard():
                           "success", "未來 30 天內沒有已知的出貨、生產、"
                           "採購或進貨提醒"
                       )
-
-                dashboard_alert_label.text = (
-                    f"依「缺口」由大到小排序，共 {len(risk_rows)} 項"
-                )
-                with dashboard_alert_container:
-                  if not risk_rows:
-                    ui.label(
-                        "目前沒有品項低於安全庫存，或商品主檔尚未設定"
-                        "安全存量／尚未同步資料"
-                    ).classes("text-xs text-zinc-400")
-                  else:
-                    ui.table(
-                        columns=[
-                            {"name": "品號", "label": "品號", "field": "品號", "align": "left"},
-                            {"name": "品名", "label": "品名", "field": "品名", "align": "left"},
-                            {"name": "目前庫存", "label": "目前庫存", "field": "目前庫存"},
-                            {"name": "安全存量", "label": "安全存量", "field": "安全存量"},
-                            {"name": "缺口", "label": "缺口", "field": "缺口"},
-                        ],
-                        rows=risk_rows,
-                    ).classes("w-full")
 
               update_dashboard()
               refs["update_dashboard"] = update_dashboard
@@ -2693,6 +2772,91 @@ def inventory_dashboard():
               update_turnover_list()
               refs["update_turnover_list"] = update_turnover_list
 
+              ui.separator().classes("my-6")
+
+              ui.label("5.4 進貨明細").classes(
+                  "text-sm font-bold text-zinc-700 mb-2"
+              )
+              with ui.row().classes(
+                  "w-full p-3 mb-4 bg-[#e8f6f5] border border-[#bfe6e3]"
+              ):
+                ui.label(
+                    "資料來源：Google Sheets「進貨明細」分頁。A1 的"
+                    "「進銷存報表」雖然能在後台匯出進退貨明細表，但那是"
+                    "後台網頁報表，這份 API 串接手冊（1.0.35）裡 Receives "
+                    "只有 [Post] 上傳、沒有對應的查詢端點，所以沒辦法直接"
+                    "用 API 抓，改用 Sheet 維護（可以把 A1 匯出的報表複製"
+                    "貼上進來，比一筆一筆手動輸入快）。"
+                ).classes("text-xs text-teal-800")
+
+              with ui.row().classes("items-center gap-3 flex-wrap mb-3"):
+                receiving_search_input = ui.input(
+                    placeholder="輸入品號、品名或供應商..."
+                ).classes("w-64 text-xs")
+
+              receiving_stats_label = ui.label().classes(
+                  "text-xs text-zinc-500 mb-3"
+              )
+              receiving_table_container = ui.column().classes("w-full")
+
+              def update_receivings_list():
+                receiving_table_container.clear()
+                receivings = app_state.get("receivings", [])
+                configured = app_state.get("receivings_configured", False)
+
+                if not configured:
+                  receiving_stats_label.text = ""
+                  with receiving_table_container:
+                    ui.label(
+                        "尚未設定 Google Sheets，請見「6. 系統設定」的設定"
+                        "說明。"
+                    ).classes("text-xs text-zinc-400")
+                  return
+
+                rows = list(receivings)
+                keyword = (receiving_search_input.value or "").strip().lower()
+                if keyword:
+                  rows = [
+                      r for r in rows
+                      if keyword in str(r["品號"]).lower()
+                      or keyword in str(r.get("品名", "")).lower()
+                      or keyword in str(r.get("供應商", "")).lower()
+                  ]
+
+                rows = sorted(rows, key=lambda r: r["進貨日期"], reverse=True)
+                display_rows = [
+                    {**r, "進貨日期": r["進貨日期"].isoformat()}
+                    for r in rows
+                ]
+
+                total_qty = sum(r["進貨數量"] for r in rows)
+                receiving_stats_label.text = (
+                    f"共 {len(rows)} 筆進貨紀錄｜總進貨數量 {total_qty:g}"
+                )
+
+                with receiving_table_container:
+                  if not rows:
+                    ui.label("目前沒有符合條件的進貨紀錄").classes(
+                        "text-xs text-zinc-400"
+                    )
+                  else:
+                    ui.table(
+                        columns=[
+                            {"name": "進貨日期", "label": "進貨日期", "field": "進貨日期"},
+                            {"name": "品號", "label": "品號", "field": "品號", "align": "left"},
+                            {"name": "品名", "label": "品名", "field": "品名", "align": "left"},
+                            {"name": "進貨數量", "label": "進貨數量", "field": "進貨數量"},
+                            {"name": "單價", "label": "單價", "field": "單價"},
+                            {"name": "供應商", "label": "供應商", "field": "供應商", "align": "left"},
+                            {"name": "備註", "label": "備註", "field": "備註", "align": "left"},
+                        ],
+                        rows=display_rows,
+                    ).classes("w-full")
+
+              receiving_search_input.on_value_change(lambda e: update_receivings_list())
+              update_receivings_list()
+              refs["update_receivings_list"] = update_receivings_list
+
           # ==================================================
           # 6. 系統設定與同步管理
           # ==================================================
@@ -2748,12 +2912,12 @@ def inventory_dashboard():
                 ui.label(
                     "狀態："
                     + (
-                        "已設定，三份資料（BOM表／訂單資訊／銷售歷史）"
-                        "共用同一份 Google Sheet 讀取"
+                        "已設定，四份資料（BOM表／訂單資訊／銷售歷史／"
+                        "進貨明細）共用同一份 Google Sheet 讀取"
                         if sheets_configured
                         else "尚未設定。BOM表會退回本機 Excel 過渡方案；"
-                        "訂單資訊與銷售歷史目前沒有備援來源，相關頁面"
-                        "會顯示「尚未設定」"
+                        "訂單資訊、銷售歷史、進貨明細目前沒有備援來源，"
+                        "相關頁面會顯示「尚未設定」"
                     )
                 ).classes(
                     "text-sm mb-2 "
@@ -2777,17 +2941,22 @@ def inventory_dashboard():
                           "銷售歷史", SALES_HISTORY_GOOGLE_SHEET_TAB,
                           "Google Sheets" if app_state.get("sales_history_configured") else "尚未設定",
                       ),
+                      (
+                          "進貨明細", RECEIVING_GOOGLE_SHEET_TAB,
+                          "Google Sheets" if app_state.get("receivings_configured") else "尚未設定",
+                      ),
                   ):
                     ui.label(
                         f"分頁「{tab_name}」（{label}）目前來源：{source_state}"
                     ).classes("text-xs text-zinc-600")
                 ui.label(
                     "設定方式：環境變數 GOOGLE_SHEETS_CREDENTIALS_JSON（服務"
-                    "帳號金鑰 JSON 內容）、GOOGLE_SHEET_ID（三份資料共用同一"
+                    "帳號金鑰 JSON 內容）、GOOGLE_SHEET_ID（四份資料共用同一"
                     "個 Sheet ID，只是分頁不同）。分頁名稱可用"
                     "BOM_GOOGLE_SHEET_TAB／ORDERS_GOOGLE_SHEET_TAB／"
-                    "SALES_HISTORY_GOOGLE_SHEET_TAB 自訂，預設分別是"
-                    "「BOM表」「訂單資訊」「銷售歷史」。"
+                    "SALES_HISTORY_GOOGLE_SHEET_TAB／"
+                    "RECEIVING_GOOGLE_SHEET_TAB 自訂，預設分別是"
+                    "「BOM表」「訂單資訊」「銷售歷史」「進貨明細」。"
                 ).classes("text-xs text-zinc-500 mt-2")
 
               # ---------------- 6.3：參數設定 ----------------
