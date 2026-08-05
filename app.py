@@ -12,7 +12,6 @@ from datetime import datetime, timedelta
 from nicegui import app, ui
 import pandas as pd
 import requests
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
 
@@ -138,33 +137,53 @@ if not BASIC_AUTH_USERNAME or not BASIC_AUTH_PASSWORD:
   )
 
 
-class BasicAuthMiddleware(BaseHTTPMiddleware):
-  """檢查每一個請求的 Authorization header，帳密不符就回401要求重新輸入。"""
+class BasicAuthMiddleware:
+  """檢查每一個一般網頁請求的 Authorization header，帳密不符就回401要求重新輸入。
 
-  async def dispatch(self, request, call_next):
-    if not BASIC_AUTH_USERNAME or not BASIC_AUTH_PASSWORD:
-      return await call_next(request)  # 沒設定帳密就不擋
+  刻意寫成最底層的 ASGI middleware（而不是 Starlette 的
+  BaseHTTPMiddleware），是因為 BaseHTTPMiddleware 會把每個請求包裝成
+  request/response 物件再轉發，這個包裝過程跟 NiceGUI 用來即時更新畫面
+  的 WebSocket 連線不相容，實測會直接讓連線壞掉、整頁噴 500，而不是照
+  我們要的邏輯回401。這裡改成只在 scope["type"] == "http"（一般網頁請求）
+  時才檢查帳密，WebSocket 跟其他類型的連線完全不經過這段邏輯、直接放行
+  給 NiceGUI 自己處理。
+  """
 
-    auth_header = request.headers.get("Authorization", "")
+  def __init__(self, asgi_app):
+    self.asgi_app = asgi_app
+
+  async def __call__(self, scope, receive, send):
+    if scope["type"] != "http" or not BASIC_AUTH_USERNAME or not BASIC_AUTH_PASSWORD:
+      await self.asgi_app(scope, receive, send)
+      return
+
+    headers = dict(scope.get("headers") or [])
+    auth_header = headers.get(b"authorization", b"").decode("latin-1")
+
+    authorized = False
     if auth_header.startswith("Basic "):
       try:
         decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
         username, _, password = decoded.partition(":")
+        # 用 secrets.compare_digest 而不是 == ，避免帳密比對時間差被用來
+        # 猜測密碼內容（timing attack），這裡資安等級不需要到這麼高，但
+        # 反正代價很低，順手做好。
+        authorized = secrets.compare_digest(
+            username, BASIC_AUTH_USERNAME
+        ) and secrets.compare_digest(password, BASIC_AUTH_PASSWORD)
       except Exception:
-        username, password = "", ""
-      # 用 secrets.compare_digest 而不是 == ，避免帳密比對時間差被用來
-      # 猜測密碼內容（timing attack），這裡資安等級不需要到這麼高，但
-      # 反正代價很低，順手做好。
-      username_ok = secrets.compare_digest(username, BASIC_AUTH_USERNAME)
-      password_ok = secrets.compare_digest(password, BASIC_AUTH_PASSWORD)
-      if username_ok and password_ok:
-        return await call_next(request)
+        authorized = False
 
-    return Response(
+    if authorized:
+      await self.asgi_app(scope, receive, send)
+      return
+
+    response = Response(
         content="請輸入帳號密碼才能瀏覽此系統",
         status_code=401,
         headers={"WWW-Authenticate": 'Basic realm="興聖集團內部系統"'},
     )
+    await response(scope, receive, send)
 
 
 app.add_middleware(BasicAuthMiddleware)
