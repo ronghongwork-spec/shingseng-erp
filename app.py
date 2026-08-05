@@ -4,6 +4,7 @@ import io
 import json
 import math
 import os
+import secrets
 import sys
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -11,6 +12,8 @@ from datetime import datetime, timedelta
 from nicegui import app, ui
 import pandas as pd
 import requests
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response
 
 
 def safe_text(value, default=""):
@@ -111,6 +114,60 @@ REQUEST_TIMEOUT = 15   # 秒，避免 A1 主機無回應時整頁卡死
 STOCK_PAGE_SIZE = 100  # 手冊：StockBatch 每頁固定 100 筆（依 品號+倉庫 計算）
 MAX_STOCK_PAGES = 1000  # 分頁安全上限，避免 More 一直為 true 造成無窮迴圈
 ITEM_DETAIL_WORKERS = 8  # 平行抓取商品明細的執行緒數
+
+# -------------------------------------------------------------------------
+# 1.5. 內部員工登入保護（HTTP Basic Auth）
+#    整個網站（含所有頁籤、API、靜態檔案）都會被擋住，瀏覽器打開時會跳出
+#    原生的「輸入帳號密碼」對話框，帳密正確才放行。適合「全公司共用一組
+#    帳密」這種內部系統，不需要個別員工帳號。
+#
+#    部署到 Render 時請在後台「Environment」設定這兩個環境變數：
+#      BASIC_AUTH_USERNAME=你要用的帳號
+#      BASIC_AUTH_PASSWORD=你要用的密碼
+#    兩個都設定了才會啟用保護；只要有一個沒設，網站會維持開放不擋（本機
+#    開發測試時通常不會設這兩個變數，才不會每次都要輸入密碼）。
+# -------------------------------------------------------------------------
+BASIC_AUTH_USERNAME = os.environ.get("BASIC_AUTH_USERNAME", "")
+BASIC_AUTH_PASSWORD = os.environ.get("BASIC_AUTH_PASSWORD", "")
+
+if not BASIC_AUTH_USERNAME or not BASIC_AUTH_PASSWORD:
+  print(
+      "警告：尚未設定環境變數 BASIC_AUTH_USERNAME / BASIC_AUTH_PASSWORD，"
+      "網站目前沒有密碼保護，任何人有網址都能看到。",
+      file=sys.stderr,
+  )
+
+
+class BasicAuthMiddleware(BaseHTTPMiddleware):
+  """檢查每一個請求的 Authorization header，帳密不符就回401要求重新輸入。"""
+
+  async def dispatch(self, request, call_next):
+    if not BASIC_AUTH_USERNAME or not BASIC_AUTH_PASSWORD:
+      return await call_next(request)  # 沒設定帳密就不擋
+
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Basic "):
+      try:
+        decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
+        username, _, password = decoded.partition(":")
+      except Exception:
+        username, password = "", ""
+      # 用 secrets.compare_digest 而不是 == ，避免帳密比對時間差被用來
+      # 猜測密碼內容（timing attack），這裡資安等級不需要到這麼高，但
+      # 反正代價很低，順手做好。
+      username_ok = secrets.compare_digest(username, BASIC_AUTH_USERNAME)
+      password_ok = secrets.compare_digest(password, BASIC_AUTH_PASSWORD)
+      if username_ok and password_ok:
+        return await call_next(request)
+
+    return Response(
+        content="請輸入帳號密碼才能瀏覽此系統",
+        status_code=401,
+        headers={"WWW-Authenticate": 'Basic realm="興聖集團內部系統"'},
+    )
+
+
+app.add_middleware(BasicAuthMiddleware)
 
 # 鼎新 A1 目前的 POS API（手冊 1.0.35）沒有提供「組合品-組成明細」的查詢
 # 端點，只能改用人工維護的 Excel 來補齊「主件/子件品號＋用量」關係，
@@ -1247,7 +1304,7 @@ def compute_order_demand_alerts(orders, items_map, bom_map, stock_lookup, settin
     1. 未來 horizon_days 天內要出貨、但成品庫存不夠的品項
     2. 因此連帶需要補的原料/子件缺口，以及建議下單日
        （建議下單日 = 最早相關出貨日 － 採購前置天數 － 生產工時）
-  這支函式同時餵給「1. 儀表板」「3. 訂單與出貨管理」「4. 生產與包裝排程」，
+  這支函式同時餵給「儀表板」「訂單出貨」「生產排程」，
   確保三個頁面看到的是同一套邏輯算出來的數字，不會互相矛盾。
 
   簡化假設（先講清楚，之後有更多資料再精進）：
@@ -1973,12 +2030,12 @@ def inventory_dashboard():
           )
 
         with ui.tabs().classes("w-full") as page_tabs:
-          tab_dashboard = ui.tab("1. 儀表板與即時預警")
-          tab_products_group = ui.tab("2. 商品與組合管理")
-          tab_orders = ui.tab("3. 訂單與出貨管理")
-          tab_production = ui.tab("4. 生產與包裝排程")
-          tab_procurement = ui.tab("5. 採購分析與決策支援")
-          tab_settings = ui.tab("6. 系統設定與同步管理")
+          tab_dashboard = ui.tab("儀表板")
+          tab_products_group = ui.tab("商品資訊")
+          tab_orders = ui.tab("訂單出貨")
+          tab_production = ui.tab("生產排程")
+          tab_procurement = ui.tab("採購分析")
+          tab_settings = ui.tab("系統設定")
 
         with ui.tab_panels(page_tabs, value=tab_dashboard).classes(
             "w-full bg-transparent"
@@ -2295,7 +2352,7 @@ def inventory_dashboard():
                   if not orders_configured:
                     ui.label(
                         "尚未設定 Google Sheets「訂單資訊」分頁，暫時無法"
-                        "顯示出貨與補貨提醒，設定方式見「6. 系統設定」。"
+                        "顯示出貨與補貨提醒，設定方式見「系統設定」。"
                     ).classes("text-xs text-zinc-400")
                   else:
                     announcements = compute_dashboard_announcements(
@@ -2333,10 +2390,10 @@ def inventory_dashboard():
           # ==================================================
           with ui.tab_panel(tab_products_group):
             with ui.tabs().classes("w-full mb-2") as sub_tabs:
-              tab_products = ui.tab("2.1 商品資料")
-              tab_inventory = ui.tab("2.3 庫存即時查詢")
-              tab_bom = ui.tab("2.2 商品組合資訊（BOM）")
-              tab_lotno = ui.tab("2.3 批號／效期追蹤")
+              tab_products = ui.tab("商品資料")
+              tab_inventory = ui.tab("庫存查詢")
+              tab_bom = ui.tab("商品組合(BOM)")
+              tab_lotno = ui.tab("批號效期")
 
             with ui.tab_panels(sub_tabs, value=tab_products).classes(
                 "w-full bg-transparent"
@@ -3085,7 +3142,7 @@ def inventory_dashboard():
                   orders_stats_label.text = ""
                   with orders_table_container:
                     ui.label(
-                        "尚未設定 Google Sheets，請見「6. 系統設定」的設定"
+                        "尚未設定 Google Sheets，請見「系統設定」的設定"
                         "說明。"
                     ).classes("text-xs text-zinc-400")
                   return
@@ -3173,10 +3230,10 @@ def inventory_dashboard():
                   "w-full p-3 mb-4 bg-[#e8f6f5] border border-[#bfe6e3]"
               ):
                 ui.label(
-                    "依「訂單資訊」的預計出貨日排序，並用「商品組合資訊"
+                    "依「訂單資訊」的預計出貨日排序，並用「商品組合"
                     "(BOM)」展開子件用量，跟目前庫存比對——原料/半成品不夠"
-                    "的品項會標示出來，方便提前備料。同一套邏輯跟「1. 儀表板"
-                    "」「3. 訂單與出貨管理」共用，數字會一致。"
+                    "的品項會標示出來，方便提前備料。同一套邏輯跟「儀表板"
+                    "」「訂單出貨」共用，數字會一致。"
                 ).classes("text-xs text-teal-800")
 
               packing_reminder_container = ui.column().classes("w-full gap-2 mb-4")
@@ -3202,7 +3259,7 @@ def inventory_dashboard():
                   packing_stats_label.text = ""
                   with packing_schedule_container:
                     ui.label(
-                        "尚未設定 Google Sheets，請見「6. 系統設定」的設定"
+                        "尚未設定 Google Sheets，請見「系統設定」的設定"
                         "說明。"
                     ).classes("text-xs text-zinc-400")
                   return
@@ -3305,9 +3362,9 @@ def inventory_dashboard():
                 "w-full p-3 mb-4 bg-[#fff8e6] border border-[#f0dca0]"
             ):
               ui.label(
-                  "「5.1 簡化版建議採購量」只用「安全庫存 − 現有庫存」計算，"
+                  "「建議採購量」只用「安全庫存 − 現有庫存」計算，"
                   "沒有把訂單需求算進去；含訂單/BOM 展開的完整版本在"
-                  "「4. 生產與包裝排程」的「原物料備料需求」表，兩者算法"
+                  "「生產排程」的「原物料備料需求」表，兩者算法"
                   "不同、用途也不同（這裡是長期安全庫存基準，第4點是短期"
                   "訂單驅動的緊急採購）。「供應商歷史採購單價走勢」仍是"
                   "規劃中，需要額外記錄歷次採購單價，目前 A1/Sheets 都還"
@@ -3315,10 +3372,10 @@ def inventory_dashboard():
               ).classes("text-xs text-amber-800")
 
             with ui.tabs().classes("w-full mb-2") as sub_tabs_procurement:
-              tab_procurement_51 = ui.tab("5.1 簡化版建議採購量")
-              tab_procurement_53 = ui.tab("5.3 庫存週轉率／滯銷品分析")
-              tab_procurement_54 = ui.tab("5.4 進貨明細")
-              tab_procurement_55 = ui.tab("5.5 月產銷分析")
+              tab_procurement_51 = ui.tab("建議採購量")
+              tab_procurement_53 = ui.tab("庫存週轉")
+              tab_procurement_54 = ui.tab("進貨明細")
+              tab_procurement_55 = ui.tab("月產銷分析")
 
             with ui.tab_panels(
                 sub_tabs_procurement, value=tab_procurement_51
@@ -3330,7 +3387,7 @@ def inventory_dashboard():
                 ):
                   procurement_reminder_container = ui.column().classes("w-full gap-2 mb-4")
 
-                  ui.label("5.1 簡化版建議採購量（安全庫存基準）").classes(
+                  ui.label("建議採購量（安全庫存基準）").classes(
                       "text-sm font-bold text-zinc-700 mb-2"
                   )
 
@@ -3495,7 +3552,7 @@ def inventory_dashboard():
                     "w-full p-6 bg-white border border-[#e2e1dc] shadow-none"
                     " rounded-none"
                 ):
-                  ui.label("5.3 庫存週轉率／滯銷品分析").classes(
+                  ui.label("庫存週轉率／滯銷品分析").classes(
                       "text-sm font-bold text-zinc-700 mb-2"
                   )
                   with ui.row().classes(
@@ -3566,7 +3623,7 @@ def inventory_dashboard():
                       turnover_stats_label.text = ""
                       with turnover_table_container:
                         ui.label(
-                            "尚未設定 Google Sheets，請見「6. 系統設定」的設定"
+                            "尚未設定 Google Sheets，請見「系統設定」的設定"
                             "說明。"
                         ).classes("text-xs text-zinc-400")
                       return
@@ -3619,7 +3676,7 @@ def inventory_dashboard():
                     "w-full p-6 bg-white border border-[#e2e1dc] shadow-none"
                     " rounded-none"
                 ):
-                  ui.label("5.4 進貨明細").classes(
+                  ui.label("進貨明細").classes(
                       "text-sm font-bold text-zinc-700 mb-2"
                   )
                   with ui.row().classes(
@@ -3653,7 +3710,7 @@ def inventory_dashboard():
                       receiving_stats_label.text = ""
                       with receiving_table_container:
                         ui.label(
-                            "尚未設定 Google Sheets，請見「6. 系統設定」的設定"
+                            "尚未設定 Google Sheets，請見「系統設定」的設定"
                             "說明。"
                         ).classes("text-xs text-zinc-400")
                       return
@@ -3707,7 +3764,7 @@ def inventory_dashboard():
                     "w-full p-6 bg-white border border-[#e2e1dc] shadow-none"
                     " rounded-none"
                 ):
-                  ui.label("5.5 月產銷分析").classes(
+                  ui.label("月產銷分析").classes(
                       "text-lg font-bold text-zinc-900 tracking-wide mb-2"
                   )
                   with ui.row().classes(
