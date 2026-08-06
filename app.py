@@ -115,6 +115,68 @@ MAX_STOCK_PAGES = 1000  # 分頁安全上限，避免 More 一直為 true 造成
 ITEM_DETAIL_WORKERS = 8  # 平行抓取商品明細的執行緒數
 
 # -------------------------------------------------------------------------
+# 興聖(股)公司｜SHOPLINE 官網訂單
+# 文件：https://open-api.docs.shoplineapp.com/docs/search-orders
+# .env 需設定：
+#   SHOPLINE_XINGSHENG_ACCESS_TOKEN=（SHOPLINE後台管理員設定產生的token）
+#   SHOPLINE_XINGSHENG_USER_AGENT=（識別用字串，無嚴格規定，已實測 "Xingsheng-ERP" 可用）
+# -------------------------------------------------------------------------
+SHOPLINE_API_DOMAIN = "https://open.shopline.io"
+SHOPLINE_XINGSHENG_ACCESS_TOKEN = os.environ.get("SHOPLINE_XINGSHENG_ACCESS_TOKEN", "")
+SHOPLINE_XINGSHENG_USER_AGENT = os.environ.get("SHOPLINE_XINGSHENG_USER_AGENT", "")
+
+
+def fetch_shopline_pending_orders(access_token, user_agent):
+  """興聖SHOPLINE官網：抓全部「待處理」(status=pending)訂單，自動翻頁，
+  回傳簡化過、給表格顯示用的欄位（不是原始API的完整資料）。
+  回傳 (rows, error_message)；成功時 error_message 是 None。
+  """
+  if not access_token or not user_agent:
+    return None, "尚未設定 SHOPLINE_XINGSHENG_ACCESS_TOKEN / SHOPLINE_XINGSHENG_USER_AGENT"
+  try:
+    all_orders = []
+    page = 1
+    while True:
+      resp = requests.get(
+          f"{SHOPLINE_API_DOMAIN}/v1/orders/search",
+          params={"status": "pending", "per_page": 50, "page": page},
+          headers={
+              "accept": "application/json",
+              "authorization": f"Bearer {access_token}",
+              "User-Agent": user_agent,
+          },
+          timeout=REQUEST_TIMEOUT,
+      )
+      resp.raise_for_status()
+      body = resp.json()
+      all_orders.extend(body.get("items", []) or [])
+      pagination = body.get("pagination", {}) or {}
+      total_pages = pagination.get("total_pages", 1) or 1
+      if page >= total_pages:
+        break
+      page += 1
+
+    rows = []
+    for o in all_orders:
+      created_raw = o.get("created_at", "") or ""
+      try:
+        dt_utc = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+        created_display = (dt_utc + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M")
+      except (ValueError, TypeError):
+        created_display = created_raw
+      delivery = o.get("order_delivery") or {}
+      rows.append({
+          "訂單編號": o.get("order_number") or o.get("id"),
+          "客戶": o.get("customer_name") or "",
+          "金額": (o.get("total") or {}).get("label") or "",
+          "建立時間": created_display,
+          "物流狀態": delivery.get("delivery_status") or "",
+      })
+    return rows, None
+  except Exception as e:
+    return None, str(e)
+
+# -------------------------------------------------------------------------
 # 1.5. 內部員工登入保護（HTTP Basic Auth）
 #    整個網站（含所有頁籤、API、靜態檔案）都會被擋住，瀏覽器打開時會跳出
 #    原生的「輸入帳號密碼」對話框，帳密正確才放行。適合「全公司共用一組
@@ -2017,6 +2079,39 @@ def inventory_dashboard():
       ui.label(title).classes("text-sm font-bold text-zinc-700 mb-2")
       ui.label(hint).classes("text-xs text-zinc-500")
 
+  def render_shopline_pending_orders():
+    """興聖(股)公司／訂單出貨／SHOPLINE官網：抓待處理訂單畫成表格。
+    每次切換到這個分頁都會重新打一次API（目前沒有做快取／同步按鈕，
+    先求資料正確；之後如果需要跟海濤客頁面一樣的「手動刷新」機制，
+    再仿照 handle_sync 的寫法加上去）。
+    """
+    rows, error = fetch_shopline_pending_orders(
+        SHOPLINE_XINGSHENG_ACCESS_TOKEN, SHOPLINE_XINGSHENG_USER_AGENT
+    )
+    if error:
+      render_section_placeholder("訂單出貨－SHOPLINE官網", f"抓取失敗：{error}")
+      return
+    if not rows:
+      render_section_placeholder("訂單出貨－SHOPLINE官網", "目前沒有待處理訂單")
+      return
+    with ui.card().classes(
+        "w-full p-6 bg-white border border-[#e2e1dc] shadow-none rounded-none"
+    ):
+      ui.label(f"待處理訂單（共 {len(rows)} 筆）").classes(
+          "text-sm font-bold text-zinc-700 mb-3"
+      )
+      ui.table(
+          columns=[
+              {"name": "訂單編號", "label": "訂單編號", "field": "訂單編號", "align": "left"},
+              {"name": "客戶", "label": "客戶", "field": "客戶", "align": "left"},
+              {"name": "金額", "label": "金額", "field": "金額", "align": "right"},
+              {"name": "建立時間", "label": "建立時間（台灣時間）", "field": "建立時間", "align": "left"},
+              {"name": "物流狀態", "label": "物流狀態", "field": "物流狀態", "align": "left"},
+          ],
+          rows=rows,
+          row_key="訂單編號",
+      ).classes("w-full")
+
   # 訂單出貨底下的4個通路子分頁，之後每個通路會各自串不同的訂單來源
   # API（SHOPLINE官網／蝦皮／經銷／其它），目前先放佔位畫面
   ORDER_CHANNELS = ["SHOPLINE官網", "蝦皮", "經銷", "其它"]
@@ -2075,10 +2170,13 @@ def inventory_dashboard():
             ).classes("w-full bg-transparent"):
               for ch, ch_tab in zip(ORDER_CHANNELS, channel_tab_objs):
                 with ui.tab_panel(ch_tab):
-                  render_section_placeholder(
-                      f"訂單出貨－{ch}",
-                      f"「{ch}」通路的訂單 API 尚未串接，敬請期待",
-                  )
+                  if company_name == "興聖(股)公司" and ch == "SHOPLINE官網":
+                    render_shopline_pending_orders()
+                  else:
+                    render_section_placeholder(
+                        f"訂單出貨－{ch}",
+                        f"「{ch}」通路的訂單 API 尚未串接，敬請期待",
+                    )
 
           with ui.tab_panel(tab_ch_daily_shipping):
             render_section_placeholder("每日出貨")
