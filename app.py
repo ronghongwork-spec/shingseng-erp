@@ -127,12 +127,16 @@ SHOPLINE_XINGSHENG_USER_AGENT = os.environ.get("SHOPLINE_XINGSHENG_USER_AGENT", 
 
 
 def fetch_shopline_pending_orders(access_token, user_agent):
-  """興聖SHOPLINE官網：抓全部「待處理」(status=pending)訂單，自動翻頁，
-  回傳簡化過、給表格顯示用的欄位（不是原始API的完整資料）。
-  回傳 (rows, error_message)；成功時 error_message 是 None。
+  """興聖SHOPLINE官網（海濤客品牌）：抓全部「待處理」(status=pending)訂單，
+  自動翻頁，同時整理成兩份資料：
+    1. order_rows：訂單清單（給參考用，一張訂單一列）
+    2. item_rows：商品需求彙總（把所有待處理訂單裡的商品明細依SKU加總
+       起來，算出「這個商品接下來總共要出貨幾件」，這份才是拿去跟海濤客
+       食品工廠請備貨/採購用的清單）
+  回傳 (order_rows, item_rows, error_message)；成功時 error_message 是 None。
   """
   if not access_token or not user_agent:
-    return None, "尚未設定 SHOPLINE_XINGSHENG_ACCESS_TOKEN / SHOPLINE_XINGSHENG_USER_AGENT"
+    return None, None, "尚未設定 SHOPLINE_XINGSHENG_ACCESS_TOKEN / SHOPLINE_XINGSHENG_USER_AGENT"
   try:
     all_orders = []
     page = 1
@@ -156,7 +160,8 @@ def fetch_shopline_pending_orders(access_token, user_agent):
         break
       page += 1
 
-    rows = []
+    order_rows = []
+    item_agg = {}  # sku -> {"商品": 品名, "SKU": sku, "需求數量": 累加quantity, "_orders": set(訂單編號)}
     for o in all_orders:
       created_raw = o.get("created_at", "") or ""
       try:
@@ -165,16 +170,42 @@ def fetch_shopline_pending_orders(access_token, user_agent):
       except (ValueError, TypeError):
         created_display = created_raw
       delivery = o.get("order_delivery") or {}
-      rows.append({
-          "訂單編號": o.get("order_number") or o.get("id"),
+      order_no = o.get("order_number") or o.get("id")
+      order_rows.append({
+          "訂單編號": order_no,
           "客戶": o.get("customer_name") or "",
           "金額": (o.get("total") or {}).get("label") or "",
           "建立時間": created_display,
           "物流狀態": delivery.get("delivery_status") or "",
       })
-    return rows, None
+
+      for item in (o.get("subtotal_items") or []):
+        sku = item.get("sku") or item.get("item_id") or "(無SKU)"
+        title = item.get("title_translations") or {}
+        name = title.get("zh-hant") or title.get("en") or sku
+        qty = item.get("quantity") or 0
+        entry = item_agg.setdefault(
+            sku, {"商品": name, "SKU": sku, "需求數量": 0, "_orders": set()}
+        )
+        entry["需求數量"] += qty
+        entry["_orders"].add(order_no)
+
+    item_rows = [
+        {
+            "SKU": e["SKU"],
+            "商品": e["商品"],
+            "需求數量": e["需求數量"],
+            "訂單數": len(e["_orders"]),
+        }
+        for e in item_agg.values()
+    ]
+    item_rows.sort(key=lambda r: r["需求數量"], reverse=True)
+
+    return order_rows, item_rows, None
   except Exception as e:
-    return None, str(e)
+    return None, None, str(e)
+
+
 
 # -------------------------------------------------------------------------
 # 1.5. 內部員工登入保護（HTTP Basic Auth）
@@ -2080,24 +2111,51 @@ def inventory_dashboard():
       ui.label(hint).classes("text-xs text-zinc-500")
 
   def render_shopline_pending_orders():
-    """興聖(股)公司／訂單出貨／SHOPLINE官網：抓待處理訂單畫成表格。
+    """興聖(股)公司／訂單出貨／SHOPLINE官網（海濤客品牌）：抓待處理訂單。
+    畫面分兩塊：
+      1. 商品需求彙總：依SKU加總所有待處理訂單裡的商品數量，用來跟
+         海濤客食品工廠請備貨/採購——這是主要用途
+      2. 訂單清單：一張訂單一列，當作參考明細
     每次切換到這個分頁都會重新打一次API（目前沒有做快取／同步按鈕，
     先求資料正確；之後如果需要跟海濤客頁面一樣的「手動刷新」機制，
     再仿照 handle_sync 的寫法加上去）。
     """
-    rows, error = fetch_shopline_pending_orders(
+    order_rows, item_rows, error = fetch_shopline_pending_orders(
         SHOPLINE_XINGSHENG_ACCESS_TOKEN, SHOPLINE_XINGSHENG_USER_AGENT
     )
     if error:
       render_section_placeholder("訂單出貨－SHOPLINE官網", f"抓取失敗：{error}")
       return
-    if not rows:
+    if not order_rows:
       render_section_placeholder("訂單出貨－SHOPLINE官網", "目前沒有待處理訂單")
       return
+
+    ui.label("SHOPLINE官網（海濤客品牌）").classes(
+        "text-xs text-zinc-500 mb-3"
+    )
+
+    with ui.card().classes(
+        "w-full p-6 bg-white border border-[#e2e1dc] shadow-none rounded-none mb-4"
+    ):
+      ui.label(
+          f"未出貨商品需求彙總（共 {len(item_rows)} 個品項，供向海濤客食品工廠"
+          "請備貨/採購用）"
+      ).classes("text-sm font-bold text-zinc-700 mb-3")
+      ui.table(
+          columns=[
+              {"name": "SKU", "label": "SKU", "field": "SKU", "align": "left"},
+              {"name": "商品", "label": "商品", "field": "商品", "align": "left"},
+              {"name": "需求數量", "label": "需求數量", "field": "需求數量", "align": "right"},
+              {"name": "訂單數", "label": "訂單數", "field": "訂單數", "align": "right"},
+          ],
+          rows=item_rows,
+          row_key="SKU",
+      ).classes("w-full")
+
     with ui.card().classes(
         "w-full p-6 bg-white border border-[#e2e1dc] shadow-none rounded-none"
     ):
-      ui.label(f"待處理訂單（共 {len(rows)} 筆）").classes(
+      ui.label(f"待處理訂單清單（共 {len(order_rows)} 筆，參考用）").classes(
           "text-sm font-bold text-zinc-700 mb-3"
       )
       ui.table(
@@ -2108,13 +2166,17 @@ def inventory_dashboard():
               {"name": "建立時間", "label": "建立時間（台灣時間）", "field": "建立時間", "align": "left"},
               {"name": "物流狀態", "label": "物流狀態", "field": "物流狀態", "align": "left"},
           ],
-          rows=rows,
+          rows=order_rows,
           row_key="訂單編號",
       ).classes("w-full")
 
-  # 訂單出貨底下的4個通路子分頁，之後每個通路會各自串不同的訂單來源
-  # API（SHOPLINE官網／蝦皮／經銷／其它），目前先放佔位畫面
-  ORDER_CHANNELS = ["SHOPLINE官網", "蝦皮", "經銷", "其它"]
+  # 訂單出貨底下的通路子分頁，之後每個通路會各自串不同的訂單來源API。
+  # 各分公司實際通路不完全一樣（例如興聖沒有蝦皮），用字典各自設定；
+  # 沒特別列出的公司預設用完整4通路。
+  ORDER_CHANNELS_BY_COMPANY = {
+      "興聖(股)公司": ["SHOPLINE官網", "經銷", "其它"],  # 興聖沒有蝦皮通路
+  }
+  DEFAULT_ORDER_CHANNELS = ["SHOPLINE官網", "蝦皮", "經銷", "其它"]
 
   # 公司名稱轉成安全的英文代碼，用來組CSS class名稱（中文當class名稱在
   # 部分瀏覽器/選擇器語法下容易出錯，改用英文代碼比較保險）
@@ -2163,12 +2225,15 @@ def inventory_dashboard():
             )
 
           with ui.tab_panel(tab_ch_orders):
+            order_channels = ORDER_CHANNELS_BY_COMPANY.get(
+                company_name, DEFAULT_ORDER_CHANNELS
+            )
             with ui.tabs().props("dense no-caps").classes("w-full") as channel_tabs:
-              channel_tab_objs = [ui.tab(ch) for ch in ORDER_CHANNELS]
+              channel_tab_objs = [ui.tab(ch) for ch in order_channels]
             with ui.tab_panels(
                 channel_tabs, value=channel_tab_objs[0]
             ).classes("w-full bg-transparent"):
-              for ch, ch_tab in zip(ORDER_CHANNELS, channel_tab_objs):
+              for ch, ch_tab in zip(order_channels, channel_tab_objs):
                 with ui.tab_panel(ch_tab):
                   if company_name == "興聖(股)公司" and ch == "SHOPLINE官網":
                     render_shopline_pending_orders()
