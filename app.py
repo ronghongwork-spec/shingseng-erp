@@ -181,7 +181,7 @@ class BasicAuthMiddleware:
     response = Response(
         content="請輸入帳號密碼才能瀏覽此系統",
         status_code=401,
-        headers={"WWW-Authenticate": 'Basic realm="興聖集團內部系統"'},
+        headers={"WWW-Authenticate": 'Basic realm="Internal System"'},
     )
     await response(scope, receive, send)
 
