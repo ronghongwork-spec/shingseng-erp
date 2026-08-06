@@ -2604,8 +2604,8 @@ def inventory_dashboard():
       2. 商品需求彙總表：依目前篩選條件即時算出的SKU加總結果，商品名稱
          欄位可排序，右下角可切換每頁顯示筆數(10/30/50/全部)，不用一直
          往下滑。所有篩選都是在「已經抓好的資料」裡做，不會重打API。
-    每次「切換到這個分頁」都會重新打一次API抓最新資料；分頁內也有「🔄
-    重新整理」按鈕，不用離開分頁再切回來也能手動重抓一次。
+    每次「切換到這個分頁」都會重新打一次API抓最新資料；分頁內也有「重新
+    整理」按鈕，不用離開分頁再切回來也能手動重抓一次。
     """
     def fetch_data():
       created_after = (
@@ -2655,7 +2655,7 @@ def inventory_dashboard():
           refresh_results()
           ui.notify("已重新整理", color="positive")
 
-        ui.button("🔄 重新整理", on_click=handle_refresh).props(
+        ui.button("重新整理", icon="refresh", on_click=handle_refresh).props(
             "dense no-caps unelevated"
         ).classes("px-3 py-1 rounded-lg text-xs").style(
             "background:#ffffff !important; color:#4b5563 !important;"
@@ -3001,7 +3001,7 @@ def inventory_dashboard():
           else:
             ui.notify("已重新整理", color="positive")
 
-        ui.button("🔄 重新整理", on_click=handle_refresh).props(
+        ui.button("重新整理", icon="refresh", on_click=handle_refresh).props(
             "dense no-caps unelevated"
         ).classes("px-3 py-1 rounded-lg text-xs").style(
             "background:#ffffff !important; color:#4b5563 !important;"
@@ -3681,18 +3681,20 @@ def inventory_dashboard():
                         horizon_days=30,
                     )
                     category_labels = [
-                        ("shipping", "🚚 訂單出貨提醒", "#2563eb"),
-                        ("production", "🏭 生產組裝確認", "#9333ea"),
-                        ("finished_goods", "🧾 建議採購成品（母件）", "#db2777"),
+                        ("shipping", "local_shipping", "訂單出貨提醒", "#2563eb"),
+                        ("production", "factory", "生產組裝確認", "#9333ea"),
+                        ("finished_goods", "receipt_long", "建議採購成品（母件）", "#db2777"),
                     ]
                     any_announcement = False
-                    for key, label, accent_color in category_labels:
+                    for key, icon_name, label, accent_color in category_labels:
                       items = announcements.get(key, [])[:6]
                       if not items:
                         continue
-                      ui.label(label).classes(
-                          "text-xs font-bold text-zinc-600 mt-1"
-                      )
+                      with ui.row().classes("items-center gap-1 mt-1"):
+                        ui.icon(icon_name, size="16px").classes("text-zinc-500")
+                        ui.label(label).classes(
+                            "text-xs font-bold text-zinc-600"
+                        )
                       for item in items:
                         _severity_box(item["severity"], item["text"], accent_color)
                       any_announcement = True
@@ -3909,7 +3911,7 @@ def inventory_dashboard():
                       "w-full p-3 mb-4 bg-[#fff8e6] border border-[#f0dca0]"
                   ):
                     ui.label(
-                        "⚠ 鼎新 A1 目前的 API／後台匯出都只有組合品「主件」，"
+                        "鼎新 A1 目前的 API／後台匯出都只有組合品「主件」，"
                         "沒有「子件＋用量＋損耗率＋前置天數」明細，這些資料"
                         "改由「商品組合明細」Google Sheet 維護（尚未設定"
                         "Google Sheets 時，暫時退回本機 Excel 上傳作為過渡）。"
@@ -4103,7 +4105,7 @@ def inventory_dashboard():
                             " border-[#f5c2c0]"
                         ):
                           ui.label(
-                              f"⚠ 商品組合明細中有 {len(orphan_ids)} 個主件品號，在"
+                              f"商品組合明細中有 {len(orphan_ids)} 個主件品號，在"
                               f"目前 A1 商品主檔中查無此品號（可能是品號填錯，"
                               f"或該商品已停售）：{shown}{more}"
                           ).classes("text-xs text-red-700")
@@ -4297,7 +4299,7 @@ def inventory_dashboard():
                     " font-bold"
                 )
                 ui.label(
-                    "⚠ 會實際寫入 A1，上傳前請先確認 Sheet 裡的客戶代號／"
+                    "會實際寫入 A1，上傳前請先確認 Sheet 裡的客戶代號／"
                     "金額都填對"
                 ).classes("text-xs text-amber-700")
 
@@ -4507,7 +4509,7 @@ def inventory_dashboard():
                           else "info"
                       )
                       status_text = (
-                          "⚠ 成品庫存不足，需先確認能否即時生產/組裝"
+                          "成品庫存不足，需先確認能否即時生產/組裝"
                           if has_shortage else "成品庫存足夠，可直接安排包裝"
                       )
                       _severity_box(
@@ -4602,7 +4604,7 @@ def inventory_dashboard():
                       "w-full p-2 mb-2 bg-[#e8f6f5] border border-[#bfe6e3]"
                   ):
                     ui.label(
-                        "⚠ 預設只顯示「現有庫存 ≤ 安全庫存」的品項。如果你"
+                        "預設只顯示「現有庫存 ≤ 安全庫存」的品項。如果你"
                         "覺得少了很多商品，多半是因為那些商品在 A1 商品主檔"
                         "裡沒有設定安全存量(SafetyStock)——沒設定就沒有基準"
                         "可以判斷要不要採購，這裡自動略過。切成「顯示全部"
@@ -5003,7 +5005,7 @@ def inventory_dashboard():
                       "text-xs text-zinc-500 mb-1"
                   )
                   ui.label(
-                      "⚠ 若去年的品號編碼跟今年不一樣，系統會完全比對不到"
+                      "若去年的品號編碼跟今年不一樣，系統會完全比對不到"
                       "「去年同期銷量」（一律顯示為 0）。這時可以填「去年"
                       "目標營業額」，系統會用「近3個月」的營收佔比當權重，"
                       "把這個數字依同樣比例分攤回各品項、換算回數量，當作"
@@ -5416,7 +5418,7 @@ def inventory_dashboard():
                     "text-lg font-bold text-zinc-900 tracking-wide mb-3"
                 )
                 ui.label(
-                    "⚠ 這裡的設定目前只存在記憶體中，服務重啟（含 Render "
+                    "這裡的設定目前只存在記憶體中，服務重啟（含 Render "
                     "重新部署或睡眠喚醒）就會回到預設值。之後若要長期保存，"
                     "建議也存進 Google Sheets 的一個「系統參數」分頁。"
                 ).classes("text-xs text-amber-700 mb-3")
