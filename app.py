@@ -2228,14 +2228,18 @@ def inventory_dashboard():
       2. 商品需求彙總表：依目前篩選條件即時算出的SKU加總結果，商品名稱
          欄位可排序，右下角可切換每頁顯示筆數(10/30/50/全部)，不用一直
          往下滑。所有篩選都是在「已經抓好的資料」裡做，不會重打API。
-    每次「切換到這個分頁」才會重新打一次API抓最新資料。
+    每次「切換到這個分頁」都會重新打一次API抓最新資料；分頁內也有「🔄
+    重新整理」按鈕，不用離開分頁再切回來也能手動重抓一次。
     """
-    created_after = (
-        datetime.utcnow() - timedelta(days=SHOPLINE_LOOKBACK_DAYS)
-    ).strftime("%Y-%m-%d %H:%M:%S")
-    orders, error = fetch_shopline_orders(
-        access_token, user_agent, SHOPLINE_ORDER_STATUSES, created_after,
-    )
+    def fetch_data():
+      created_after = (
+          datetime.utcnow() - timedelta(days=SHOPLINE_LOOKBACK_DAYS)
+      ).strftime("%Y-%m-%d %H:%M:%S")
+      return fetch_shopline_orders(
+          access_token, user_agent, SHOPLINE_ORDER_STATUSES, created_after,
+      )
+
+    orders, error = fetch_data()
     if error:
       render_section_placeholder(f"訂單出貨－{channel_title}", f"抓取失敗：{error}")
       return
@@ -2246,10 +2250,43 @@ def inventory_dashboard():
       return
 
     stats = compute_shopline_stats(orders)
+    last_updated = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
     state = {
         "status_filter": "all", "delivery_filter": "all", "keyword": "",
         "date_from": "", "date_to": "",
     }
+
+    # ---- 更新時間 + 手動重新整理按鈕 ----
+    refresh_row = ui.row().classes("w-full items-center gap-3 mb-2")
+
+    def render_refresh_row():
+      nonlocal last_updated
+      refresh_row.clear()
+      with refresh_row:
+        ui.label(f"資料更新時間：{last_updated}").classes("text-xs text-zinc-400")
+
+        def handle_refresh():
+          nonlocal orders, stats, last_updated
+          new_orders, err = fetch_data()
+          if err:
+            ui.notify(f"重新整理失敗：{err}", color="negative")
+            return
+          orders = new_orders or []
+          stats = compute_shopline_stats(orders)
+          last_updated = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+          render_refresh_row()
+          render_toolbar()
+          refresh_results()
+          ui.notify("已重新整理", color="positive")
+
+        ui.button("🔄 重新整理", on_click=handle_refresh).props(
+            "dense no-caps unelevated"
+        ).classes("px-3 py-1 rounded-none text-xs").style(
+            "background:#ffffff !important; color:#4b5563 !important;"
+            " border:1px solid #e2e1dc;"
+        )
+
+    render_refresh_row()
 
     # ---- 篩選工具列：放在最上方（在說明文字跟結果表格之前）----
     toolbar_container = ui.row().classes("w-full items-end gap-3 mb-1 flex-wrap")
