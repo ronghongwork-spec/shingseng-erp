@@ -126,24 +126,50 @@ SHOPLINE_XINGSHENG_ACCESS_TOKEN = os.environ.get("SHOPLINE_XINGSHENG_ACCESS_TOKE
 SHOPLINE_XINGSHENG_USER_AGENT = os.environ.get("SHOPLINE_XINGSHENG_USER_AGENT", "")
 
 
-def fetch_shopline_pending_orders(access_token, user_agent):
-  """興聖SHOPLINE官網（海濤客品牌）：抓全部「待處理」(status=pending)訂單，
-  自動翻頁，同時整理成兩份資料：
-    1. order_rows：訂單清單（給參考用，一張訂單一列）
-    2. item_rows：商品需求彙總（把所有待處理訂單裡的商品明細依SKU加總
-       起來，算出「這個商品接下來總共要出貨幾件」，這份才是拿去跟海濤客
-       食品工廠請備貨/採購用的清單）
-  回傳 (order_rows, item_rows, error_message)；成功時 error_message 是 None。
+SHOPLINE_STATUSES_FOR_XINGSHENG = ["pending", "confirmed"]  # 待處理+已確認
+SHOPLINE_LOOKBACK_DAYS = 90  # 訂單建立時間往前推3個月
+
+# 送貨方式關鍵字分類：先比對已知物流商關鍵字，再比對溫層關鍵字，
+# 兩者獨立判斷後組合（例如「黑貓常溫」= 黑貓 + 常溫），沒對到已知物流商
+# 關鍵字時，直接用原始送貨方式名稱當分組，避免資料被錯誤合併。
+SHOPLINE_DELIVERY_CARRIER_KEYWORDS = [
+    "黑貓", "全家", "7-11", "7-ELEVEN", "小七", "萊爾富", "OK超商", "郵局", "宅配通",
+]
+SHOPLINE_TEMP_KEYWORDS = [("常溫", "常溫"), ("冷藏", "冷藏"), ("低溫", "低溫"), ("冷凍", "冷凍")]
+
+
+def classify_shopline_delivery_method(label):
+  """依關鍵字判斷送貨方式分組。同一物流商不同溫層會分開（黑貓常溫／黑貓
+  低溫不會合併），沒對到已知物流商關鍵字時直接用原始標籤當分組名稱。
+  """
+  label = (label or "").strip()
+  if not label:
+    return "未標示"
+  carrier = next((kw for kw in SHOPLINE_DELIVERY_CARRIER_KEYWORDS if kw in label), None)
+  temp = next((disp for kw, disp in SHOPLINE_TEMP_KEYWORDS if kw in label), None)
+  base = carrier or label
+  return f"{base}{temp}" if temp else base
+
+
+def fetch_shopline_orders(access_token, user_agent, statuses, created_after):
+  """抓SHOPLINE官網訂單原始資料（不做聚合），依statuses(list)+
+  created_after（UTC時間字串"YYYY-MM-DD HH:MM:SS"）篩選，自動翻頁抓完。
+  回傳 (orders, error_message)。
   """
   if not access_token or not user_agent:
-    return None, None, "尚未設定 SHOPLINE_XINGSHENG_ACCESS_TOKEN / SHOPLINE_XINGSHENG_USER_AGENT"
+    return None, "尚未設定 SHOPLINE_XINGSHENG_ACCESS_TOKEN / SHOPLINE_XINGSHENG_USER_AGENT"
   try:
     all_orders = []
     page = 1
     while True:
       resp = requests.get(
           f"{SHOPLINE_API_DOMAIN}/v1/orders/search",
-          params={"status": "pending", "per_page": 50, "page": page},
+          params={
+              "statuses[]": statuses,
+              "created_after": created_after,
+              "per_page": 50,
+              "page": page,
+          },
           headers={
               "accept": "application/json",
               "authorization": f"Bearer {access_token}",
@@ -159,52 +185,78 @@ def fetch_shopline_pending_orders(access_token, user_agent):
       if page >= total_pages:
         break
       page += 1
-
-    order_rows = []
-    item_agg = {}  # sku -> {"商品": 品名, "SKU": sku, "需求數量": 累加quantity, "_orders": set(訂單編號)}
-    for o in all_orders:
-      created_raw = o.get("created_at", "") or ""
-      try:
-        dt_utc = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
-        created_display = (dt_utc + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M")
-      except (ValueError, TypeError):
-        created_display = created_raw
-      delivery = o.get("order_delivery") or {}
-      order_no = o.get("order_number") or o.get("id")
-      order_rows.append({
-          "訂單編號": order_no,
-          "客戶": o.get("customer_name") or "",
-          "金額": (o.get("total") or {}).get("label") or "",
-          "建立時間": created_display,
-          "物流狀態": delivery.get("delivery_status") or "",
-      })
-
-      for item in (o.get("subtotal_items") or []):
-        sku = item.get("sku") or item.get("item_id") or "(無SKU)"
-        title = item.get("title_translations") or {}
-        name = title.get("zh-hant") or title.get("en") or sku
-        qty = item.get("quantity") or 0
-        entry = item_agg.setdefault(
-            sku, {"商品": name, "SKU": sku, "需求數量": 0, "_orders": set()}
-        )
-        entry["需求數量"] += qty
-        entry["_orders"].add(order_no)
-
-    item_rows = [
-        {
-            "SKU": e["SKU"],
-            "商品": e["商品"],
-            "需求數量": e["需求數量"],
-            "訂單數": len(e["_orders"]),
-        }
-        for e in item_agg.values()
-    ]
-    item_rows.sort(key=lambda r: r["需求數量"], reverse=True)
-
-    return order_rows, item_rows, None
+    return all_orders, None
   except Exception as e:
-    return None, None, str(e)
+    return None, str(e)
 
+
+def aggregate_shopline_orders(orders, status_filter="all"):
+  """把 fetch_shopline_orders() 抓回來的原始訂單清單整理成：
+    - counts：{"pending": n, "confirmed": n}（永遠是全部訂單的統計，不受
+      status_filter影響，用來顯示總筆數）
+    - sku_rows：商品需求彙總（依SKU加總數量，只看status_filter篩選後的
+      訂單，這是給海濤客食品工廠請備貨/採購用的主要清單）
+    - delivery_rows：送貨方式 x 商品 需求彙總（同樣只看status_filter篩選
+      後的訂單，多一層送貨方式分組，方便依配送溫層/物流商分開備貨）
+  status_filter: "all" / "pending" / "confirmed"
+  """
+  counts = {"pending": 0, "confirmed": 0}
+  for o in orders:
+    st = o.get("status")
+    if st in counts:
+      counts[st] += 1
+
+  if status_filter in ("pending", "confirmed"):
+    filtered = [o for o in orders if o.get("status") == status_filter]
+  else:
+    filtered = orders
+
+  sku_agg = {}
+  delivery_agg = {}
+  for o in filtered:
+    order_no = o.get("order_number") or o.get("id")
+    delivery_label = (
+        (o.get("order_delivery") or {}).get("name_translations") or {}
+    ).get("zh-hant", "")
+    delivery_group = classify_shopline_delivery_method(delivery_label)
+
+    for item in (o.get("subtotal_items") or []):
+      sku = item.get("sku") or item.get("item_id") or "(無SKU)"
+      title = item.get("title_translations") or {}
+      name = title.get("zh-hant") or title.get("en") or sku
+      qty = item.get("quantity") or 0
+
+      entry = sku_agg.setdefault(
+          sku, {"商品": name, "SKU": sku, "需求數量": 0, "_orders": set()}
+      )
+      entry["需求數量"] += qty
+      entry["_orders"].add(order_no)
+
+      d_key = (delivery_group, sku)
+      d_entry = delivery_agg.setdefault(d_key, {
+          "送貨方式": delivery_group, "商品": name, "SKU": sku,
+          "需求數量": 0, "_orders": set(),
+      })
+      d_entry["需求數量"] += qty
+      d_entry["_orders"].add(order_no)
+
+  sku_rows = [
+      {"SKU": e["SKU"], "商品": e["商品"], "需求數量": e["需求數量"], "訂單數": len(e["_orders"])}
+      for e in sku_agg.values()
+  ]
+  sku_rows.sort(key=lambda r: r["需求數量"], reverse=True)
+
+  delivery_rows = [
+      {
+          "_row_key": f"{e['送貨方式']}__{e['SKU']}",
+          "送貨方式": e["送貨方式"], "SKU": e["SKU"], "商品": e["商品"],
+          "需求數量": e["需求數量"], "訂單數": len(e["_orders"]),
+      }
+      for e in delivery_agg.values()
+  ]
+  delivery_rows.sort(key=lambda r: (r["送貨方式"], -r["需求數量"]))
+
+  return counts, sku_rows, delivery_rows
 
 
 # -------------------------------------------------------------------------
@@ -2111,64 +2163,116 @@ def inventory_dashboard():
       ui.label(hint).classes("text-xs text-zinc-500")
 
   def render_shopline_pending_orders():
-    """興聖(股)公司／訂單出貨／SHOPLINE官網（海濤客品牌）：抓待處理訂單。
-    畫面分兩塊：
-      1. 商品需求彙總：依SKU加總所有待處理訂單裡的商品數量，用來跟
-         海濤客食品工廠請備貨/採購——這是主要用途
-      2. 訂單清單：一張訂單一列，當作參考明細
-    每次切換到這個分頁都會重新打一次API（目前沒有做快取／同步按鈕，
-    先求資料正確；之後如果需要跟海濤客頁面一樣的「手動刷新」機制，
-    再仿照 handle_sync 的寫法加上去）。
+    """興聖(股)公司／訂單出貨／SHOPLINE官網（海濤客品牌）：
+    抓近3個月「待處理」+「已確認」訂單，畫面分三塊：
+      1. 總筆數：待處理/已確認各多少筆（不受下面的篩選按鈕影響）
+      2. 篩選按鈕（全部／待處理／已確認）：切換下面兩張彙總表要看哪個
+         狀態的資料，只在已經抓好的資料裡篩選，不會重打API
+      3. 商品需求彙總 + 送貨方式x商品彙總：都是彙總後的數字，不顯示
+         每張訂單的明細（不需要看到單張訂單內容）
+    每次「切換到這個分頁」才會重新打一次API抓最新資料。
     """
-    order_rows, item_rows, error = fetch_shopline_pending_orders(
-        SHOPLINE_XINGSHENG_ACCESS_TOKEN, SHOPLINE_XINGSHENG_USER_AGENT
+    created_after = (
+        datetime.utcnow() - timedelta(days=SHOPLINE_LOOKBACK_DAYS)
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    orders, error = fetch_shopline_orders(
+        SHOPLINE_XINGSHENG_ACCESS_TOKEN, SHOPLINE_XINGSHENG_USER_AGENT,
+        SHOPLINE_STATUSES_FOR_XINGSHENG, created_after,
     )
     if error:
       render_section_placeholder("訂單出貨－SHOPLINE官網", f"抓取失敗：{error}")
       return
-    if not order_rows:
-      render_section_placeholder("訂單出貨－SHOPLINE官網", "目前沒有待處理訂單")
+    if not orders:
+      render_section_placeholder(
+          "訂單出貨－SHOPLINE官網", "近3個月沒有待處理或已確認的訂單"
+      )
       return
 
-    ui.label("SHOPLINE官網（海濤客品牌）").classes(
-        "text-xs text-zinc-500 mb-3"
-    )
+    ui.label(
+        f"SHOPLINE官網（海濤客品牌）・近{SHOPLINE_LOOKBACK_DAYS}天訂單建立時間"
+    ).classes("text-xs text-zinc-500 mb-3")
 
-    with ui.card().classes(
-        "w-full p-6 bg-white border border-[#e2e1dc] shadow-none rounded-none mb-4"
-    ):
-      ui.label(
-          f"未出貨商品需求彙總（共 {len(item_rows)} 個品項，供向海濤客食品工廠"
-          "請備貨/採購用）"
-      ).classes("text-sm font-bold text-zinc-700 mb-3")
-      ui.table(
-          columns=[
-              {"name": "SKU", "label": "SKU", "field": "SKU", "align": "left"},
-              {"name": "商品", "label": "商品", "field": "商品", "align": "left"},
-              {"name": "需求數量", "label": "需求數量", "field": "需求數量", "align": "right"},
-              {"name": "訂單數", "label": "訂單數", "field": "訂單數", "align": "right"},
-          ],
-          rows=item_rows,
-          row_key="SKU",
-      ).classes("w-full")
+    counts, _, _ = aggregate_shopline_orders(orders, "all")
+    with ui.row().classes("w-full gap-4 mb-4"):
+      with ui.card().classes(
+          "p-4 bg-white border border-[#e2e1dc] shadow-none rounded-none"
+      ):
+        ui.label("待處理").classes("text-xs text-zinc-500")
+        ui.label(f"{counts['pending']} 筆").classes("text-xl font-bold text-zinc-900")
+      with ui.card().classes(
+          "p-4 bg-white border border-[#e2e1dc] shadow-none rounded-none"
+      ):
+        ui.label("已確認").classes("text-xs text-zinc-500")
+        ui.label(f"{counts['confirmed']} 筆").classes("text-xl font-bold text-zinc-900")
 
-    with ui.card().classes(
-        "w-full p-6 bg-white border border-[#e2e1dc] shadow-none rounded-none"
-    ):
-      ui.label(f"待處理訂單清單（共 {len(order_rows)} 筆，參考用）").classes(
-          "text-sm font-bold text-zinc-700 mb-3"
-      )
-      ui.table(
-          columns=[
-              {"name": "訂單編號", "label": "訂單編號", "field": "訂單編號", "align": "left"},
-              {"name": "客戶", "label": "客戶", "field": "客戶", "align": "left"},
-              {"name": "金額", "label": "金額", "field": "金額", "align": "right"},
-              {"name": "建立時間", "label": "建立時間（台灣時間）", "field": "建立時間", "align": "left"},
-              {"name": "物流狀態", "label": "物流狀態", "field": "物流狀態", "align": "left"},
-          ],
-          rows=order_rows,
-          row_key="訂單編號",
-      ).classes("w-full")
+    results_container = ui.column().classes("w-full")
+
+    def render_results(status_filter):
+      results_container.clear()
+      _, sku_rows, delivery_rows = aggregate_shopline_orders(orders, status_filter)
+      with results_container:
+        with ui.card().classes(
+            "w-full p-6 bg-white border border-[#e2e1dc] shadow-none rounded-none mb-4"
+        ):
+          ui.label(
+              f"未出貨商品需求彙總（共 {len(sku_rows)} 個品項，供向海濤客"
+              "食品工廠請備貨/採購用）"
+          ).classes("text-sm font-bold text-zinc-700 mb-3")
+          ui.table(
+              columns=[
+                  {"name": "SKU", "label": "SKU", "field": "SKU", "align": "left"},
+                  {"name": "商品", "label": "商品", "field": "商品", "align": "left"},
+                  {"name": "需求數量", "label": "需求數量", "field": "需求數量", "align": "right"},
+                  {"name": "訂單數", "label": "訂單數", "field": "訂單數", "align": "right"},
+              ],
+              rows=sku_rows,
+              row_key="SKU",
+          ).classes("w-full")
+
+        with ui.card().classes(
+            "w-full p-6 bg-white border border-[#e2e1dc] shadow-none rounded-none"
+        ):
+          ui.label(
+              f"依送貨方式拆分（共 {len(delivery_rows)} 列，同物流商不同溫層"
+              "分開列）"
+          ).classes("text-sm font-bold text-zinc-700 mb-3")
+          ui.table(
+              columns=[
+                  {"name": "送貨方式", "label": "送貨方式", "field": "送貨方式", "align": "left"},
+                  {"name": "SKU", "label": "SKU", "field": "SKU", "align": "left"},
+                  {"name": "商品", "label": "商品", "field": "商品", "align": "left"},
+                  {"name": "需求數量", "label": "需求數量", "field": "需求數量", "align": "right"},
+                  {"name": "訂單數", "label": "訂單數", "field": "訂單數", "align": "right"},
+              ],
+              rows=delivery_rows,
+              row_key="_row_key",
+          ).classes("w-full")
+
+    filter_options = [("全部", "all"), ("待處理", "pending"), ("已確認", "confirmed")]
+    filter_btn_row = ui.row().classes("w-full gap-2 mb-4")
+
+    def render_filter_buttons(active):
+      filter_btn_row.clear()
+      with filter_btn_row:
+        for label, value in filter_options:
+          is_active = value == active
+          btn = ui.button(
+              label,
+              on_click=lambda v=value: (render_filter_buttons(v), render_results(v)),
+          ).props("dense no-caps")
+          btn.classes(
+              "px-4 py-1 rounded-none "
+              + (
+                  "bg-[#5bc0be] text-white"
+                  if is_active
+                  else "bg-white text-zinc-600 border border-[#e2e1dc]"
+              )
+          )
+
+    render_filter_buttons("all")
+    render_results("all")
+
+
 
   # 訂單出貨底下的通路子分頁，之後每個通路會各自串不同的訂單來源API。
   # 各分公司實際通路不完全一樣（例如興聖沒有蝦皮），用字典各自設定；
