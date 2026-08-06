@@ -2464,16 +2464,44 @@ app_state = {
 @ui.page("/")
 def inventory_dashboard():
   ui.add_head_html("""
+        <link rel="preconnect" href="https://fonts.googleapis.com">
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+TC:wght@600;700&family=Noto+Sans+TC:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
         <style>
-            body { background-color: #f7f6f2; color: #1a1a1a; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-            .q-table__container { background-color: #ffffff !important; border: 1px solid #e2e1dc; border-radius: 0px; box-shadow: none !important; }
-            .q-table th { color: #555555 !important; font-weight: 700 !important; font-size: 13px; border-bottom: 2px solid #1a1a1a !important; }
-            .q-table td { color: #1a1a1a !important; border-bottom: 1px solid #eeede8 !important; }
-            .sync-btn { background-color: #5bc0be !important; color: #ffffff !important; font-weight: 700; }
-            .q-tabs { border-bottom: 1px solid #e2e1dc; }
-            .q-tab { color: #777777 !important; font-weight: 700; text-transform: none; }
-            .q-tab--active { color: #1a1a1a !important; }
-            .q-tab-indicator { background: #5bc0be !important; }
+            :root {
+              --bg: #f2f0ea;
+              --surface: #ffffff;
+              --surface-2: #f7f5ef;
+              --border: #e6e1d4;
+              --ink: #2a2823;
+              --muted: #8a8577;
+              --font-display: 'Noto Serif TC', serif;
+              --font-body: 'Noto Sans TC', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+              --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, monospace;
+            }
+            body { background-color: var(--bg); color: var(--ink); font-family: var(--font-body); }
+
+            /* 表格：白底卡片、柔和陰影取代生硬的滿版邊框，數字用等寬字體 */
+            .q-table__container { background-color: var(--surface) !important; border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 1px 3px rgba(42,40,35,.06) !important; overflow: hidden; }
+            .q-table th { color: var(--muted) !important; font-weight: 700 !important; font-size: 12px; letter-spacing: .02em; background: var(--surface-2) !important; border-bottom: 1px solid var(--border) !important; }
+            .q-table td { color: var(--ink) !important; border-bottom: 1px solid var(--surface-2) !important; font-family: var(--font-body); }
+            .q-table tbody tr:hover td { background: var(--surface-2) !important; }
+
+            /* 分頁：底線取代粗黑框，字重輕一點更沉穩 */
+            .q-tabs { border-bottom: 1px solid var(--border); }
+            .q-tab { color: var(--muted) !important; font-weight: 500; text-transform: none; font-family: var(--font-body); }
+            .q-tab--active { color: var(--ink) !important; font-weight: 700; }
+            .q-tab-indicator { background: #5bc0be !important; height: 2px !important; }
+
+            /* 按鈕：柔和圓角，主要動作按鈕用品牌色 */
+            .q-btn { border-radius: 6px !important; font-family: var(--font-body); }
+            .sync-btn { background-color: #4f9d9b !important; color: #ffffff !important; font-weight: 700; }
+
+            /* 輸入框/下拉選單也統一柔和圓角 */
+            .q-field__control { border-radius: 6px !important; }
+
+            /* 標題用襯線字型，跟內文區分出層次 */
+            h1, h2, .text-lg.font-bold, .text-xl.font-bold { font-family: var(--font-display); }
         </style>
     """)
 
@@ -2520,7 +2548,7 @@ def inventory_dashboard():
 
   with ui.row().classes(
       "w-full flex flex-nowrap items-center justify-between bg-white"
-      " border-b border-[#e2e1dc] px-8 py-4 sticky top-0 z-50"
+      " border-b border-[#e6e1d4] px-8 py-4 sticky top-0 z-50"
   ):
     with ui.row().classes("items-center gap-3 flex-shrink-0"):
       ui.label("興聖集團｜A1 智慧進銷存總管理系統").classes(
@@ -2546,8 +2574,8 @@ def inventory_dashboard():
           "w-full p-8 max-w-[1600px] mx-auto items-center justify-center"
       ):
         with ui.card().classes(
-            "w-full p-16 bg-white border border-[#e2e1dc] shadow-none"
-            " rounded-none text-center"
+            "w-full p-16 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)]"
+            " rounded-lg text-center"
         ):
           ui.label(name).classes("text-lg font-bold text-zinc-900 mb-2")
           ui.label("此分公司尚未串接 A1 API，敬請期待").classes(
@@ -2560,8 +2588,8 @@ def inventory_dashboard():
     版面（分頁結構）不用重搭。
     """
     with ui.card().classes(
-        "w-full p-10 bg-white border border-[#e2e1dc] shadow-none"
-        " rounded-none text-center"
+        "w-full p-10 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)]"
+        " rounded-lg text-center"
     ):
       ui.label(title).classes("text-sm font-bold text-zinc-700 mb-2")
       ui.label(hint).classes("text-xs text-zinc-500")
@@ -2629,9 +2657,9 @@ def inventory_dashboard():
 
         ui.button("🔄 重新整理", on_click=handle_refresh).props(
             "dense no-caps unelevated"
-        ).classes("px-3 py-1 rounded-none text-xs").style(
+        ).classes("px-3 py-1 rounded-lg text-xs").style(
             "background:#ffffff !important; color:#4b5563 !important;"
-            " border:1px solid #e2e1dc;"
+            " border:1px solid #e6e1d4;"
         )
 
     render_refresh_row()
@@ -2652,14 +2680,14 @@ def inventory_dashboard():
             is_active = value == state["status_filter"]
             bg = "#5bc0be" if is_active else "#ffffff"
             fg = "#ffffff" if is_active else "#4b5563"
-            border = "#5bc0be" if is_active else "#e2e1dc"
+            border = "#5bc0be" if is_active else "#e6e1d4"
             # 用行內 style 強制指定顏色，避免被 NiceGUI/Quasar 按鈕預設的
             # 文字顏色蓋掉（Tailwind的class在這裡權重會輸給Quasar內建樣式，
             # 導致文字顏色跟背景一樣、整個看起來像空白按鈕）。
             ui.button(
                 label, on_click=lambda v=value: set_status_filter(v)
             ).props("dense no-caps unelevated").classes(
-                "px-4 py-1 rounded-none"
+                "px-4 py-1 rounded-lg"
             ).style(
                 f"background:{bg} !important; color:{fg} !important;"
                 f" border:1px solid {border};"
@@ -2714,7 +2742,7 @@ def inventory_dashboard():
       )
       with results_container:
         with ui.card().classes(
-            "w-full p-6 bg-white border border-[#e2e1dc] shadow-none rounded-none"
+            "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)] rounded-lg"
         ):
           with ui.row().classes("w-full items-center justify-between mb-3"):
             ui.label(
@@ -2734,7 +2762,7 @@ def inventory_dashboard():
                 ui.notify(f"匯出失敗：{e}", color="negative")
 
             ui.button("匯出 xlsx", on_click=handle_export).classes(
-                "sync-btn px-3 py-1 text-xs rounded-none"
+                "sync-btn px-3 py-1 text-xs rounded-lg"
             )
 
           if not rows:
@@ -2892,13 +2920,13 @@ def inventory_dashboard():
 
     with results_container:
       with ui.card().classes(
-          "w-full p-6 bg-white border border-[#e2e1dc] shadow-none rounded-none mb-4"
+          "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)] rounded-lg mb-4"
       ):
         ui.label("揀貨表（依品號加總數量）").classes("text-sm font-bold text-zinc-700 mb-3")
         picking_container = ui.column().classes("w-full")
 
       with ui.card().classes(
-          "w-full p-6 bg-white border border-[#e2e1dc] shadow-none rounded-none"
+          "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)] rounded-lg"
       ):
         with ui.row().classes("w-full items-center justify-between mb-3"):
           ui.label("通路分類數量（人員手動填寫，不會自動計算）").classes(
@@ -2924,7 +2952,7 @@ def inventory_dashboard():
               ui.notify(f"匯出失敗：{e}", color="negative")
 
           ui.button("匯出 xlsx（揀貨表＋通路分類數量）", on_click=handle_export).classes(
-              "sync-btn px-3 py-1 text-xs rounded-none"
+              "sync-btn px-3 py-1 text-xs rounded-lg"
           )
 
         with ui.row().classes("w-full gap-3 flex-wrap"):
@@ -2975,9 +3003,9 @@ def inventory_dashboard():
 
         ui.button("🔄 重新整理", on_click=handle_refresh).props(
             "dense no-caps unelevated"
-        ).classes("px-3 py-1 rounded-none text-xs").style(
+        ).classes("px-3 py-1 rounded-lg text-xs").style(
             "background:#ffffff !important; color:#4b5563 !important;"
-            " border:1px solid #e2e1dc;"
+            " border:1px solid #e6e1d4;"
         )
 
     render_refresh_row()
@@ -3009,7 +3037,7 @@ def inventory_dashboard():
           with ui.tab_panel(pa_tab_procure):
             rows = compute_suggested_procurement(items_map, stock_lookup)
             with ui.card().classes(
-                "w-full p-6 bg-white border border-[#e2e1dc] shadow-none rounded-none"
+                "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)] rounded-lg"
             ):
               with ui.row().classes("w-full items-center justify-between mb-3"):
                 ui.label(
@@ -3027,7 +3055,7 @@ def inventory_dashboard():
                     ui.notify(f"匯出失敗：{e}", color="negative")
 
                 ui.button("匯出 xlsx", on_click=handle_export_procure).classes(
-                    "sync-btn px-3 py-1 text-xs rounded-none"
+                    "sync-btn px-3 py-1 text-xs rounded-lg"
                 )
               if not rows:
                 ui.label("目前沒有品項需要採購（或商品主檔都沒設定安全庫存）").classes(
@@ -3049,7 +3077,7 @@ def inventory_dashboard():
             rows = compute_turnover_metrics(sales_history, stock_lookup, items_map)
             slow_count = sum(1 for r in rows if r["滯銷"] == "是")
             with ui.card().classes(
-                "w-full p-6 bg-white border border-[#e2e1dc] shadow-none rounded-none"
+                "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)] rounded-lg"
             ):
               with ui.row().classes("w-full items-center justify-between mb-3"):
                 ui.label(
@@ -3068,7 +3096,7 @@ def inventory_dashboard():
                     ui.notify(f"匯出失敗：{e}", color="negative")
 
                 ui.button("匯出 xlsx", on_click=handle_export_turnover).classes(
-                    "sync-btn px-3 py-1 text-xs rounded-none"
+                    "sync-btn px-3 py-1 text-xs rounded-lg"
                 )
               if not rows:
                 ui.label("目前沒有成品/組合品的銷售歷史資料").classes("text-xs text-zinc-400")
@@ -3094,7 +3122,7 @@ def inventory_dashboard():
           with ui.tab_panel(pa_tab_forecast):
             rows = compute_simple_monthly_forecast(items_map, sales_history)
             with ui.card().classes(
-                "w-full p-6 bg-white border border-[#e2e1dc] shadow-none rounded-none"
+                "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)] rounded-lg"
             ):
               with ui.row().classes(
                   "w-full p-3 mb-3 bg-[#fff8e6] border border-[#f0dca0]"
@@ -3119,7 +3147,7 @@ def inventory_dashboard():
                     ui.notify(f"匯出失敗：{e}", color="negative")
 
                 ui.button("匯出 xlsx", on_click=handle_export_forecast).classes(
-                    "sync-btn px-3 py-1 text-xs rounded-none"
+                    "sync-btn px-3 py-1 text-xs rounded-lg"
                 )
               if not rows:
                 ui.label("目前沒有成品/組合品的銷售歷史資料").classes("text-xs text-zinc-400")
@@ -3316,7 +3344,7 @@ def inventory_dashboard():
                 "text-2xl font-black text-zinc-900 tracking-wide"
             )
           ui.button("同步 A1 最新庫存", on_click=handle_sync).classes(
-              "sync-btn px-4 py-2 text-xs rounded-none"
+              "sync-btn px-4 py-2 text-xs rounded-lg"
           )
 
         with ui.tabs().classes("w-full") as page_tabs:
@@ -3335,8 +3363,8 @@ def inventory_dashboard():
           # ==================================================
           with ui.tab_panel(tab_dashboard):
             with ui.card().classes(
-                "w-full p-6 bg-white border border-[#e2e1dc] shadow-none"
-                " rounded-none"
+                "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)]"
+                " rounded-lg"
             ):
               dashboard_source_label = ui.label().classes(
                   "text-xs text-zinc-500 mb-4"
@@ -3357,7 +3385,7 @@ def inventory_dashboard():
                     f"w-full items-center gap-2 p-2 border {style['box']} {accent_class}"
                 ):
                   ui.label(style["label"]).classes(
-                      f"text-[11px] px-2 py-0.5 rounded-none font-bold"
+                      f"text-[11px] px-2 py-0.5 rounded-lg font-bold"
                       f" {style['badge']}"
                   )
                   ui.label(text).classes(f"text-xs {style['text']} flex-1")
@@ -3387,7 +3415,7 @@ def inventory_dashboard():
                 )
                 kpi_dialog_body = ui.column().classes("w-full")
                 ui.button("關閉", on_click=kpi_dialog.close).classes(
-                    "sync-btn px-4 py-1 text-xs rounded-none mt-3 self-end"
+                    "sync-btn px-4 py-1 text-xs rounded-lg mt-3 self-end"
                 )
 
               def open_kpi_dialog(title, rows, columns):
@@ -3416,7 +3444,7 @@ def inventory_dashboard():
                         ui.notify(f"匯出失敗：{e}", color="negative")
 
                     ui.button("匯出 xlsx", on_click=handle_export).classes(
-                        "sync-btn px-3 py-1 text-xs rounded-none mt-3"
+                        "sync-btn px-3 py-1 text-xs rounded-lg mt-3"
                     )
                 kpi_dialog.open()
 
@@ -3693,8 +3721,8 @@ def inventory_dashboard():
               # ---------------- 2.3：庫存即時查詢 ----------------
               with ui.tab_panel(tab_inventory):
                 with ui.card().classes(
-                    "w-full p-6 bg-white border border-[#e2e1dc] shadow-none"
-                    " rounded-none"
+                    "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)]"
+                    " rounded-lg"
                 ):
                   with ui.row().classes(
                       "w-full items-center justify-between mb-6 gap-4 flex-wrap"
@@ -3708,16 +3736,16 @@ def inventory_dashboard():
                       wh_select = ui.select(
                           options=wh_options, value="全部倉庫"
                       ).classes(
-                          "bg-[#f7f6f2] text-zinc-900 rounded-none px-3 py-1"
-                          " text-xs font-bold border border-[#e2e1dc]"
+                          "bg-[#f7f6f2] text-zinc-900 rounded-lg px-3 py-1"
+                          " text-xs font-bold border border-[#e6e1d4]"
                       )
 
                       cat_options = ["全部分類"] + app_state["categories"]
                       cat_select = ui.select(
                           options=cat_options, value="全部分類"
                       ).classes(
-                          "bg-[#f7f6f2] text-zinc-900 rounded-none px-3 py-1"
-                          " text-xs font-bold border border-[#e2e1dc]"
+                          "bg-[#f7f6f2] text-zinc-900 rounded-lg px-3 py-1"
+                          " text-xs font-bold border border-[#e6e1d4]"
                       )
 
                       search_input = ui.input(
@@ -3728,7 +3756,7 @@ def inventory_dashboard():
 
                   with ui.row().classes(
                       "w-full items-center gap-3 mb-4 p-3 bg-[#f7f6f2] border"
-                      " border-[#e2e1dc] flex-wrap"
+                      " border-[#e6e1d4] flex-wrap"
                   ):
                     ui.label(
                         "單一品號覆核（直查 A1，不受表格篩選/分頁影響）"
@@ -3765,7 +3793,7 @@ def inventory_dashboard():
                       verify_result.text = "A1 即時庫存 → " + "，".join(parts)
 
                     ui.button("查詢", on_click=handle_verify).classes(
-                        "sync-btn px-3 py-1 text-xs rounded-none"
+                        "sync-btn px-3 py-1 text-xs rounded-lg"
                     )
 
                   table_container = ui.column().classes("w-full")
@@ -3871,8 +3899,8 @@ def inventory_dashboard():
               # Excel 上傳），這裡讀取後與 A1 商品主檔的組合品清單合併顯示。
               with ui.tab_panel(tab_bom):
                 with ui.card().classes(
-                    "w-full p-6 bg-white border border-[#e2e1dc] shadow-none"
-                    " rounded-none"
+                    "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)]"
+                    " rounded-lg"
                 ):
                   ui.label("商品組合資訊（BOM）").classes(
                       "text-lg font-bold text-zinc-900 tracking-wide mb-2"
@@ -3893,7 +3921,7 @@ def inventory_dashboard():
 
                   with ui.row().classes(
                       "w-full items-center gap-3 flex-wrap mb-4 p-3"
-                      " bg-[#f7f6f2] border border-[#e2e1dc]"
+                      " bg-[#f7f6f2] border border-[#e6e1d4]"
                   ):
 
                     def handle_reload_bom():
@@ -3909,7 +3937,7 @@ def inventory_dashboard():
 
                     ui.button(
                         "重新讀取商品組合明細", on_click=handle_reload_bom
-                    ).classes("sync-btn px-3 py-1 text-xs rounded-none")
+                    ).classes("sync-btn px-3 py-1 text-xs rounded-lg")
 
                     def handle_bom_upload(e):
                       os.makedirs(
@@ -4016,7 +4044,7 @@ def inventory_dashboard():
                             icon="inventory_2",
                             value=True,
                         ).classes(
-                            "w-full border border-[#e2e1dc] text-sm"
+                            "w-full border border-[#e6e1d4] text-sm"
                         ):
                           ui.table(
                               columns=[
@@ -4041,7 +4069,7 @@ def inventory_dashboard():
                             icon="help_outline",
                             value=False,
                         ).classes(
-                            "w-full border border-[#e2e1dc] text-sm text-zinc-500"
+                            "w-full border border-[#e6e1d4] text-sm text-zinc-500"
                         ):
                           ui.table(
                               columns=[
@@ -4088,8 +4116,8 @@ def inventory_dashboard():
               # ---------------- 2.3：批號／效期追蹤 ----------------
               with ui.tab_panel(tab_lotno):
                 with ui.card().classes(
-                    "w-full p-6 bg-white border border-[#e2e1dc] shadow-none"
-                    " rounded-none"
+                    "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)]"
+                    " rounded-lg"
                 ):
                   ui.label("批號／效期追蹤").classes(
                       "text-lg font-bold text-zinc-900 tracking-wide mb-2"
@@ -4128,7 +4156,7 @@ def inventory_dashboard():
 
                     ui.button(
                         "查詢批號資料", on_click=handle_load_lot_nos
-                    ).classes("sync-btn px-3 py-1 text-xs rounded-none")
+                    ).classes("sync-btn px-3 py-1 text-xs rounded-lg")
 
                   lotno_stats_label = ui.label().classes(
                       "text-xs text-zinc-500 mb-3"
@@ -4178,8 +4206,8 @@ def inventory_dashboard():
           # ==================================================
           with ui.tab_panel(tab_orders):
             with ui.card().classes(
-                "w-full p-6 bg-white border border-[#e2e1dc] shadow-none"
-                " rounded-none"
+                "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)]"
+                " rounded-lg"
             ):
               ui.label("訂單與出貨管理").classes(
                   "text-lg font-bold text-zinc-900 tracking-wide mb-3"
@@ -4205,9 +4233,9 @@ def inventory_dashboard():
                 with ui.row().classes("w-full justify-end gap-2 mt-4"):
                   ui.button(
                       "取消", on_click=order_sync_dialog.close
-                  ).classes("px-4 py-1 text-xs rounded-none")
+                  ).classes("px-4 py-1 text-xs rounded-lg")
                   order_sync_confirm_button = ui.button("確認上傳").classes(
-                      "sync-btn px-4 py-1 text-xs rounded-none"
+                      "sync-btn px-4 py-1 text-xs rounded-lg"
                   )
 
               def handle_order_sync_click():
@@ -4265,7 +4293,7 @@ def inventory_dashboard():
                     "同步訂單到 A1（寫入正式系統）",
                     on_click=handle_order_sync_click,
                 ).classes(
-                    "px-3 py-1 text-xs rounded-none bg-amber-600 text-white"
+                    "px-3 py-1 text-xs rounded-lg bg-amber-600 text-white"
                     " font-bold"
                 )
                 ui.label(
@@ -4283,8 +4311,8 @@ def inventory_dashboard():
                     options=["全部狀態", "未出貨", "備貨中", "已出貨"],
                     value="全部狀態",
                 ).classes(
-                    "bg-[#f7f6f2] text-zinc-900 rounded-none px-3 py-1"
-                    " text-xs font-bold border border-[#e2e1dc]"
+                    "bg-[#f7f6f2] text-zinc-900 rounded-lg px-3 py-1"
+                    " text-xs font-bold border border-[#e6e1d4]"
                 )
 
               orders_stats_label = ui.label().classes(
@@ -4380,8 +4408,8 @@ def inventory_dashboard():
           # ==================================================
           with ui.tab_panel(tab_production):
             with ui.card().classes(
-                "w-full p-6 bg-white border border-[#e2e1dc] shadow-none"
-                " rounded-none"
+                "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)]"
+                " rounded-lg"
             ):
               ui.label("生產與包裝排程").classes(
                   "text-lg font-bold text-zinc-900 tracking-wide mb-3"
@@ -4542,8 +4570,8 @@ def inventory_dashboard():
             ).classes("w-full bg-transparent"):
               with ui.tab_panel(tab_procurement_51):
                 with ui.card().classes(
-                    "w-full p-6 bg-white border border-[#e2e1dc] shadow-none"
-                    " rounded-none"
+                    "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)]"
+                    " rounded-lg"
                 ):
                   procurement_reminder_container = ui.column().classes("w-full gap-2 mb-4")
 
@@ -4556,8 +4584,8 @@ def inventory_dashboard():
                     procurement_cat_select = ui.select(
                         options=procurement_cat_options, value="全部分類"
                     ).classes(
-                        "bg-[#f7f6f2] text-zinc-900 rounded-none px-3 py-1"
-                        " text-xs font-bold border border-[#e2e1dc]"
+                        "bg-[#f7f6f2] text-zinc-900 rounded-lg px-3 py-1"
+                        " text-xs font-bold border border-[#e6e1d4]"
                     )
                     procurement_search_input = ui.input(
                         placeholder="輸入品號或品名關鍵字..."
@@ -4566,8 +4594,8 @@ def inventory_dashboard():
                         options=["僅顯示需要採購", "顯示全部商品"],
                         value="僅顯示需要採購",
                     ).classes(
-                        "bg-[#f7f6f2] text-zinc-900 rounded-none px-3 py-1"
-                        " text-xs font-bold border border-[#e2e1dc]"
+                        "bg-[#f7f6f2] text-zinc-900 rounded-lg px-3 py-1"
+                        " text-xs font-bold border border-[#e6e1d4]"
                     )
 
                   with ui.row().classes(
@@ -4709,8 +4737,8 @@ def inventory_dashboard():
 
               with ui.tab_panel(tab_procurement_53):
                 with ui.card().classes(
-                    "w-full p-6 bg-white border border-[#e2e1dc] shadow-none"
-                    " rounded-none"
+                    "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)]"
+                    " rounded-lg"
                 ):
                   ui.label("庫存週轉率／滯銷品分析").classes(
                       "text-sm font-bold text-zinc-700 mb-2"
@@ -4764,7 +4792,7 @@ def inventory_dashboard():
 
                     ui.button(
                         "從 A1 抓取近3個月銷售歷史", on_click=handle_fetch_sales_from_a1
-                    ).classes("sync-btn px-3 py-1 text-xs rounded-none")
+                    ).classes("sync-btn px-3 py-1 text-xs rounded-lg")
 
                   turnover_stats_label = ui.label().classes(
                       "text-xs text-zinc-500 mb-3"
@@ -4833,8 +4861,8 @@ def inventory_dashboard():
 
               with ui.tab_panel(tab_procurement_54):
                 with ui.card().classes(
-                    "w-full p-6 bg-white border border-[#e2e1dc] shadow-none"
-                    " rounded-none"
+                    "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)]"
+                    " rounded-lg"
                 ):
                   ui.label("進貨明細").classes(
                       "text-sm font-bold text-zinc-700 mb-2"
@@ -4921,8 +4949,8 @@ def inventory_dashboard():
 
               with ui.tab_panel(tab_procurement_55):
                 with ui.card().classes(
-                    "w-full p-6 bg-white border border-[#e2e1dc] shadow-none"
-                    " rounded-none"
+                    "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)]"
+                    " rounded-lg"
                 ):
                   ui.label("月產銷分析").classes(
                       "text-lg font-bold text-zinc-900 tracking-wide mb-2"
@@ -4950,8 +4978,8 @@ def inventory_dashboard():
                         value=generate_month_options(6)[0],
                         label="預估月份",
                     ).classes(
-                        "bg-[#f7f6f2] text-zinc-900 rounded-none px-3 py-1"
-                        " text-xs font-bold border border-[#e2e1dc] w-32"
+                        "bg-[#f7f6f2] text-zinc-900 rounded-lg px-3 py-1"
+                        " text-xs font-bold border border-[#e6e1d4] w-32"
                     )
                     forecast_revenue_input = ui.number(
                         label="目標營業額（選填，不填則用基準預估量）",
@@ -4968,7 +4996,7 @@ def inventory_dashboard():
                         value=True,
                     ).classes("text-xs")
                     forecast_calc_button = ui.button("計算").classes(
-                        "sync-btn px-4 py-2 text-xs rounded-none"
+                        "sync-btn px-4 py-2 text-xs rounded-lg"
                     )
 
                   forecast_fetch_status_label = ui.label().classes(
@@ -5113,11 +5141,11 @@ def inventory_dashboard():
                       for cat in FORECAST_CATEGORY_OPTIONS:
                         is_active = cat == forecast_state["active_category"]
                         ui.button(cat, on_click=make_handler(cat)).classes(
-                            "px-3 py-1 text-xs rounded-none "
+                            "px-3 py-1 text-xs rounded-lg "
                             + (
                                 "sync-btn"
                                 if is_active
-                                else "bg-[#f7f6f2] text-zinc-700 border border-[#e2e1dc]"
+                                else "bg-[#f7f6f2] text-zinc-700 border border-[#e6e1d4]"
                             )
                         )
 
@@ -5226,7 +5254,7 @@ def inventory_dashboard():
                       ]
                       for label, value in summary_cards:
                         with ui.column().classes(
-                            "bg-[#f7f6f2] border border-[#e2e1dc] p-4"
+                            "bg-[#f7f6f2] border border-[#e6e1d4] p-4"
                             " min-w-[200px] flex-1"
                         ):
                           ui.label(label).classes("text-xs text-zinc-500 mb-1")
@@ -5262,7 +5290,7 @@ def inventory_dashboard():
                         ui.button(
                             "匯出 xlsx（總表＋分通路表）",
                             on_click=handle_export_forecast,
-                        ).classes("sync-btn px-3 py-1 text-xs rounded-none")
+                        ).classes("sync-btn px-3 py-1 text-xs rounded-lg")
 
                     render_forecast_category_buttons()
                     render_forecast_table()
@@ -5278,8 +5306,8 @@ def inventory_dashboard():
             with ui.column().classes("w-full gap-4"):
               # ---------------- 6.1：同步狀態與日誌 ----------------
               with ui.card().classes(
-                  "w-full p-6 bg-white border border-[#e2e1dc] shadow-none"
-                  " rounded-none"
+                  "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)]"
+                  " rounded-lg"
               ):
                 ui.label("鼎新 A1 連線狀態與同步日誌").classes(
                     "text-lg font-bold text-zinc-900 tracking-wide mb-3"
@@ -5314,8 +5342,8 @@ def inventory_dashboard():
 
               # ---------------- 6.2：Google Sheets 設定檢視 ----------------
               with ui.card().classes(
-                  "w-full p-6 bg-white border border-[#e2e1dc] shadow-none"
-                  " rounded-none"
+                  "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)]"
+                  " rounded-lg"
               ):
                 ui.label("Google Sheets 資料對應設定").classes(
                     "text-lg font-bold text-zinc-900 tracking-wide mb-3"
@@ -5381,8 +5409,8 @@ def inventory_dashboard():
 
               # ---------------- 6.3：參數設定 ----------------
               with ui.card().classes(
-                  "w-full p-6 bg-white border border-[#e2e1dc] shadow-none"
-                  " rounded-none"
+                  "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)]"
+                  " rounded-lg"
               ):
                 ui.label("參數設定").classes(
                     "text-lg font-bold text-zinc-900 tracking-wide mb-3"
@@ -5447,7 +5475,7 @@ def inventory_dashboard():
                       refs[ref_key]()
 
                 ui.button("儲存參數", on_click=handle_save_settings).classes(
-                    "sync-btn px-4 py-2 text-xs rounded-none"
+                    "sync-btn px-4 py-2 text-xs rounded-lg"
                 )
 
 
