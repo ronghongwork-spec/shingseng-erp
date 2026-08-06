@@ -140,6 +140,37 @@ SHOPLINE_FULAIBO_USER_AGENT = os.environ.get("SHOPLINE_FULAIBO_USER_AGENT", "")
 SHOPLINE_ORDER_STATUSES = ["pending", "confirmed"]  # 待處理+已確認
 SHOPLINE_LOOKBACK_DAYS = 90  # 訂單建立時間往前推3個月
 
+# -------------------------------------------------------------------------
+# 分公司｜每日出貨（抓鼎新A1銷貨單，依銷貨單建立日期彙總品項數量＝揀貨表）
+# 興聖/容鴻/芙萊柏在A1系統裡是各自獨立租戶，帳密跟海濤客的 A1_API_KEY /
+# A1_API_PASSWORD 不是同一組，要各自設定。
+# .env 需設定（目前只有興聖，其餘公司之後陸續補）：
+#   A1_XINGSHENG_API_KEY=
+#   A1_XINGSHENG_API_PASSWORD=
+# -------------------------------------------------------------------------
+A1_XINGSHENG_API_KEY = os.environ.get("A1_XINGSHENG_API_KEY", "")
+A1_XINGSHENG_API_PASSWORD = os.environ.get("A1_XINGSHENG_API_PASSWORD", "")
+
+# 每日出貨手動填寫的通路清單（跟出貨明細一起匯出，不會反查任何API）
+DAILY_SHIPPING_CHANNELS = ["全家", "7-11", "黑貓", "新竹", "順豐", "海外", "其它"]
+
+# -------------------------------------------------------------------------
+# 分公司｜採購分析（建議採購量／庫存週轉／月產銷分析，共用A1帳密。
+# 進貨明細目前跳過，因為A1沒有查詢API、要另外維護Google Sheet，容鴻/
+# 芙萊柏是否有這份資料還待確認）
+# .env 需設定（目前有容鴻、芙萊柏；興聖如果也要這個功能，可以直接沿用
+# 上面 A1_XINGSHENG_API_KEY/PASSWORD，不用重複設定）：
+#   A1_RONGHONG_API_KEY=
+#   A1_RONGHONG_API_PASSWORD=
+#   A1_FULAIBO_API_KEY=
+#   A1_FULAIBO_API_PASSWORD=
+# -------------------------------------------------------------------------
+A1_RONGHONG_API_KEY = os.environ.get("A1_RONGHONG_API_KEY", "")
+A1_RONGHONG_API_PASSWORD = os.environ.get("A1_RONGHONG_API_PASSWORD", "")
+A1_FULAIBO_API_KEY = os.environ.get("A1_FULAIBO_API_KEY", "")
+A1_FULAIBO_API_PASSWORD = os.environ.get("A1_FULAIBO_API_PASSWORD", "")
+PROCUREMENT_ANALYSIS_LOOKBACK_MONTHS = 3  # 銷售歷史往前抓幾個月，用來算週轉/預估銷量
+
 # 送貨方式關鍵字分類：先比對已知物流商關鍵字，再比對溫層關鍵字，
 # 兩者獨立判斷後組合（例如「黑貓常溫」= 黑貓 + 常溫），沒對到已知物流商
 # 關鍵字時，直接用原始送貨方式名稱當分組，避免資料被錯誤合併。
@@ -278,20 +309,17 @@ def compute_shopline_sku_rows(
   sku_agg = {}
   for o in filtered:
     for item in (o.get("subtotal_items") or []):
-      sku = item.get("sku") or item.get("item_id") or "(無SKU)"
-      title = item.get("title_translations") or {}
-      name = title.get("zh-hant") or title.get("en") or sku
-      qty = item.get("quantity") or 0
-      detail = extract_shopline_item_detail(item)
-      entry = sku_agg.setdefault(
-          sku, {"商品": name, "SKU": sku, "細項": detail, "需求數量": 0}
-      )
-      # 細項理論上同一個SKU都是同一組固定內容，但保險起見：如果目前是
-      # 空的、這次抓到有值，就補上去，避免因為抓到的第一筆剛好沒細項
-      # 資料而漏掉。
-      if not entry["細項"] and detail:
-        entry["細項"] = detail
-      entry["需求數量"] += qty
+      for line in explode_shopline_item(item):
+        entry = sku_agg.setdefault(
+            line["SKU"],
+            {"商品": line["商品"], "SKU": line["SKU"], "細項": line["細項"], "需求數量": 0},
+        )
+        # 細項理論上同一個SKU都是同一組固定內容，但保險起見：如果目前是
+        # 空的、這次抓到有值，就補上去，避免因為抓到的第一筆剛好沒細項
+        # 資料而漏掉。
+        if not entry["細項"] and line["細項"]:
+          entry["細項"] = line["細項"]
+        entry["需求數量"] += line["數量"]
 
   rows = list(sku_agg.values())
   keyword = (keyword or "").strip()
@@ -301,18 +329,99 @@ def compute_shopline_sku_rows(
   return rows
 
 
-def extract_shopline_item_detail(item):
-  """從訂單商品明細(subtotal_items的單一item)裡撈出「細項」說明，例如
-  組合/禮盒商品的內容物「烏金醬*2 (禮盒組)」。實際存放位置是
-  item["fields_translations"]["zh-hant"]，格式是字串陣列(可能有多筆)，
-  沒有細項的一般商品這裡會是空字典{}。
+def _extract_zh_translation_list(fields_translations):
+  """共用小工具：從SHOPLINE的xxx_translations格式(例如
+  {"zh-hant": [...] 或 "zh-hant": "..."}) 撈出中文字串清單，統一格式、
+  過濾空字串。extract_shopline_item_detail() 跟 explode_shopline_item()
+  都會用到。
   """
-  fields = item.get("fields_translations") or {}
-  zh_list = fields.get("zh-hant") or []
+  zh_list = (fields_translations or {}).get("zh-hant") or []
   if isinstance(zh_list, str):
     zh_list = [zh_list]
-  cleaned = [s for s in zh_list if s]
-  return "、".join(cleaned)
+  return [s for s in zh_list if s]
+
+
+def explode_shopline_item(item):
+  """把單一 subtotal_item 展開成「實際要出貨/備貨的品項」清單，格式統一
+  為 [{"SKU","商品","細項","數量"}, ...]：
+
+  - 一般商品(item_type="Product"等)：展開成自己一筆，數量就是最外層
+    quantity。
+  - 客製化特惠組(item_type="ProductSet"，客人自己選內容的組合，最外層
+    sku是空的)：拆解成 child_products 裡的每個子項目各一筆，數量＝
+    item_data.selected_child_products 裡對應子項目的quantity，再乘上
+    最外層quantity（訂了幾組這種特惠組本身），這樣才能算出實際要備多少
+    貨，而不是把整組特惠組當成1個獨立品項。
+  """
+  if item.get("item_type") == "ProductSet":
+    child_products = item.get("child_products") or []
+    if not child_products:
+      return []
+    selected = (item.get("item_data") or {}).get("selected_child_products") or []
+    qty_by_child_id = {s.get("child_product_id"): s.get("quantity") or 0 for s in selected}
+    set_multiplier = item.get("quantity") or 1
+
+    lines = []
+    for child in child_products:
+      child_id = child.get("id")
+      qty_per_set = qty_by_child_id.get(child_id, 0)
+      if qty_per_set <= 0:
+        continue
+      detail = "、".join(_extract_zh_translation_list(child.get("fields_translations")))
+      sku = child.get("sku") or child_id or "(無SKU)"
+      name = detail or sku
+      lines.append({
+          "SKU": sku,
+          "商品": name,
+          "細項": detail,
+          "數量": qty_per_set * set_multiplier,
+      })
+    return lines
+
+  sku = item.get("sku") or item.get("item_id") or "(無SKU)"
+  title = item.get("title_translations") or {}
+  name = title.get("zh-hant") or title.get("en") or sku
+  qty = item.get("quantity") or 0
+  detail = extract_shopline_item_detail(item)
+  return [{"SKU": sku, "商品": name, "細項": detail, "數量": qty}]
+
+
+def extract_shopline_item_detail(item):
+  """從訂單商品明細(subtotal_items的單一item)裡撈出「細項」說明，支援
+  兩種不同結構：
+
+  1. 一般組合/禮盒商品(item_type="Product")：細項放在最外層
+     item["fields_translations"]["zh-hant"]，字串陣列，例如
+     「烏金醬*2 (禮盒組)」，沒有細項的一般商品這裡會是空字典{}。
+
+  2. 客製化特惠組(item_type="ProductSet"，讓客人自選內容的組合，最外層
+     sku是空的)：細項要從 item["child_products"][] 裡撈，每個子項目
+     自己的 fields_translations.zh-hant 才是內容描述。這裡回傳的是給
+     單一item摘要用的字串；實際彙總數量時 explode_shopline_item() 會
+     分開處理每個子項目各自的數量，不會走這條路徑。
+  """
+  # 先試一般組合商品的結構（最外層）
+  top_level = _extract_zh_translation_list(item.get("fields_translations"))
+  if top_level:
+    return "、".join(top_level)
+
+  # 再試客製化特惠組(ProductSet)的結構
+  child_products = item.get("child_products") or []
+  if not child_products:
+    return ""
+
+  selected = (item.get("item_data") or {}).get("selected_child_products") or []
+  qty_by_child_id = {s.get("child_product_id"): s.get("quantity") for s in selected}
+
+  parts = []
+  for child in child_products:
+    names = _extract_zh_translation_list(child.get("fields_translations"))
+    name = "、".join(names)
+    if not name:
+      continue
+    qty = qty_by_child_id.get(child.get("id"))
+    parts.append(f"{name}*{qty}" if qty else name)
+  return "、".join(parts)
 
 
 # -------------------------------------------------------------------------
@@ -438,9 +547,17 @@ def get_a1_token():
   缺一則回 401001(帳號密碼空白) 或 401002(帳號密碼錯誤)。
   登入有效期限為 12 小時。
   """
+  return get_a1_token_for(API_KEY, API_PASSWORD)
+
+
+def get_a1_token_for(api_key, api_password):
+  """跟 get_a1_token() 同一套登入邏輯，但帳密用傳入的參數，而不是寫死
+  海濤客的 API_KEY/API_PASSWORD，讓其他分公司（各自獨立的A1租戶）也能
+  共用這支登入函式。
+  """
   url = f"{A1_BASE_URL}/Login"
   headers = {"Content-Type": "application/json"}
-  body = {"UserName": API_KEY, "Password": API_PASSWORD}
+  body = {"UserName": api_key, "Password": api_password}
 
   try:
     response = requests.post(
@@ -461,6 +578,230 @@ def get_a1_token():
   except requests.exceptions.RequestException as e:
     print(f"A1 登入連線異常: {e}")
   return None
+
+
+def fetch_daily_shipping_items(api_key, api_password, start_date, end_date):
+  """抓鼎新A1銷貨單(GetSales)，依「銷貨單建立日期」(TradeDate)在
+  start_date~end_date區間內的資料，依品號加總數量，回傳揀貨表用的清單：
+  [{"品號","品名","數量"}, ...]。
+  回傳 (rows, error_message)；成功時 error_message 是 None。
+  """
+  if not api_key or not api_password:
+    return None, "尚未設定 A1 API Key / Password"
+  token = get_a1_token_for(api_key, api_password)
+  if not token:
+    return None, "A1登入失敗，請確認API Key/Password是否正確"
+
+  try:
+    qty_by_item = {}
+    name_by_item = {}
+    window_start = start_date
+    while window_start <= end_date:
+      window_end = min(window_start + timedelta(days=6), end_date)
+      for sale in fetch_sales_details_range(
+          token, window_start, window_end, "/Sales/PaginationQuery", "SaleDetails"
+      ):
+        for detail in sale.get("SaleDetails", []) or []:
+          item_id = detail.get("ItemDetailID")
+          if not item_id:
+            continue
+          try:
+            qty = float(detail.get("Qty") or 0)
+          except (TypeError, ValueError):
+            qty = 0.0
+          qty_by_item[item_id] = qty_by_item.get(item_id, 0) + qty
+          if detail.get("ItemName"):
+            name_by_item[item_id] = detail["ItemName"]
+      window_start = window_end + timedelta(days=1)
+
+    rows = [
+        {"品號": item_id, "品名": name_by_item.get(item_id, ""), "數量": qty}
+        for item_id, qty in qty_by_item.items()
+    ]
+    rows.sort(key=lambda r: r["數量"], reverse=True)
+    return rows, None
+  except Exception as e:
+    return None, str(e)
+
+
+def fetch_procurement_analysis_data(api_key, api_password, months_back=PROCUREMENT_ANALYSIS_LOOKBACK_MONTHS):
+  """分公司採購分析的共用資料來源：登入A1後一次抓齊
+    - items_map：商品主檔（品名/分類/成本/安全庫存等，來自 fetch_items_map）
+    - stock_lookup：{品號: 現有庫存(跨倉庫加總)}
+    - sales_history：近months_back個月的銷貨淨額，[{"年月","品號","品名",
+      "銷售數量","銷售金額"}, ...]（銷貨-銷退，銷售金額用來反推平均售價）
+  回傳 (data_dict, error_message)；成功時 error_message 是 None。
+  """
+  if not api_key or not api_password:
+    return None, "尚未設定 A1 API Key / Password"
+  token = get_a1_token_for(api_key, api_password)
+  if not token:
+    return None, "A1登入失敗，請確認API Key/Password是否正確"
+
+  try:
+    items_map = fetch_items_map(token)
+    if not items_map:
+      return None, "取得商品主檔失敗或商品清單為空"
+
+    # ---- 庫存：StockBatch，依品號分批查詢，跨倉庫加總 ----
+    stock_lookup = {}
+    all_item_ids = list(items_map.keys())
+    batch_size = 100  # 手冊：ItemIDs 一次最多可傳 100 筆
+    batches = [all_item_ids[i:i + batch_size] for i in range(0, len(all_item_ids), batch_size)]
+    for batch in batches:
+      pagination = 1
+      more = True
+      while more and pagination <= MAX_STOCK_PAGES:
+        resp = requests.post(
+            f"{A1_BASE_URL}/Stock/Batch",
+            json={"Pagination": pagination, "ItemIDs": batch},
+            headers={"Content-Type": "application/json", "Authorization": token},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code != 200:
+          break
+        data = resp.json()
+        rows = data if isinstance(data, list) else data.get("Data", [])
+        for row in rows:
+          iid = row.get("ItemID")
+          if not iid:
+            continue
+          stock_lookup[iid] = stock_lookup.get(iid, 0) + (row.get("Qty") or 0)
+        more = data.get("More", False) if isinstance(data, dict) else False
+        pagination += 1
+
+    # ---- 銷售歷史：近N個月銷貨-銷退，含金額(算平均售價用) ----
+    end_date = datetime.now().date()
+    start_date = end_date - timedelta(days=months_back * 30)
+    qty_by_month_item = defaultdict(float)
+    amount_by_month_item = defaultdict(float)
+    name_by_item = {}
+
+    window_start = start_date
+    while window_start <= end_date:
+      window_end = min(window_start + timedelta(days=6), end_date)
+      for sale in fetch_sales_details_range(
+          token, window_start, window_end, "/Sales/PaginationQuery", "SaleDetails"
+      ):
+        year_month = str(sale.get("TradeDate", ""))[:7].replace("/", "-")
+        for detail in sale.get("SaleDetails", []) or []:
+          item_id = detail.get("ItemDetailID")
+          if not item_id:
+            continue
+          qty = float(detail.get("Qty") or 0)
+          amount = float(detail.get("Amount") or 0)
+          qty_by_month_item[(year_month, item_id)] += qty
+          amount_by_month_item[(year_month, item_id)] += amount
+          if detail.get("ItemName"):
+            name_by_item[item_id] = detail["ItemName"]
+      for ret in fetch_sales_details_range(
+          token, window_start, window_end, "/SaleReturns/PaginationQuery", "SaleReturnDetails"
+      ):
+        year_month = str(ret.get("TradeDate", ""))[:7].replace("/", "-")
+        for detail in ret.get("SaleReturnDetails", []) or []:
+          item_id = detail.get("ItemDetailID")
+          if not item_id:
+            continue
+          qty = float(detail.get("Qty") or 0)
+          amount = float(detail.get("Amount") or 0)
+          qty_by_month_item[(year_month, item_id)] -= qty
+          amount_by_month_item[(year_month, item_id)] -= amount
+          if detail.get("ItemName"):
+            name_by_item[item_id] = detail["ItemName"]
+      window_start = window_end + timedelta(days=1)
+
+    sales_history = [
+        {
+            "年月": year_month,
+            "品號": item_id,
+            "品名": items_map.get(item_id, {}).get("Name") or name_by_item.get(item_id, ""),
+            "銷售數量": round(qty, 2),
+            "銷售金額": round(amount_by_month_item.get((year_month, item_id), 0), 2),
+        }
+        for (year_month, item_id), qty in qty_by_month_item.items()
+    ]
+
+    return {
+        "items_map": items_map,
+        "stock_lookup": stock_lookup,
+        "sales_history": sales_history,
+    }, None
+  except Exception as e:
+    return None, str(e)
+
+
+def compute_suggested_procurement(items_map, stock_lookup):
+  """建議採購量（安全庫存基準）＝安全庫存(A1商品主檔設定) − 現有庫存，
+  只列出「有設定安全庫存」且「算出來需要採購」的品項。沒設定安全庫存
+  的品項沒有基準可比較，直接略過（不是庫存=0，是根本沒有這個判斷依據）。
+  """
+  rows = []
+  for item_id, info in items_map.items():
+    safety_stock = info.get("SafetyStock")
+    if safety_stock is None:
+      continue
+    try:
+      safety_stock = float(safety_stock)
+    except (TypeError, ValueError):
+      continue
+    current_stock = stock_lookup.get(item_id, 0) or 0
+    suggested_qty = safety_stock - current_stock
+    if suggested_qty <= 0:
+      continue
+    unit_cost = info.get("StdPurPrice") or 0
+    rows.append({
+        "品號": item_id,
+        "品名": info.get("Name", ""),
+        "商品分類": info.get("CategoryName") or "未分類",
+        "現有庫存": ceil_qty(current_stock),
+        "安全庫存": ceil_qty(safety_stock),
+        "建議採購量": ceil_qty(suggested_qty),
+        "預估採購成本": round(suggested_qty * unit_cost, 2),
+    })
+  rows.sort(key=lambda r: r["建議採購量"], reverse=True)
+  return rows
+
+
+def compute_simple_monthly_forecast(items_map, sales_history, months_for_avg=PROCUREMENT_ANALYSIS_LOOKBACK_MONTHS):
+  """簡化版月產銷分析：只分析「成品」跟「組合品」（見
+  is_finished_or_combo_category），不做BOM展開成原物料——直接用商品
+  本身的成本(StdPurPrice)和依銷售歷史反推的平均售價(銷售金額÷銷售數量)
+  來估算，適合本身就有明確成本/售價、不需要拆解用料的商品。
+  用近months_for_avg個月的平均銷量，估算「下個月大概要備多少貨」。
+  """
+  by_item = defaultdict(list)
+  for row in sales_history:
+    item_id = row["品號"]
+    if not is_finished_or_combo_category(items_map.get(item_id, {}).get("CategoryName")):
+      continue
+    by_item[item_id].append(row)
+
+  rows = []
+  for item_id, records in by_item.items():
+    records_sorted = sorted(records, key=lambda r: r["年月"])
+    recent = records_sorted[-months_for_avg:]
+    total_qty = sum(r["銷售數量"] for r in recent)
+    total_amount = sum(r.get("銷售金額", 0) for r in recent)
+    avg_qty = total_qty / len(recent) if recent else 0
+    avg_price = (total_amount / total_qty) if total_qty > 0 else 0
+
+    info = items_map.get(item_id, {})
+    unit_cost = info.get("StdPurPrice") or 0
+    est_qty = ceil_qty(avg_qty)
+
+    rows.append({
+        "品號": item_id,
+        "品名": info.get("Name") or (records[-1]["品名"] if records else ""),
+        "商品分類": info.get("CategoryName") or "未分類",
+        f"近{months_for_avg}月平均銷量": est_qty,
+        "平均售價": round(avg_price, 2),
+        "商品成本": round(unit_cost, 2),
+        "預估營收": round(est_qty * avg_price, 2),
+        "預估成本": round(est_qty * unit_cost, 2),
+        "預估毛利": round(est_qty * (avg_price - unit_cost), 2),
+    })
+  rows.sort(key=lambda r: r["預估營收"], reverse=True)
+  return rows
 
 
 def fetch_warehouses(token):
@@ -1771,10 +2112,17 @@ def compute_turnover_metrics(sales_history, stock_lookup, items_map, slow_moving
   """5.3 庫存週轉率／滯銷品分析：用「銷售歷史」Google Sheet 抓每個品號最近
   3 個月的月銷量，算出週轉天數 = 現有庫存 ÷ 日均銷量。週轉天數異常長（或
   完全沒賣出過、但還有庫存）就標記為滯銷。
+
+  只分析「成品」跟「組合品」兩個分類（見 is_finished_or_combo_category），
+  原料/物料/費用類不是賣給客戶的品項，週轉率對這些品項沒有意義，排除
+  掉才不會讓滯銷清單充滿一堆原物料雜訊。
   """
   by_item = defaultdict(list)
   for row in sales_history:
-    by_item[row["品號"]].append(row)
+    item_id = row["品號"]
+    if not is_finished_or_combo_category(items_map.get(item_id, {}).get("CategoryName")):
+      continue
+    by_item[item_id].append(row)
 
   results = []
   for item_id, records in by_item.items():
@@ -2450,6 +2798,20 @@ def inventory_dashboard():
       ("芙萊柏(股)公司", "官網-B'f"): (SHOPLINE_FULAIBO_ACCESS_TOKEN, SHOPLINE_FULAIBO_USER_AGENT),
   }
 
+  # 公司 -> 每日出貨要用的A1帳密(api_key, api_password)。目前只有興聖，
+  # 容鴻/芙萊柏之後拿到帳密再補進來即可，沒列出的公司會顯示佔位畫面。
+  DAILY_SHIPPING_CREDENTIALS = {
+      "興聖(股)公司": (A1_XINGSHENG_API_KEY, A1_XINGSHENG_API_PASSWORD),
+  }
+
+  # 公司 -> 採購分析要用的A1帳密(api_key, api_password)。目前是容鴻、
+  # 芙萊柏；興聖如果之後也要這個功能，可以直接沿用A1_XINGSHENG_API_KEY/
+  # PASSWORD，把這行也加進來即可。
+  PROCUREMENT_ANALYSIS_CREDENTIALS = {
+      "容鴻(股)公司": (A1_RONGHONG_API_KEY, A1_RONGHONG_API_PASSWORD),
+      "芙萊柏(股)公司": (A1_FULAIBO_API_KEY, A1_FULAIBO_API_PASSWORD),
+  }
+
   # 公司名稱轉成安全的英文代碼，用來組CSS class名稱（中文當class名稱在
   # 部分瀏覽器/選擇器語法下容易出錯，改用英文代碼比較保險）
   COMPANY_SLUGS = {
@@ -2457,6 +2819,323 @@ def inventory_dashboard():
       "容鴻(股)公司": "ronghong",
       "芙萊柏(股)公司": "fulaibo",
   }
+
+  def render_daily_shipping(api_key, api_password, company_label):
+    """分公司／每日出貨：抓鼎新A1銷貨單，依「銷貨單建立日期」區間彙總
+    品項數量＝揀貨表；下方另外提供一張「通路分類數量」讓人員手動填寫
+    （全家/7-11/黑貓/新竹/順豐/海外/其它，純手填，不會反查任何系統），
+    兩張表最後可以合併匯出成一份xlsx（兩個分頁）。
+    """
+    today_tw = (datetime.utcnow() + timedelta(hours=8)).date()
+    state = {"date_from": today_tw.isoformat(), "date_to": today_tw.isoformat()}
+    picking_rows_holder = {"rows": []}
+    channel_inputs = {}
+
+    ui.label(f"{company_label}・每日出貨（依銷貨單建立日期彙總）").classes(
+        "text-xs text-zinc-500 mb-3"
+    )
+
+    date_row = ui.row().classes("w-full items-end gap-3 mb-4 flex-wrap")
+
+    results_container = ui.column().classes("w-full")
+
+    def load_and_render():
+      picking_container.clear()
+      try:
+        d_from = datetime.strptime(state["date_from"], "%Y-%m-%d").date()
+        d_to = datetime.strptime(state["date_to"], "%Y-%m-%d").date()
+      except (ValueError, TypeError):
+        with picking_container:
+          ui.label("日期格式錯誤，請重新選擇").classes("text-xs text-red-500")
+        return
+      if d_from > d_to:
+        with picking_container:
+          ui.label("「起」不能晚於「迄」，請重新選擇").classes("text-xs text-red-500")
+        return
+
+      rows, error = fetch_daily_shipping_items(api_key, api_password, d_from, d_to)
+      if error:
+        with picking_container:
+          ui.label(f"抓取失敗：{error}").classes("text-xs text-red-500")
+        return
+      picking_rows_holder["rows"] = rows or []
+      with picking_container:
+        if not rows:
+          ui.label("此區間沒有銷貨單資料").classes("text-xs text-zinc-400")
+        else:
+          ui.table(
+              columns=[
+                  {"name": "品號", "label": "品號", "field": "品號", "align": "left", "sortable": True},
+                  {"name": "品名", "label": "品名", "field": "品名", "align": "left", "sortable": True},
+                  {"name": "數量", "label": "數量", "field": "數量", "align": "right", "sortable": True},
+              ],
+              rows=rows,
+              row_key="品號",
+              pagination={"rowsPerPage": 10, "sortBy": "數量", "descending": True},
+          ).classes("w-full").props(':rows-per-page-options="[10,30,50,0]"')
+
+    def set_date_from(e):
+      state["date_from"] = e.value or ""
+      load_and_render()
+
+    def set_date_to(e):
+      state["date_to"] = e.value or ""
+      load_and_render()
+
+    with date_row:
+      ui.input(
+          label="銷貨單建立日期 起", value=state["date_from"], on_change=set_date_from,
+      ).props('dense outlined type="date"').classes("w-44")
+      ui.input(
+          label="銷貨單建立日期 迄", value=state["date_to"], on_change=set_date_to,
+      ).props('dense outlined type="date"').classes("w-44")
+
+    with results_container:
+      with ui.card().classes(
+          "w-full p-6 bg-white border border-[#e2e1dc] shadow-none rounded-none mb-4"
+      ):
+        ui.label("揀貨表（依品號加總數量）").classes("text-sm font-bold text-zinc-700 mb-3")
+        picking_container = ui.column().classes("w-full")
+
+      with ui.card().classes(
+          "w-full p-6 bg-white border border-[#e2e1dc] shadow-none rounded-none"
+      ):
+        with ui.row().classes("w-full items-center justify-between mb-3"):
+          ui.label("通路分類數量（人員手動填寫，不會自動計算）").classes(
+              "text-sm font-bold text-zinc-700"
+          )
+
+          def handle_export():
+            try:
+              channel_rows = [
+                  {"通路": ch, "數量": int(inp.value or 0)}
+                  for ch, inp in channel_inputs.items()
+              ]
+              xlsx_bytes = multi_sheet_xlsx_bytes({
+                  "揀貨表": picking_rows_holder["rows"],
+                  "通路分類數量": channel_rows,
+              })
+              ui.download(
+                  xlsx_bytes,
+                  f"{company_label}每日出貨_{state['date_from']}_{state['date_to']}.xlsx",
+                  media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+              )
+            except Exception as e:
+              ui.notify(f"匯出失敗：{e}", color="negative")
+
+          ui.button("匯出 xlsx（揀貨表＋通路分類數量）", on_click=handle_export).classes(
+              "sync-btn px-3 py-1 text-xs rounded-none"
+          )
+
+        with ui.row().classes("w-full gap-3 flex-wrap"):
+          for ch in DAILY_SHIPPING_CHANNELS:
+            with ui.column().classes("gap-1"):
+              ui.label(ch).classes("text-xs text-zinc-500")
+              channel_inputs[ch] = ui.input(value="0").props(
+                  'dense outlined type="number"'
+              ).classes("w-24")
+
+    load_and_render()
+
+  def render_procurement_analysis(api_key, api_password, company_label):
+    """分公司／採購分析：建議採購量／庫存週轉／進貨明細(先佔位)／月產銷
+    分析，共用一次A1資料抓取(fetch_procurement_analysis_data)。跟海濤客
+    那份的差異：
+      - 銷售歷史直接即時從A1銷貨單算，不用另外維護Google Sheet
+      - 月產銷分析不做BOM展開，只看成品/組合品本身的成本/售價
+      - 進貨明細因為A1沒有查詢API、要另外維護Sheet，資料來源還沒確認，
+        先維持佔位畫面
+    """
+    data_holder = {"data": None, "error": None}
+    last_updated = {"time": ""}
+
+    def load_data():
+      data, error = fetch_procurement_analysis_data(api_key, api_password)
+      data_holder["data"] = data
+      data_holder["error"] = error
+      last_updated["time"] = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+
+    load_data()
+
+    refresh_row = ui.row().classes("w-full items-center gap-3 mb-3")
+
+    def render_refresh_row():
+      refresh_row.clear()
+      with refresh_row:
+        ui.label(f"資料更新時間：{last_updated['time']}").classes("text-xs text-zinc-400")
+
+        def handle_refresh():
+          load_data()
+          render_refresh_row()
+          render_tabs_content()
+          if data_holder["error"]:
+            ui.notify(f"重新整理失敗：{data_holder['error']}", color="negative")
+          else:
+            ui.notify("已重新整理", color="positive")
+
+        ui.button("🔄 重新整理", on_click=handle_refresh).props(
+            "dense no-caps unelevated"
+        ).classes("px-3 py-1 rounded-none text-xs").style(
+            "background:#ffffff !important; color:#4b5563 !important;"
+            " border:1px solid #e2e1dc;"
+        )
+
+    render_refresh_row()
+
+    body_container = ui.column().classes("w-full")
+
+    def render_tabs_content():
+      body_container.clear()
+      with body_container:
+        if data_holder["error"]:
+          render_section_placeholder(
+              "採購分析", f"抓取失敗：{data_holder['error']}"
+          )
+          return
+        data = data_holder["data"]
+        items_map = data["items_map"]
+        stock_lookup = data["stock_lookup"]
+        sales_history = data["sales_history"]
+
+        with ui.tabs().props("dense no-caps").classes("w-full") as pa_tabs:
+          pa_tab_procure = ui.tab("建議採購量")
+          pa_tab_turnover = ui.tab("庫存週轉")
+          pa_tab_receiving = ui.tab("進貨明細")
+          pa_tab_forecast = ui.tab("月產銷分析")
+
+        with ui.tab_panels(pa_tabs, value=pa_tab_procure).classes(
+            "w-full bg-transparent"
+        ):
+          with ui.tab_panel(pa_tab_procure):
+            rows = compute_suggested_procurement(items_map, stock_lookup)
+            with ui.card().classes(
+                "w-full p-6 bg-white border border-[#e2e1dc] shadow-none rounded-none"
+            ):
+              with ui.row().classes("w-full items-center justify-between mb-3"):
+                ui.label(
+                    f"建議採購量（安全庫存基準，共 {len(rows)} 項需要採購）"
+                ).classes("text-sm font-bold text-zinc-700")
+
+                def handle_export_procure():
+                  try:
+                    xlsx_bytes = rows_to_xlsx_bytes(rows, sheet_name="建議採購量")
+                    ui.download(
+                        xlsx_bytes, f"{company_label}建議採購量.xlsx",
+                        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                  except Exception as e:
+                    ui.notify(f"匯出失敗：{e}", color="negative")
+
+                ui.button("匯出 xlsx", on_click=handle_export_procure).classes(
+                    "sync-btn px-3 py-1 text-xs rounded-none"
+                )
+              if not rows:
+                ui.label("目前沒有品項需要採購（或商品主檔都沒設定安全庫存）").classes(
+                    "text-xs text-zinc-400"
+                )
+              else:
+                ui.table(
+                    columns=[
+                        {"name": c, "label": c, "field": c,
+                         "align": "left" if c in ("品號", "品名", "商品分類") else "right",
+                         "sortable": True}
+                        for c in rows[0].keys()
+                    ],
+                    rows=rows, row_key="品號",
+                    pagination={"rowsPerPage": 10, "sortBy": "建議採購量", "descending": True},
+                ).classes("w-full").props(':rows-per-page-options="[10,30,50,0]"')
+
+          with ui.tab_panel(pa_tab_turnover):
+            rows = compute_turnover_metrics(sales_history, stock_lookup, items_map)
+            slow_count = sum(1 for r in rows if r["滯銷"] == "是")
+            with ui.card().classes(
+                "w-full p-6 bg-white border border-[#e2e1dc] shadow-none rounded-none"
+            ):
+              with ui.row().classes("w-full items-center justify-between mb-3"):
+                ui.label(
+                    f"庫存週轉率／滯銷品分析（共 {len(rows)} 項，其中 "
+                    f"{slow_count} 項判定為滯銷；只分析成品/組合品）"
+                ).classes("text-sm font-bold text-zinc-700")
+
+                def handle_export_turnover():
+                  try:
+                    xlsx_bytes = rows_to_xlsx_bytes(rows, sheet_name="庫存週轉")
+                    ui.download(
+                        xlsx_bytes, f"{company_label}庫存週轉分析.xlsx",
+                        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                  except Exception as e:
+                    ui.notify(f"匯出失敗：{e}", color="negative")
+
+                ui.button("匯出 xlsx", on_click=handle_export_turnover).classes(
+                    "sync-btn px-3 py-1 text-xs rounded-none"
+                )
+              if not rows:
+                ui.label("目前沒有成品/組合品的銷售歷史資料").classes("text-xs text-zinc-400")
+              else:
+                ui.table(
+                    columns=[
+                        {"name": c, "label": c, "field": c,
+                         "align": "left" if c in ("品號", "品名", "滯銷") else "right",
+                         "sortable": True}
+                        for c in rows[0].keys()
+                    ],
+                    rows=rows, row_key="品號",
+                    pagination={"rowsPerPage": 10, "sortBy": "庫存週轉天數", "descending": True},
+                ).classes("w-full").props(':rows-per-page-options="[10,30,50,0]"')
+
+          with ui.tab_panel(pa_tab_receiving):
+            render_section_placeholder(
+                "進貨明細",
+                "資料來源尚未確認（A1沒有進貨查詢API，需要額外維護"
+                "Google Sheet），敬請期待",
+            )
+
+          with ui.tab_panel(pa_tab_forecast):
+            rows = compute_simple_monthly_forecast(items_map, sales_history)
+            with ui.card().classes(
+                "w-full p-6 bg-white border border-[#e2e1dc] shadow-none rounded-none"
+            ):
+              with ui.row().classes(
+                  "w-full p-3 mb-3 bg-[#fff8e6] border border-[#f0dca0]"
+              ):
+                ui.label(
+                    "簡化版：只分析成品/組合品，用商品本身的成本與依銷售"
+                    "歷史反推的平均售價估算，不做BOM展開成原物料。"
+                ).classes("text-xs text-amber-800")
+              with ui.row().classes("w-full items-center justify-between mb-3"):
+                ui.label(f"月產銷分析（共 {len(rows)} 項）").classes(
+                    "text-sm font-bold text-zinc-700"
+                )
+
+                def handle_export_forecast():
+                  try:
+                    xlsx_bytes = rows_to_xlsx_bytes(rows, sheet_name="月產銷分析")
+                    ui.download(
+                        xlsx_bytes, f"{company_label}月產銷分析.xlsx",
+                        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                  except Exception as e:
+                    ui.notify(f"匯出失敗：{e}", color="negative")
+
+                ui.button("匯出 xlsx", on_click=handle_export_forecast).classes(
+                    "sync-btn px-3 py-1 text-xs rounded-none"
+                )
+              if not rows:
+                ui.label("目前沒有成品/組合品的銷售歷史資料").classes("text-xs text-zinc-400")
+              else:
+                ui.table(
+                    columns=[
+                        {"name": c, "label": c, "field": c,
+                         "align": "left" if c in ("品號", "品名", "商品分類") else "right",
+                         "sortable": True}
+                        for c in rows[0].keys()
+                    ],
+                    rows=rows, row_key="品號",
+                    pagination={"rowsPerPage": 10, "sortBy": "預估營收", "descending": True},
+                ).classes("w-full").props(':rows-per-page-options="[10,30,50,0]"')
+
+    render_tabs_content()
 
   def render_channel_company_page(company_name):
     """興聖(股)公司／容鴻(股)公司／芙萊柏(股)公司 共用的頁面骨架：
@@ -2482,6 +3161,7 @@ def inventory_dashboard():
           tab_ch_daily_shipping = ui.tab("每日出貨")
           tab_ch_transfer = ui.tab("調撥紀錄")
           tab_ch_returns = ui.tab("退換貨記錄")
+          tab_ch_procurement = ui.tab("採購分析")
         # 只套用在這組分頁自己身上（用.section-tabs-xxx限定範圍），
         # 不會影響到最上面的公司切換列或其他分公司頁面的分頁顏色
         ui.add_head_html(
@@ -2517,13 +3197,24 @@ def inventory_dashboard():
                     )
 
           with ui.tab_panel(tab_ch_daily_shipping):
-            render_section_placeholder("每日出貨")
+            daily_shipping_creds = DAILY_SHIPPING_CREDENTIALS.get(company_name)
+            if daily_shipping_creds:
+              render_daily_shipping(daily_shipping_creds[0], daily_shipping_creds[1], company_name)
+            else:
+              render_section_placeholder("每日出貨")
 
           with ui.tab_panel(tab_ch_transfer):
             render_section_placeholder("調撥紀錄")
 
           with ui.tab_panel(tab_ch_returns):
             render_section_placeholder("退換貨記錄")
+
+          with ui.tab_panel(tab_ch_procurement):
+            procurement_creds = PROCUREMENT_ANALYSIS_CREDENTIALS.get(company_name)
+            if procurement_creds:
+              render_procurement_analysis(procurement_creds[0], procurement_creds[1], company_name)
+            else:
+              render_section_placeholder("採購分析")
 
   def render_hai_tao_ke_page():
     content_container.clear()
@@ -2992,146 +3683,13 @@ def inventory_dashboard():
           # ==================================================
           with ui.tab_panel(tab_products_group):
             with ui.tabs().classes("w-full mb-2") as sub_tabs:
-              tab_products = ui.tab("商品資料")
               tab_inventory = ui.tab("庫存查詢")
               tab_bom = ui.tab("商品組合(BOM)")
               tab_lotno = ui.tab("批號效期")
 
-            with ui.tab_panels(sub_tabs, value=tab_products).classes(
+            with ui.tab_panels(sub_tabs, value=tab_inventory).classes(
                 "w-full bg-transparent"
             ):
-              # ---------------- 2.1：商品資料 ----------------
-              with ui.tab_panel(tab_products):
-                with ui.card().classes(
-                    "w-full p-6 bg-white border border-[#e2e1dc] shadow-none"
-                    " rounded-none"
-                ):
-                  with ui.row().classes("items-center gap-3 flex-wrap mb-2"):
-                    cat_options_p = ["全部分類"] + app_state["categories"]
-                    cat_select_p = ui.select(
-                        options=cat_options_p, value="全部分類"
-                    ).classes(
-                        "bg-[#f7f6f2] text-zinc-900 rounded-none px-3 py-1"
-                        " text-xs font-bold border border-[#e2e1dc]"
-                    )
-                    search_input_p = ui.input(
-                        placeholder="輸入品號或品名關鍵字..."
-                    ).classes("w-64 text-xs")
-
-                  products_stats_label = ui.label().classes(
-                      "text-xs text-zinc-500 mb-3"
-                  )
-                  products_container = ui.row().classes("w-full flex-wrap gap-4")
-
-                  def update_products_grid():
-                    products_container.clear()
-                    df = app_state["df"].copy()
-
-                    if df.empty:
-                      products_stats_label.text = "目前尚無商品資料"
-                      with products_container:
-                        ui.label("請先按右上角「同步 A1 最新庫存」").classes(
-                            "text-xs text-zinc-400"
-                        )
-                      return
-
-                    # 舊資料（或防呆資料）可能沒有「圖片」欄位，這裡先補上避免
-                    # groupby 時噴錯
-                    if "圖片" not in df.columns:
-                      df["圖片"] = None
-
-                    # 依品號彙整（同一品號在不同倉庫的庫存加總，
-                    # 品名/分類/單位/平均成本/圖片取第一筆即可，均來自商品主檔）
-                    catalog = df.groupby("品號", as_index=False).agg({
-                        "品名": "first",
-                        "商品分類": "first",
-                        "單位": "first",
-                        "平均成本": "first",
-                        "庫存數量": "sum",
-                        "圖片": "first",
-                    })
-
-                    if (
-                        cat_select_p.value
-                        and cat_select_p.value != "全部分類"
-                    ):
-                      catalog = catalog[
-                          catalog["商品分類"] == cat_select_p.value
-                      ]
-
-                    keyword = (search_input_p.value or "").strip()
-                    if keyword:
-                      mask = catalog["品號"].astype(str).str.contains(
-                          keyword, case=False, na=False
-                      ) | catalog["品名"].astype(str).str.contains(
-                          keyword, case=False, na=False
-                      )
-                      catalog = catalog[mask]
-
-                    products_stats_label.text = f"共 {len(catalog)} 項商品"
-
-                    with products_container:
-                      for _, row in catalog.iterrows():
-                        item_name = safe_text(row["品名"], "(未命名商品)")
-                        initial = item_name[0] if item_name else "?"
-                        with ui.card().classes(
-                            "w-56 p-4 bg-white border border-[#e2e1dc]"
-                            " shadow-none rounded-none"
-                        ):
-                          # 依手冊 ItemImage[Get] 抓取的商品圖片（已轉成 base64
-                          # data URI）；沒有上傳過圖片的商品，改用品名首字當
-                          # 預留圖示。
-                          # 注意：若整欄「圖片」都是 None，pandas 會把該欄自動
-                          # 轉成 float64 的 NaN，而 Python 的 bool(nan) 是
-                          # True，用 `if image_uri:` 判斷會誤把 NaN 當成「有
-                          # 圖片」，把 NaN 傳進 ui.image() 造成 TypeError。
-                          # 因此這裡明確要求是非空字串才視為有圖片。
-                          image_uri = row.get("圖片")
-                          has_image = (
-                              isinstance(image_uri, str) and bool(image_uri)
-                          )
-                          with ui.row().classes(
-                              "w-full items-center justify-center mb-2"
-                          ):
-                            if has_image:
-                              ui.image(image_uri).classes(
-                                  "w-14 h-14 rounded-full object-cover"
-                              )
-                            else:
-                              ui.label(initial).classes(
-                                  "w-14 h-14 flex items-center justify-center"
-                                  " rounded-full bg-[#5bc0be] text-white text-xl"
-                                  " font-black"
-                              )
-                          ui.label(item_name).classes(
-                              "text-sm font-bold text-zinc-900 text-center"
-                              " w-full truncate"
-                          )
-                          ui.label(f"品號：{row['品號']}").classes(
-                              "text-xs text-zinc-500 text-center w-full"
-                          )
-                          ui.label(safe_text(row["商品分類"], "未分類")).classes(
-                              "text-xs text-center w-full text-[#5bc0be]"
-                              " font-bold mt-1"
-                          )
-                          ui.separator().classes("my-2")
-                          with ui.row().classes(
-                              "w-full justify-between text-xs text-zinc-700"
-                          ):
-                            ui.label(
-                                f"庫存：{ceil_qty(row['庫存數量'])} {safe_text(row['單位'])}"
-                            )
-                            ui.label(f"成本：{row['平均成本']:.2f}")
-
-                  cat_select_p.on_value_change(lambda e: update_products_grid())
-                  search_input_p.on_value_change(
-                      lambda e: update_products_grid()
-                  )
-                  update_products_grid()
-
-                  refs["cat_select_p"] = cat_select_p
-                  refs["update_products_grid"] = update_products_grid
-
               # ---------------- 2.3：庫存即時查詢 ----------------
               with ui.tab_panel(tab_inventory):
                 with ui.card().classes(
