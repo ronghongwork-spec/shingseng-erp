@@ -115,18 +115,29 @@ MAX_STOCK_PAGES = 1000  # 分頁安全上限，避免 More 一直為 true 造成
 ITEM_DETAIL_WORKERS = 8  # 平行抓取商品明細的執行緒數
 
 # -------------------------------------------------------------------------
-# 興聖(股)公司｜SHOPLINE 官網訂單
+# SHOPLINE 官網訂單串接（目前有3個據點，各自獨立帳密）
 # 文件：https://open-api.docs.shoplineapp.com/docs/search-orders
 # .env 需設定：
-#   SHOPLINE_XINGSHENG_ACCESS_TOKEN=（SHOPLINE後台管理員設定產生的token）
-#   SHOPLINE_XINGSHENG_USER_AGENT=（識別用字串，無嚴格規定，已實測 "Xingsheng-ERP" 可用）
+#   興聖(股)公司／官網(海濤客)：
+#     SHOPLINE_XINGSHENG_ACCESS_TOKEN=
+#     SHOPLINE_XINGSHENG_USER_AGENT=（已實測 "Xingsheng-ERP" 可用）
+#   興聖(股)公司／官網(JDH)：
+#     SHOPLINE_XINGSHENG_JDH_ACCESS_TOKEN=
+#     SHOPLINE_XINGSHENG_JDH_USER_AGENT=
+#   芙萊柏(股)公司／官網-B'f：
+#     SHOPLINE_FULAIBO_ACCESS_TOKEN=
+#     SHOPLINE_FULAIBO_USER_AGENT=
 # -------------------------------------------------------------------------
 SHOPLINE_API_DOMAIN = "https://open.shopline.io"
 SHOPLINE_XINGSHENG_ACCESS_TOKEN = os.environ.get("SHOPLINE_XINGSHENG_ACCESS_TOKEN", "")
 SHOPLINE_XINGSHENG_USER_AGENT = os.environ.get("SHOPLINE_XINGSHENG_USER_AGENT", "")
+SHOPLINE_XINGSHENG_JDH_ACCESS_TOKEN = os.environ.get("SHOPLINE_XINGSHENG_JDH_ACCESS_TOKEN", "")
+SHOPLINE_XINGSHENG_JDH_USER_AGENT = os.environ.get("SHOPLINE_XINGSHENG_JDH_USER_AGENT", "")
+SHOPLINE_FULAIBO_ACCESS_TOKEN = os.environ.get("SHOPLINE_FULAIBO_ACCESS_TOKEN", "")
+SHOPLINE_FULAIBO_USER_AGENT = os.environ.get("SHOPLINE_FULAIBO_USER_AGENT", "")
 
 
-SHOPLINE_STATUSES_FOR_XINGSHENG = ["pending", "confirmed"]  # 待處理+已確認
+SHOPLINE_ORDER_STATUSES = ["pending", "confirmed"]  # 待處理+已確認
 SHOPLINE_LOOKBACK_DAYS = 90  # 訂單建立時間往前推3個月
 
 # 送貨方式關鍵字分類：先比對已知物流商關鍵字，再比對溫層關鍵字，
@@ -157,7 +168,7 @@ def fetch_shopline_orders(access_token, user_agent, statuses, created_after):
   回傳 (orders, error_message)。
   """
   if not access_token or not user_agent:
-    return None, "尚未設定 SHOPLINE_XINGSHENG_ACCESS_TOKEN / SHOPLINE_XINGSHENG_USER_AGENT"
+    return None, "尚未設定 access_token / user_agent"
   try:
     all_orders = []
     page = 1
@@ -2163,30 +2174,30 @@ def inventory_dashboard():
       ui.label(title).classes("text-sm font-bold text-zinc-700 mb-2")
       ui.label(hint).classes("text-xs text-zinc-500")
 
-  def render_shopline_pending_orders():
-    """興聖(股)公司／訂單出貨／SHOPLINE官網（海濤客品牌）：
+  def render_shopline_channel(access_token, user_agent, channel_title):
+    """SHOPLINE官網訂單通路的共用畫面（興聖官網(海濤客)／官網(JDH)／
+    芙萊柏官網-B'f 都呼叫這支，只是傳入的access_token/user_agent/標題不同）。
     抓近3個月「待處理」+「已確認」訂單，畫面：
       1. 篩選工具列（放在最上方，一進分頁就看得到）：狀態(全部/待處理/
          已確認，各自帶筆數)、送貨方式下拉選單(全送貨方式+各送貨方式，
          數字會依目前選的狀態即時重算)、商品關鍵字搜尋、匯出xlsx
       2. 商品需求彙總表：依目前篩選條件即時算出的SKU加總結果，商品名稱
-         欄位可排序。所有篩選都是在「已經抓好的資料」裡做，不會重打API，
-         切換很快；不顯示每張訂單的明細。
+         欄位可排序，右下角可切換每頁顯示筆數(10/30/50/全部)，不用一直
+         往下滑。所有篩選都是在「已經抓好的資料」裡做，不會重打API。
     每次「切換到這個分頁」才會重新打一次API抓最新資料。
     """
     created_after = (
         datetime.utcnow() - timedelta(days=SHOPLINE_LOOKBACK_DAYS)
     ).strftime("%Y-%m-%d %H:%M:%S")
     orders, error = fetch_shopline_orders(
-        SHOPLINE_XINGSHENG_ACCESS_TOKEN, SHOPLINE_XINGSHENG_USER_AGENT,
-        SHOPLINE_STATUSES_FOR_XINGSHENG, created_after,
+        access_token, user_agent, SHOPLINE_ORDER_STATUSES, created_after,
     )
     if error:
-      render_section_placeholder("訂單出貨－SHOPLINE官網", f"抓取失敗：{error}")
+      render_section_placeholder(f"訂單出貨－{channel_title}", f"抓取失敗：{error}")
       return
     if not orders:
       render_section_placeholder(
-          "訂單出貨－SHOPLINE官網", "近3個月沒有待處理或已確認的訂單"
+          f"訂單出貨－{channel_title}", "近3個月沒有待處理或已確認的訂單"
       )
       return
 
@@ -2246,7 +2257,7 @@ def inventory_dashboard():
         ).props("dense outlined clearable").classes("w-56")
 
     ui.label(
-        f"SHOPLINE官網（海濤客品牌）・近{SHOPLINE_LOOKBACK_DAYS}天訂單建立時間"
+        f"{channel_title}・近{SHOPLINE_LOOKBACK_DAYS}天訂單建立時間"
     ).classes("text-xs text-zinc-500 mb-3")
 
     results_container = ui.column().classes("w-full")
@@ -2271,7 +2282,7 @@ def inventory_dashboard():
                 xlsx_bytes = rows_to_xlsx_bytes(rows, sheet_name="商品需求彙總")
                 ui.download(
                     xlsx_bytes,
-                    "SHOPLINE官網商品需求彙總.xlsx",
+                    f"{channel_title}商品需求彙總.xlsx",
                     media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
               except Exception as e:
@@ -2284,6 +2295,8 @@ def inventory_dashboard():
           if not rows:
             ui.label("目前沒有符合篩選條件的品項").classes("text-xs text-zinc-400")
           else:
+            # rows-per-page-options 用 Quasar 慣例：0 代表「全部」，
+            # 表格右下角會有內建的每頁筆數切換選單(10/30/50/全部)。
             ui.table(
                 columns=[
                     {"name": "SKU", "label": "SKU", "field": "SKU", "align": "left", "sortable": True},
@@ -2292,7 +2305,8 @@ def inventory_dashboard():
                 ],
                 rows=rows,
                 row_key="SKU",
-            ).classes("w-full")
+                pagination={"rowsPerPage": 10, "sortBy": "需求數量", "descending": True},
+            ).classes("w-full").props(':rows-per-page-options="[10,30,50,0]"')
 
     def set_status_filter(v):
       state["status_filter"] = v
@@ -2313,12 +2327,22 @@ def inventory_dashboard():
 
 
   # 訂單出貨底下的通路子分頁，之後每個通路會各自串不同的訂單來源API。
-  # 各分公司實際通路不完全一樣（例如興聖沒有蝦皮），用字典各自設定；
-  # 沒特別列出的公司預設用完整4通路。
+  # 各分公司實際通路不完全一樣，用字典各自設定；沒特別列出的公司預設
+  # 用完整4通路。
   ORDER_CHANNELS_BY_COMPANY = {
-      "興聖(股)公司": ["SHOPLINE官網", "經銷", "其它"],  # 興聖沒有蝦皮通路
+      # 興聖沒有蝦皮通路，官網部分有兩個獨立SHOPLINE據點：海濤客品牌、JDH
+      "興聖(股)公司": ["官網(海濤客)", "官網(JDH)", "經銷", "其它"],
+      # 芙萊柏的官網通路標籤用他們自己的代稱
+      "芙萊柏(股)公司": ["官網-B'f", "蝦皮", "經銷", "其它"],
   }
   DEFAULT_ORDER_CHANNELS = ["SHOPLINE官網", "蝦皮", "經銷", "其它"]
+
+  # (公司, 通路標籤) -> 呼叫render_shopline_channel()要用的(access_token, user_agent)
+  SHOPLINE_CHANNEL_CREDENTIALS = {
+      ("興聖(股)公司", "官網(海濤客)"): (SHOPLINE_XINGSHENG_ACCESS_TOKEN, SHOPLINE_XINGSHENG_USER_AGENT),
+      ("興聖(股)公司", "官網(JDH)"): (SHOPLINE_XINGSHENG_JDH_ACCESS_TOKEN, SHOPLINE_XINGSHENG_JDH_USER_AGENT),
+      ("芙萊柏(股)公司", "官網-B'f"): (SHOPLINE_FULAIBO_ACCESS_TOKEN, SHOPLINE_FULAIBO_USER_AGENT),
+  }
 
   # 公司名稱轉成安全的英文代碼，用來組CSS class名稱（中文當class名稱在
   # 部分瀏覽器/選擇器語法下容易出錯，改用英文代碼比較保險）
@@ -2377,8 +2401,9 @@ def inventory_dashboard():
             ).classes("w-full bg-transparent"):
               for ch, ch_tab in zip(order_channels, channel_tab_objs):
                 with ui.tab_panel(ch_tab):
-                  if company_name == "興聖(股)公司" and ch == "SHOPLINE官網":
-                    render_shopline_pending_orders()
+                  shopline_creds = SHOPLINE_CHANNEL_CREDENTIALS.get((company_name, ch))
+                  if shopline_creds:
+                    render_shopline_channel(shopline_creds[0], shopline_creds[1], ch)
                   else:
                     render_section_placeholder(
                         f"訂單出貨－{ch}",
