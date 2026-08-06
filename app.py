@@ -191,9 +191,9 @@ def fetch_shopline_orders(access_token, user_agent, statuses, created_after):
 
 
 def compute_shopline_stats(orders):
-  """算總覽統計：待處理/已確認筆數，以及各送貨方式的訂單筆數（一張訂單不
-  管裡面有幾個商品，都只算一次），用來在畫面最上方顯示總覽卡片/下拉選單。
-  """
+  """算總覽統計：待處理/已確認筆數（全部訂單，不受篩選影響），以及全部
+  送貨方式名單（用來讓下拉選單的選項順序/項目固定，不會因為篩選而忽多
+  忽少）。"""
   stats = {"pending": 0, "confirmed": 0, "delivery_counts": {}}
   for o in orders:
     st = o.get("status")
@@ -205,6 +205,25 @@ def compute_shopline_stats(orders):
     group = classify_shopline_delivery_method(delivery_label)
     stats["delivery_counts"][group] = stats["delivery_counts"].get(group, 0) + 1
   return stats
+
+
+def compute_shopline_delivery_counts(orders, status_filter="all"):
+  """算「送貨方式→筆數」，但只算status_filter篩選後的訂單。用來讓送貨
+  方式下拉選單的數字跟著目前選擇的待處理/已確認/全部即時更新，例如選
+  「待處理」時，各送貨方式的筆數加總起來會等於待處理總筆數。
+  """
+  if status_filter in ("pending", "confirmed"):
+    filtered = [o for o in orders if o.get("status") == status_filter]
+  else:
+    filtered = orders
+  counts = {}
+  for o in filtered:
+    label = (
+        (o.get("order_delivery") or {}).get("name_translations") or {}
+    ).get("zh-hant", "")
+    group = classify_shopline_delivery_method(label)
+    counts[group] = counts.get(group, 0) + 1
+  return counts
 
 
 def compute_shopline_sku_rows(orders, status_filter="all", delivery_filter="all", keyword=""):
@@ -2147,8 +2166,9 @@ def inventory_dashboard():
   def render_shopline_pending_orders():
     """興聖(股)公司／訂單出貨／SHOPLINE官網（海濤客品牌）：
     抓近3個月「待處理」+「已確認」訂單，畫面：
-      1. 篩選工具列：狀態(全部/待處理/已確認，各自帶筆數)、送貨方式下拉
-         選單(全送貨方式+各送貨方式，各自帶筆數)、商品關鍵字搜尋、匯出xlsx
+      1. 篩選工具列（放在最上方，一進分頁就看得到）：狀態(全部/待處理/
+         已確認，各自帶筆數)、送貨方式下拉選單(全送貨方式+各送貨方式，
+         數字會依目前選的狀態即時重算)、商品關鍵字搜尋、匯出xlsx
       2. 商品需求彙總表：依目前篩選條件即時算出的SKU加總結果，商品名稱
          欄位可排序。所有篩選都是在「已經抓好的資料」裡做，不會重打API，
          切換很快；不顯示每張訂單的明細。
@@ -2170,12 +2190,64 @@ def inventory_dashboard():
       )
       return
 
+    stats = compute_shopline_stats(orders)
+    state = {"status_filter": "all", "delivery_filter": "all", "keyword": ""}
+
+    # ---- 篩選工具列：放在最上方（在說明文字跟結果表格之前）----
+    toolbar_container = ui.row().classes("w-full items-end gap-3 mb-1 flex-wrap")
+
+    def render_toolbar():
+      toolbar_container.clear()
+      with toolbar_container:
+        status_options = [
+            ("全部", "all"),
+            (f"待處理 ({stats['pending']})", "pending"),
+            (f"已確認 ({stats['confirmed']})", "confirmed"),
+        ]
+        with ui.row().classes("gap-2"):
+          for label, value in status_options:
+            is_active = value == state["status_filter"]
+            bg = "#5bc0be" if is_active else "#ffffff"
+            fg = "#ffffff" if is_active else "#4b5563"
+            border = "#5bc0be" if is_active else "#e2e1dc"
+            # 用行內 style 強制指定顏色，避免被 NiceGUI/Quasar 按鈕預設的
+            # 文字顏色蓋掉（Tailwind的class在這裡權重會輸給Quasar內建樣式，
+            # 導致文字顏色跟背景一樣、整個看起來像空白按鈕）。
+            ui.button(
+                label, on_click=lambda v=value: set_status_filter(v)
+            ).props("dense no-caps unelevated").classes(
+                "px-4 py-1 rounded-none"
+            ).style(
+                f"background:{bg} !important; color:{fg} !important;"
+                f" border:1px solid {border};"
+            )
+
+        delivery_counts_now = compute_shopline_delivery_counts(
+            orders, state["status_filter"]
+        )
+        total_now = sum(delivery_counts_now.values())
+        # 選項名單固定用全部送貨方式（避免篩選後某個方式暫時是0筆就從
+        # 選單裡消失），但數字用目前狀態篩選後的筆數，兩者分開處理
+        delivery_select_options = {"all": f"全送貨方式 ({total_now})"}
+        for method in sorted(stats["delivery_counts"].keys()):
+          cnt = delivery_counts_now.get(method, 0)
+          delivery_select_options[method] = f"{method} ({cnt})"
+        ui.select(
+            options=delivery_select_options,
+            value=state["delivery_filter"],
+            on_change=set_delivery_filter,
+            label="送貨方式",
+        ).props("dense outlined").classes("w-48")
+
+        ui.input(
+            label="搜尋商品關鍵字",
+            value=state["keyword"],
+            on_change=set_keyword,
+        ).props("dense outlined clearable").classes("w-56")
+
     ui.label(
         f"SHOPLINE官網（海濤客品牌）・近{SHOPLINE_LOOKBACK_DAYS}天訂單建立時間"
     ).classes("text-xs text-zinc-500 mb-3")
-
-    stats = compute_shopline_stats(orders)
-    state = {"status_filter": "all", "delivery_filter": "all", "keyword": ""}
 
     results_container = ui.column().classes("w-full")
 
@@ -2234,47 +2306,6 @@ def inventory_dashboard():
     def set_keyword(e):
       state["keyword"] = e.value
       refresh_results()
-
-    toolbar_container = ui.row().classes("w-full items-end gap-3 mb-4 flex-wrap")
-
-    def render_toolbar():
-      toolbar_container.clear()
-      with toolbar_container:
-        status_options = [
-            ("全部", "all"),
-            (f"待處理 ({stats['pending']})", "pending"),
-            (f"已確認 ({stats['confirmed']})", "confirmed"),
-        ]
-        with ui.row().classes("gap-2"):
-          for label, value in status_options:
-            is_active = value == state["status_filter"]
-            ui.button(
-                label, on_click=lambda v=value: set_status_filter(v)
-            ).props("dense no-caps").classes(
-                "px-4 py-1 rounded-none "
-                + (
-                    "bg-[#5bc0be] text-white"
-                    if is_active
-                    else "bg-white text-zinc-600 border border-[#e2e1dc]"
-                )
-            )
-
-        total_delivery_orders = sum(stats["delivery_counts"].values())
-        delivery_select_options = {"all": f"全送貨方式 ({total_delivery_orders})"}
-        for method, cnt in sorted(stats["delivery_counts"].items()):
-          delivery_select_options[method] = f"{method} ({cnt})"
-        ui.select(
-            options=delivery_select_options,
-            value=state["delivery_filter"],
-            on_change=set_delivery_filter,
-            label="送貨方式",
-        ).props("dense outlined").classes("w-48")
-
-        ui.input(
-            label="搜尋商品關鍵字",
-            value=state["keyword"],
-            on_change=set_keyword,
-        ).props("dense outlined clearable").classes("w-56")
 
     render_toolbar()
     refresh_results()
