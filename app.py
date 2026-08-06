@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import concurrent.futures
 import io
@@ -9,7 +10,7 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timedelta
 
-from nicegui import app, ui
+from nicegui import app, run, ui
 import pandas as pd
 import requests
 from starlette.responses import Response
@@ -2594,7 +2595,7 @@ def inventory_dashboard():
       ui.label(title).classes("text-sm font-bold text-zinc-700 mb-2")
       ui.label(hint).classes("text-xs text-zinc-500")
 
-  def render_shopline_channel(access_token, user_agent, channel_title):
+  async def render_shopline_channel(access_token, user_agent, channel_title):
     """SHOPLINE官網訂單通路的共用畫面（興聖官網(海濤客)／官網(JDH)／
     芙萊柏官網-B'f 都呼叫這支，只是傳入的access_token/user_agent/標題不同）。
     抓近3個月「待處理」+「已確認」訂單，畫面：
@@ -2606,6 +2607,11 @@ def inventory_dashboard():
          往下滑。所有篩選都是在「已經抓好的資料」裡做，不會重打API。
     每次「切換到這個分頁」都會重新打一次API抓最新資料；分頁內也有「重新
     整理」按鈕，不用離開分頁再切回來也能手動重抓一次。
+
+    這支是async函式，實際打API的地方都用 run.io_bound() 包起來，讓抓資料
+    這段「同步阻塞」的過程丟到背景執行緒跑，不會卡住整個伺服器的事件
+    迴圈──不然一個人切到這個分頁在等API回應時，全部人的畫面都會跟著
+    卡住沒反應。
     """
     def fetch_data():
       created_after = (
@@ -2615,7 +2621,7 @@ def inventory_dashboard():
           access_token, user_agent, SHOPLINE_ORDER_STATUSES, created_after,
       )
 
-    orders, error = fetch_data()
+    orders, error = await run.io_bound(fetch_data)
     if error:
       render_section_placeholder(f"訂單出貨－{channel_title}", f"抓取失敗：{error}")
       return
@@ -2641,9 +2647,9 @@ def inventory_dashboard():
       with refresh_row:
         ui.label(f"資料更新時間：{last_updated}").classes("text-xs text-zinc-400")
 
-        def handle_refresh():
+        async def handle_refresh():
           nonlocal orders, stats, last_updated
-          new_orders, err = fetch_data()
+          new_orders, err = await run.io_bound(fetch_data)
           if err:
             ui.notify(f"重新整理失敗：{err}", color="negative")
             return
@@ -2848,11 +2854,14 @@ def inventory_dashboard():
       "芙萊柏(股)公司": "fulaibo",
   }
 
-  def render_daily_shipping(api_key, api_password, company_label):
+  async def render_daily_shipping(api_key, api_password, company_label):
     """分公司／每日出貨：抓鼎新A1銷貨單，依「銷貨單建立日期」區間彙總
     品項數量＝揀貨表；下方另外提供一張「通路分類數量」讓人員手動填寫
     （全家/7-11/黑貓/新竹/順豐/海外/其它，純手填，不會反查任何系統），
     兩張表最後可以合併匯出成一份xlsx（兩個分頁）。
+
+    這支是async函式，實際打A1 API的地方用run.io_bound()包起來，避免
+    卡住整個伺服器的事件迴圈。
     """
     today_tw = (datetime.utcnow() + timedelta(hours=8)).date()
     state = {"date_from": today_tw.isoformat(), "date_to": today_tw.isoformat()}
@@ -2867,7 +2876,7 @@ def inventory_dashboard():
 
     results_container = ui.column().classes("w-full")
 
-    def load_and_render():
+    async def load_and_render():
       picking_container.clear()
       try:
         d_from = datetime.strptime(state["date_from"], "%Y-%m-%d").date()
@@ -2881,7 +2890,15 @@ def inventory_dashboard():
           ui.label("「起」不能晚於「迄」，請重新選擇").classes("text-xs text-red-500")
         return
 
-      rows, error = fetch_daily_shipping_items(api_key, api_password, d_from, d_to)
+      with picking_container:
+        with ui.row().classes("items-center gap-2 p-4"):
+          ui.spinner(size="20px").classes("text-zinc-400")
+          ui.label("抓取中…").classes("text-xs text-zinc-500")
+
+      rows, error = await run.io_bound(
+          fetch_daily_shipping_items, api_key, api_password, d_from, d_to
+      )
+      picking_container.clear()
       if error:
         with picking_container:
           ui.label(f"抓取失敗：{error}").classes("text-xs text-red-500")
@@ -2902,13 +2919,13 @@ def inventory_dashboard():
               pagination={"rowsPerPage": 10, "sortBy": "數量", "descending": True},
           ).classes("w-full").props(':rows-per-page-options="[10,30,50,0]"')
 
-    def set_date_from(e):
+    async def set_date_from(e):
       state["date_from"] = e.value or ""
-      load_and_render()
+      await load_and_render()
 
-    def set_date_to(e):
+    async def set_date_to(e):
       state["date_to"] = e.value or ""
-      load_and_render()
+      await load_and_render()
 
     with date_row:
       ui.input(
@@ -2963,9 +2980,9 @@ def inventory_dashboard():
                   'dense outlined type="number"'
               ).classes("w-24")
 
-    load_and_render()
+    await load_and_render()
 
-  def render_procurement_analysis(api_key, api_password, company_label):
+  async def render_procurement_analysis(api_key, api_password, company_label):
     """分公司／採購分析：建議採購量／庫存週轉／進貨明細(先佔位)／月產銷
     分析，共用一次A1資料抓取(fetch_procurement_analysis_data)。跟海濤客
     那份的差異：
@@ -2973,17 +2990,23 @@ def inventory_dashboard():
       - 月產銷分析不做BOM展開，只看成品/組合品本身的成本/售價
       - 進貨明細因為A1沒有查詢API、要另外維護Sheet，資料來源還沒確認，
         先維持佔位畫面
+
+    這支是async函式，實際打A1 API的地方（load_data）用run.io_bound()包
+    起來，避免卡住整個伺服器的事件迴圈；底下4個子分頁本身只是對同一份
+    已抓好的資料做計算，不會額外打API，維持原本一次全部畫出來的做法。
     """
     data_holder = {"data": None, "error": None}
     last_updated = {"time": ""}
 
-    def load_data():
-      data, error = fetch_procurement_analysis_data(api_key, api_password)
+    async def load_data():
+      data, error = await run.io_bound(
+          fetch_procurement_analysis_data, api_key, api_password
+      )
       data_holder["data"] = data
       data_holder["error"] = error
       last_updated["time"] = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
 
-    load_data()
+    await load_data()
 
     refresh_row = ui.row().classes("w-full items-center gap-3 mb-3")
 
@@ -2992,8 +3015,8 @@ def inventory_dashboard():
       with refresh_row:
         ui.label(f"資料更新時間：{last_updated['time']}").classes("text-xs text-zinc-400")
 
-        def handle_refresh():
-          load_data()
+        async def handle_refresh():
+          await load_data()
           render_refresh_row()
           render_tabs_content()
           if data_holder["error"]:
@@ -3165,84 +3188,135 @@ def inventory_dashboard():
 
     render_tabs_content()
 
+  def render_order_channels_tabs(company_name):
+    """「訂單出貨」分頁底下的通路子分頁（SHOPLINE官網／蝦皮／經銷／其它
+    等，依公司不同而不同）。一樣做成懶載入：只有實際點進某個通路，才會
+    去打那個通路的API，不會切到「訂單出貨」就把底下所有通路一次全部
+    打完。
+    """
+    order_channels = ORDER_CHANNELS_BY_COMPANY.get(
+        company_name, DEFAULT_ORDER_CHANNELS
+    )
+    channel_body = ui.column().classes("w-full")
+
+    async def handle_channel_change(ch):
+      channel_body.clear()
+      with channel_body:
+        with ui.row().classes("w-full items-center gap-2 p-8 justify-center"):
+          ui.spinner(size="24px").classes("text-zinc-400")
+          ui.label("資料抓取中，請稍候…").classes("text-xs text-zinc-500")
+      await asyncio.sleep(0)
+
+      channel_body.clear()
+      shopline_creds = SHOPLINE_CHANNEL_CREDENTIALS.get((company_name, ch))
+      with channel_body:
+        if shopline_creds:
+          await render_shopline_channel(shopline_creds[0], shopline_creds[1], ch)
+        else:
+          render_section_placeholder(
+              f"訂單出貨－{ch}",
+              f"「{ch}」通路的訂單 API 尚未串接，敬請期待",
+          )
+
+    with ui.tabs(on_change=lambda e: handle_channel_change(e.value)).props(
+        "dense no-caps"
+    ).classes("w-full") as channel_tabs:
+      for ch in order_channels:
+        ui.tab(ch)
+    channel_tabs.set_value(order_channels[0])
+
   def render_channel_company_page(company_name):
     """興聖(股)公司／容鴻(股)公司／芙萊柏(股)公司 共用的頁面骨架：
-    儀表板／訂單出貨(4通路)／每日出貨／調撥紀錄／退換貨記錄，共5個分頁。
-    目前資料都還沒串接，先讓分頁結構跟導覽長出來，之後每個區塊陸續串上
-    真的 API 時，只要把 render_section_placeholder(...) 換成真的內容即可，
-    不用動到分頁結構本身。
+    儀表板／訂單出貨(4通路)／每日出貨／調撥紀錄／退換貨記錄／採購分析。
+
+    刻意做成「懶載入」：切換公司的當下只建立分頁導覽本身（很便宜），
+    實際會打API抓資料的內容（訂單出貨/每日出貨/採購分析）要等使用者
+    真的點進那個分頁才觸發。原本的寫法是用ui.tab_panels把所有分頁內容
+    一次全部建好，即使畫面上只顯示一個分頁，其他分頁的內容(含API呼叫)
+    背地裡早就全部執行完了——這代表「切換一次公司」會同時觸發好幾個
+    分頁各自的API呼叫，互相排隊等，才會覺得切換很鈍。
     """
     content_container.clear()
     accent = COMPANY_TAB_COLORS.get(company_name, {}).get("active_bg", "#5bc0be")
     slug = COMPANY_SLUGS.get(company_name, "default")
     tabs_class = f"section-tabs-{slug}"
+
+    SECTION_TABS = ["儀表板", "訂單出貨", "每日出貨", "調撥紀錄", "退換貨記錄", "採購分析"]
+
     with content_container:
       with ui.column().classes("w-full p-8 max-w-[1600px] mx-auto gap-4"):
         ui.label(company_name).classes(
             "text-lg font-bold text-zinc-900"
         )
-        with ui.tabs().props("dense no-caps").classes(
-            f"w-full {tabs_class}"
-        ) as section_tabs:
-          tab_ch_dashboard = ui.tab("儀表板")
-          tab_ch_orders = ui.tab("訂單出貨")
-          tab_ch_daily_shipping = ui.tab("每日出貨")
-          tab_ch_transfer = ui.tab("調撥紀錄")
-          tab_ch_returns = ui.tab("退換貨記錄")
-          tab_ch_procurement = ui.tab("採購分析")
+        with ui.tabs(on_change=lambda e: handle_section_change(e.value)).props(
+            "dense no-caps"
+        ).classes(f"w-full {tabs_class}") as section_tabs:
+          for t in SECTION_TABS:
+            ui.tab(t)
         # 只套用在這組分頁自己身上（用.section-tabs-xxx限定範圍），
         # 不會影響到最上面的公司切換列或其他分公司頁面的分頁顏色
         ui.add_head_html(
             f"<style>.{tabs_class}.q-tabs .q-tab--active {{ color: {accent} !important; }}"
             f" .{tabs_class}.q-tabs .q-tab-indicator {{ background: {accent} !important; }}</style>"
         )
-        with ui.tab_panels(section_tabs, value=tab_ch_dashboard).classes(
-            "w-full bg-transparent"
-        ):
-          with ui.tab_panel(tab_ch_dashboard):
-            render_section_placeholder(
-                "儀表板", "尚未串接此分公司的庫存／訂單資料，敬請期待"
-            )
 
-          with ui.tab_panel(tab_ch_orders):
-            order_channels = ORDER_CHANNELS_BY_COMPANY.get(
-                company_name, DEFAULT_ORDER_CHANNELS
-            )
-            with ui.tabs().props("dense no-caps").classes("w-full") as channel_tabs:
-              channel_tab_objs = [ui.tab(ch) for ch in order_channels]
-            with ui.tab_panels(
-                channel_tabs, value=channel_tab_objs[0]
-            ).classes("w-full bg-transparent"):
-              for ch, ch_tab in zip(order_channels, channel_tab_objs):
-                with ui.tab_panel(ch_tab):
-                  shopline_creds = SHOPLINE_CHANNEL_CREDENTIALS.get((company_name, ch))
-                  if shopline_creds:
-                    render_shopline_channel(shopline_creds[0], shopline_creds[1], ch)
-                  else:
-                    render_section_placeholder(
-                        f"訂單出貨－{ch}",
-                        f"「{ch}」通路的訂單 API 尚未串接，敬請期待",
-                    )
+        section_body = ui.column().classes("w-full")
 
-          with ui.tab_panel(tab_ch_daily_shipping):
+        def render_loading():
+          with ui.row().classes("w-full items-center gap-2 p-8 justify-center"):
+            ui.spinner(size="24px").classes("text-zinc-400")
+            ui.label("資料抓取中，請稍候…").classes("text-xs text-zinc-500")
+
+        async def handle_section_change(tab_label):
+          section_body.clear()
+          with section_body:
+            render_loading()
+          # 讓上面的載入中畫面先真的畫出來，再開始跑會卡住的API呼叫，
+          # 使用者才不會覺得畫面「整個沒反應」。
+          await asyncio.sleep(0)
+
+          if tab_label == "儀表板":
+            section_body.clear()
+            with section_body:
+              render_section_placeholder(
+                  "儀表板", "尚未串接此分公司的庫存／訂單資料，敬請期待"
+              )
+          elif tab_label == "訂單出貨":
+            section_body.clear()
+            with section_body:
+              render_order_channels_tabs(company_name)
+          elif tab_label == "每日出貨":
+            section_body.clear()
             daily_shipping_creds = DAILY_SHIPPING_CREDENTIALS.get(company_name)
             if daily_shipping_creds:
-              render_daily_shipping(daily_shipping_creds[0], daily_shipping_creds[1], company_name)
+              with section_body:
+                await render_daily_shipping(
+                    daily_shipping_creds[0], daily_shipping_creds[1], company_name,
+                )
             else:
-              render_section_placeholder("每日出貨")
-
-          with ui.tab_panel(tab_ch_transfer):
-            render_section_placeholder("調撥紀錄")
-
-          with ui.tab_panel(tab_ch_returns):
-            render_section_placeholder("退換貨記錄")
-
-          with ui.tab_panel(tab_ch_procurement):
+              with section_body:
+                render_section_placeholder("每日出貨")
+          elif tab_label == "調撥紀錄":
+            section_body.clear()
+            with section_body:
+              render_section_placeholder("調撥紀錄")
+          elif tab_label == "退換貨記錄":
+            section_body.clear()
+            with section_body:
+              render_section_placeholder("退換貨記錄")
+          elif tab_label == "採購分析":
+            section_body.clear()
             procurement_creds = PROCUREMENT_ANALYSIS_CREDENTIALS.get(company_name)
             if procurement_creds:
-              render_procurement_analysis(procurement_creds[0], procurement_creds[1], company_name)
+              with section_body:
+                await render_procurement_analysis(
+                    procurement_creds[0], procurement_creds[1], company_name,
+                )
             else:
-              render_section_placeholder("採購分析")
+              with section_body:
+                render_section_placeholder("採購分析")
+
+        section_tabs.set_value("儀表板")
 
   def render_hai_tao_ke_page():
     content_container.clear()
