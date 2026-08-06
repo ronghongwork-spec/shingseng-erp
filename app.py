@@ -1930,7 +1930,64 @@ def inventory_dashboard():
 
   # -----------------------------------------------------------------------
   # 右上角分公司切換
+  # 這個 header（含公司切換分頁）故意寫在 content_container 建立「之前」，
+  # 讓它在畫面元素的排列順序上排在所有頁面內容前面，天生就位在最上方。
+  # 如果順序反過來（content_container先建立），header雖然有sticky
+  # top-0，但因為它在畫面排列順序上落在一大串內容「後面」，一開始會被
+  # 排到頁面最下方，資料一多，使用者要滑到最底部才看得到，sticky也救
+  # 不了這個順序問題。
+  #
+  # 注意：這裡只建立 header 本身（含空的 company_tabs），還不能馬上呼叫
+  # company_tabs.set_value(...) 來觸發第一次畫面內容，因為 handle_company_change
+  # 裡面用到的 render_hai_tao_ke_page() 等函式，要等下面 content_container
+  # 建立完、這些函式都 def 好之後才存在。實際觸發放在函式最後面。
   # -----------------------------------------------------------------------
+  COMPANY_TAB_COLORS = {
+      "興聖(股)公司": {"text": "#5bc0be", "active_bg": "#5bc0be"},
+      "海濤客食品工業(股)公司": {"text": "#e0824a", "active_bg": "#e0824a"},
+      "容鴻(股)公司": {"text": "#8e7cc3", "active_bg": "#8e7cc3"},
+      "芙萊柏(股)公司": {"text": "#5b8fc0", "active_bg": "#5b8fc0"},
+  }
+  ui.add_head_html(
+      "<style>"
+      + "".join(
+          f".company-tab-{i} {{ color: {c['text']} !important; "
+          f"font-weight: 700 !important; }}"
+          f".company-tab-{i}.q-tab--active {{ background: {c['active_bg']}22 !important; "
+          f"border-bottom: 3px solid {c['active_bg']} !important; }}"
+          for i, c in enumerate(COMPANY_TAB_COLORS.values())
+      )
+      + "</style>"
+  )
+
+  def handle_company_change(e):
+    selected = e.value
+    if selected == ACTIVE_COMPANY_LABEL:
+      render_hai_tao_ke_page()
+    elif selected in ("興聖(股)公司", "容鴻(股)公司", "芙萊柏(股)公司"):
+      render_channel_company_page(selected)
+    else:
+      render_placeholder_company(selected)
+
+  with ui.row().classes(
+      "w-full flex flex-nowrap items-center justify-between bg-white"
+      " border-b border-[#e2e1dc] px-8 py-4 sticky top-0 z-50"
+  ):
+    with ui.row().classes("items-center gap-3 flex-shrink-0"):
+      ui.label("興聖集團｜A1 智慧進銷存總管理系統").classes(
+          "text-base font-black tracking-wider"
+      )
+      # Logo 放置位置：把檔案存成 static/logo.png（跟 app.py 同層的
+      # static 資料夾）就會自動顯示在這裡，不用改程式碼。沒有檔案時
+      # 這裡會是空白，不影響頁面運作。
+      if os.path.exists(LOGO_PATH):
+        ui.image("/static/logo.png").classes("h-8 w-auto")
+    with ui.tabs(on_change=handle_company_change).props(
+        "dense no-caps"
+    ).classes("flex-shrink-0 ml-auto") as company_tabs:
+      for i, c in enumerate(COMPANIES):
+        ui.tab(c).classes(f"company-tab-{i}")
+
   content_container = ui.column().classes("w-full")
 
   def render_placeholder_company(name):
@@ -4400,53 +4457,9 @@ def inventory_dashboard():
                 )
 
 
-  def handle_company_change(e):
-    selected = e.value
-    if selected == ACTIVE_COMPANY_LABEL:
-      render_hai_tao_ke_page()
-    elif selected in ("興聖(股)公司", "容鴻(股)公司", "芙萊柏(股)公司"):
-      render_channel_company_page(selected)
-    else:
-      render_placeholder_company(selected)
-
-  COMPANY_TAB_COLORS = {
-      "興聖(股)公司": {"text": "#5bc0be", "active_bg": "#5bc0be"},
-      "海濤客食品工業(股)公司": {"text": "#e0824a", "active_bg": "#e0824a"},
-      "容鴻(股)公司": {"text": "#8e7cc3", "active_bg": "#8e7cc3"},
-      "芙萊柏(股)公司": {"text": "#5b8fc0", "active_bg": "#5b8fc0"},
-  }
-  ui.add_head_html(
-      "<style>"
-      + "".join(
-          f".company-tab-{i} {{ color: {c['text']} !important; "
-          f"font-weight: 700 !important; }}"
-          f".company-tab-{i}.q-tab--active {{ background: {c['active_bg']}22 !important; "
-          f"border-bottom: 3px solid {c['active_bg']} !important; }}"
-          for i, c in enumerate(COMPANY_TAB_COLORS.values())
-      )
-      + "</style>"
-  )
-
-  with ui.row().classes(
-      "w-full flex flex-nowrap items-center justify-between bg-white"
-      " border-b border-[#e2e1dc] px-8 py-4 sticky top-0 z-50"
-  ):
-    with ui.row().classes("items-center gap-3 flex-shrink-0"):
-      ui.label("興聖集團｜A1 智慧進銷存總管理系統").classes(
-          "text-base font-black tracking-wider"
-      )
-      # Logo 放置位置：把檔案存成 static/logo.png（跟 app.py 同層的
-      # static 資料夾）就會自動顯示在這裡，不用改程式碼。沒有檔案時
-      # 這裡會是空白，不影響頁面運作。
-      if os.path.exists(LOGO_PATH):
-        ui.image("/static/logo.png").classes("h-8 w-auto")
-    with ui.tabs(on_change=handle_company_change).props(
-        "dense no-caps"
-    ).classes("flex-shrink-0 ml-auto") as company_tabs:
-      for i, c in enumerate(COMPANIES):
-        ui.tab(c).classes(f"company-tab-{i}")
-    company_tabs.set_value(ACTIVE_COMPANY_LABEL)
-
+  # header（含公司切換分頁）已經搬到函式最前面建立，這裡只需要在所有
+  # render_xxx 函式都定義好之後，觸發一次「畫面初始內容」即可。
+  company_tabs.set_value(ACTIVE_COMPANY_LABEL)
   render_hai_tao_ke_page()
 
 
