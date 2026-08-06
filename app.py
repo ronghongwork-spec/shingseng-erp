@@ -1280,9 +1280,12 @@ def load_channel_sales_from_google_sheet():
 
 # -------------------------------------------------------------------------
 # 興聖集團旗下分公司清單（右上角切換用）
-# 目前僅「海濤客食品工業(股)公司」已完成 A1 API 串接，其餘分公司頁面預留、
-# 之後陸續串接時只要比照 render_hai_tao_ke_page() 的寫法為它們各自建立
-# render_xxx_page() 即可。
+# 目前「海濤客食品工業(股)公司」已完成完整 A1 API 串接（render_hai_tao_ke_page）。
+# 「興聖(股)公司」「容鴻(股)公司」「芙萊柏(股)公司」三間已建好共用的頁面骨架
+# （render_channel_company_page：儀表板／訂單出貨4通路／每日出貨／調撥紀錄／
+# 退換貨記錄），但各區塊資料都還沒串接，畫面上顯示佔位提示。之後陸續拿到
+# 各分公司/各通路的 API 時，把 render_section_placeholder(...) 換成真的資料
+# 表格即可，不用重搭分頁結構。
 # -------------------------------------------------------------------------
 # -------------------------------------------------------------------------
 # 顏色標籤：儀表板／提醒中心統一用這組顏色分辨「嚴重程度」
@@ -1945,6 +1948,90 @@ def inventory_dashboard():
               "text-sm text-zinc-500"
           )
 
+  def render_section_placeholder(title, hint="此區尚未串接資料來源，敬請期待"):
+    """訂單出貨／每日出貨／調撥紀錄／退換貨記錄 共用的「還沒串API」佔位畫面。
+    等之後陸續串接各分公司/各通路的 API 時，把對應區塊換成真的資料表格即可，
+    版面（分頁結構）不用重搭。
+    """
+    with ui.card().classes(
+        "w-full p-10 bg-white border border-[#e2e1dc] shadow-none"
+        " rounded-none text-center"
+    ):
+      ui.label(title).classes("text-sm font-bold text-zinc-700 mb-2")
+      ui.label(hint).classes("text-xs text-zinc-500")
+
+  # 訂單出貨底下的4個通路子分頁，之後每個通路會各自串不同的訂單來源
+  # API（SHOPLINE官網／蝦皮／經銷／其它），目前先放佔位畫面
+  ORDER_CHANNELS = ["SHOPLINE官網", "蝦皮", "經銷", "其它"]
+
+  # 公司名稱轉成安全的英文代碼，用來組CSS class名稱（中文當class名稱在
+  # 部分瀏覽器/選擇器語法下容易出錯，改用英文代碼比較保險）
+  COMPANY_SLUGS = {
+      "興聖(股)公司": "xingsheng",
+      "容鴻(股)公司": "ronghong",
+      "芙萊柏(股)公司": "fulaibo",
+  }
+
+  def render_channel_company_page(company_name):
+    """興聖(股)公司／容鴻(股)公司／芙萊柏(股)公司 共用的頁面骨架：
+    儀表板／訂單出貨(4通路)／每日出貨／調撥紀錄／退換貨記錄，共5個分頁。
+    目前資料都還沒串接，先讓分頁結構跟導覽長出來，之後每個區塊陸續串上
+    真的 API 時，只要把 render_section_placeholder(...) 換成真的內容即可，
+    不用動到分頁結構本身。
+    """
+    content_container.clear()
+    accent = COMPANY_TAB_COLORS.get(company_name, {}).get("active_bg", "#5bc0be")
+    slug = COMPANY_SLUGS.get(company_name, "default")
+    tabs_class = f"section-tabs-{slug}"
+    with content_container:
+      with ui.column().classes("w-full p-8 max-w-[1600px] mx-auto gap-4"):
+        ui.label(company_name).classes(
+            "text-lg font-bold text-zinc-900"
+        )
+        with ui.tabs().props("dense no-caps").classes(
+            f"w-full {tabs_class}"
+        ) as section_tabs:
+          tab_ch_dashboard = ui.tab("儀表板")
+          tab_ch_orders = ui.tab("訂單出貨")
+          tab_ch_daily_shipping = ui.tab("每日出貨")
+          tab_ch_transfer = ui.tab("調撥紀錄")
+          tab_ch_returns = ui.tab("退換貨記錄")
+        # 只套用在這組分頁自己身上（用.section-tabs-xxx限定範圍），
+        # 不會影響到最上面的公司切換列或其他分公司頁面的分頁顏色
+        ui.add_head_html(
+            f"<style>.{tabs_class}.q-tabs .q-tab--active {{ color: {accent} !important; }}"
+            f" .{tabs_class}.q-tabs .q-tab-indicator {{ background: {accent} !important; }}</style>"
+        )
+        with ui.tab_panels(section_tabs, value=tab_ch_dashboard).classes(
+            "w-full bg-transparent"
+        ):
+          with ui.tab_panel(tab_ch_dashboard):
+            render_section_placeholder(
+                "儀表板", "尚未串接此分公司的庫存／訂單資料，敬請期待"
+            )
+
+          with ui.tab_panel(tab_ch_orders):
+            with ui.tabs().props("dense no-caps").classes("w-full") as channel_tabs:
+              channel_tab_objs = [ui.tab(ch) for ch in ORDER_CHANNELS]
+            with ui.tab_panels(
+                channel_tabs, value=channel_tab_objs[0]
+            ).classes("w-full bg-transparent"):
+              for ch, ch_tab in zip(ORDER_CHANNELS, channel_tab_objs):
+                with ui.tab_panel(ch_tab):
+                  render_section_placeholder(
+                      f"訂單出貨－{ch}",
+                      f"「{ch}」通路的訂單 API 尚未串接，敬請期待",
+                  )
+
+          with ui.tab_panel(tab_ch_daily_shipping):
+            render_section_placeholder("每日出貨")
+
+          with ui.tab_panel(tab_ch_transfer):
+            render_section_placeholder("調撥紀錄")
+
+          with ui.tab_panel(tab_ch_returns):
+            render_section_placeholder("退換貨記錄")
+
   def render_hai_tao_ke_page():
     content_container.clear()
     with content_container:
@@ -2077,10 +2164,13 @@ def inventory_dashboard():
               )
               dashboard_announce_container = ui.column().classes("w-full gap-2 mb-6")
 
-              def _severity_box(severity, text):
+              def _severity_box(severity, text, accent_color=None):
                 style = SEVERITY_STYLES[severity]
+                accent_class = (
+                    f"border-l-4 border-l-[{accent_color}]" if accent_color else ""
+                )
                 with ui.row().classes(
-                    f"w-full items-center gap-2 p-2 border {style['box']}"
+                    f"w-full items-center gap-2 p-2 border {style['box']} {accent_class}"
                 ):
                   ui.label(style["label"]).classes(
                       f"text-[11px] px-2 py-0.5 rounded-none font-bold"
@@ -2379,12 +2469,12 @@ def inventory_dashboard():
                         horizon_days=30,
                     )
                     category_labels = [
-                        ("shipping", "🚚 訂單出貨提醒"),
-                        ("production", "🏭 生產組裝確認"),
-                        ("finished_goods", "🧾 建議採購成品（母件）"),
+                        ("shipping", "🚚 訂單出貨提醒", "#2563eb"),
+                        ("production", "🏭 生產組裝確認", "#9333ea"),
+                        ("finished_goods", "🧾 建議採購成品（母件）", "#db2777"),
                     ]
                     any_announcement = False
-                    for key, label in category_labels:
+                    for key, label, accent_color in category_labels:
                       items = announcements.get(key, [])[:6]
                       if not items:
                         continue
@@ -2392,7 +2482,7 @@ def inventory_dashboard():
                           "text-xs font-bold text-zinc-600 mt-1"
                       )
                       for item in items:
-                        _severity_box(item["severity"], item["text"])
+                        _severity_box(item["severity"], item["text"], accent_color)
                       any_announcement = True
 
                     if not any_announcement:
@@ -4314,6 +4404,8 @@ def inventory_dashboard():
     selected = e.value
     if selected == ACTIVE_COMPANY_LABEL:
       render_hai_tao_ke_page()
+    elif selected in ("興聖(股)公司", "容鴻(股)公司", "芙萊柏(股)公司"):
+      render_channel_company_page(selected)
     else:
       render_placeholder_company(selected)
 
