@@ -237,10 +237,14 @@ def compute_shopline_delivery_counts(orders, status_filter="all"):
   return counts
 
 
-def compute_shopline_sku_rows(orders, status_filter="all", delivery_filter="all", keyword=""):
+def compute_shopline_sku_rows(
+    orders, status_filter="all", delivery_filter="all", keyword="",
+    date_from="", date_to="",
+):
   """依status_filter(全部/待處理/已確認) + delivery_filter(全送貨方式/
-  特定送貨方式) + keyword(商品名稱關鍵字) 篩選訂單後，依SKU加總商品需求
-  數量。這是給海濤客食品工廠請備貨/採購用的主要清單。
+  特定送貨方式) + keyword(商品名稱關鍵字) + date_from/date_to(訂單建立
+  時間範圍，台灣時間，格式YYYY-MM-DD，任一留空代表不限) 篩選訂單後，依
+  SKU加總商品需求數量。這是給海濤客食品工廠請備貨/採購用的主要清單。
   """
   filtered = orders
   if status_filter in ("pending", "confirmed"):
@@ -252,6 +256,24 @@ def compute_shopline_sku_rows(orders, status_filter="all", delivery_filter="all"
       ).get("zh-hant", "")
       return classify_shopline_delivery_method(label) == delivery_filter
     filtered = [o for o in filtered if _matches_delivery(o)]
+  if date_from or date_to:
+    def _order_date_tw(o):
+      raw = o.get("created_at", "") or ""
+      try:
+        dt_utc = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return (dt_utc + timedelta(hours=8)).strftime("%Y-%m-%d")
+      except (ValueError, TypeError):
+        return ""
+    def _in_range(o):
+      d = _order_date_tw(o)
+      if not d:
+        return False
+      if date_from and d < date_from:
+        return False
+      if date_to and d > date_to:
+        return False
+      return True
+    filtered = [o for o in filtered if _in_range(o)]
 
   sku_agg = {}
   for o in filtered:
@@ -260,7 +282,15 @@ def compute_shopline_sku_rows(orders, status_filter="all", delivery_filter="all"
       title = item.get("title_translations") or {}
       name = title.get("zh-hant") or title.get("en") or sku
       qty = item.get("quantity") or 0
-      entry = sku_agg.setdefault(sku, {"商品": name, "SKU": sku, "需求數量": 0})
+      detail = extract_shopline_item_detail(item)
+      entry = sku_agg.setdefault(
+          sku, {"商品": name, "SKU": sku, "細項": detail, "需求數量": 0}
+      )
+      # 細項理論上同一個SKU都是同一組固定內容，但保險起見：如果目前是
+      # 空的、這次抓到有值，就補上去，避免因為抓到的第一筆剛好沒細項
+      # 資料而漏掉。
+      if not entry["細項"] and detail:
+        entry["細項"] = detail
       entry["需求數量"] += qty
 
   rows = list(sku_agg.values())
@@ -269,6 +299,20 @@ def compute_shopline_sku_rows(orders, status_filter="all", delivery_filter="all"
     rows = [r for r in rows if keyword in r["商品"]]
   rows.sort(key=lambda r: r["需求數量"], reverse=True)
   return rows
+
+
+def extract_shopline_item_detail(item):
+  """從訂單商品明細(subtotal_items的單一item)裡撈出「細項」說明，例如
+  組合/禮盒商品的內容物「烏金醬*2 (禮盒組)」。實際存放位置是
+  item["fields_translations"]["zh-hant"]，格式是字串陣列(可能有多筆)，
+  沒有細項的一般商品這裡會是空字典{}。
+  """
+  fields = item.get("fields_translations") or {}
+  zh_list = fields.get("zh-hant") or []
+  if isinstance(zh_list, str):
+    zh_list = [zh_list]
+  cleaned = [s for s in zh_list if s]
+  return "、".join(cleaned)
 
 
 # -------------------------------------------------------------------------
@@ -2202,7 +2246,10 @@ def inventory_dashboard():
       return
 
     stats = compute_shopline_stats(orders)
-    state = {"status_filter": "all", "delivery_filter": "all", "keyword": ""}
+    state = {
+        "status_filter": "all", "delivery_filter": "all", "keyword": "",
+        "date_from": "", "date_to": "",
+    }
 
     # ---- 篩選工具列：放在最上方（在說明文字跟結果表格之前）----
     toolbar_container = ui.row().classes("w-full items-end gap-3 mb-1 flex-wrap")
@@ -2256,6 +2303,18 @@ def inventory_dashboard():
             on_change=set_keyword,
         ).props("dense outlined clearable").classes("w-56")
 
+        ui.input(
+            label="建立日期 起",
+            value=state["date_from"],
+            on_change=set_date_from,
+        ).props('dense outlined clearable type="date"').classes("w-40")
+
+        ui.input(
+            label="建立日期 迄",
+            value=state["date_to"],
+            on_change=set_date_to,
+        ).props('dense outlined clearable type="date"').classes("w-40")
+
     ui.label(
         f"{channel_title}・近{SHOPLINE_LOOKBACK_DAYS}天訂單建立時間"
     ).classes("text-xs text-zinc-500 mb-3")
@@ -2265,7 +2324,8 @@ def inventory_dashboard():
     def refresh_results():
       results_container.clear()
       rows = compute_shopline_sku_rows(
-          orders, state["status_filter"], state["delivery_filter"], state["keyword"]
+          orders, state["status_filter"], state["delivery_filter"], state["keyword"],
+          state["date_from"], state["date_to"],
       )
       with results_container:
         with ui.card().classes(
@@ -2301,6 +2361,7 @@ def inventory_dashboard():
                 columns=[
                     {"name": "SKU", "label": "SKU", "field": "SKU", "align": "left", "sortable": True},
                     {"name": "商品", "label": "商品", "field": "商品", "align": "left", "sortable": True},
+                    {"name": "細項", "label": "細項", "field": "細項", "align": "left", "sortable": True},
                     {"name": "需求數量", "label": "需求數量", "field": "需求數量", "align": "right", "sortable": True},
                 ],
                 rows=rows,
@@ -2319,6 +2380,14 @@ def inventory_dashboard():
 
     def set_keyword(e):
       state["keyword"] = e.value
+      refresh_results()
+
+    def set_date_from(e):
+      state["date_from"] = e.value or ""
+      refresh_results()
+
+    def set_date_to(e):
+      state["date_to"] = e.value or ""
       refresh_results()
 
     render_toolbar()
