@@ -34,6 +34,29 @@ def safe_text(value, default=""):
   return str(value)
 
 
+def compute_tax_and_total(subtotal, tax_type, tax_rate=0.05):
+  """依A1的課稅別規則，從「品項金額合計」算出稅額跟總金額（含稅），供
+  訂單/銷貨單/採購單/進貨單的手動填寫表單共用，避免四個地方各寫一次、
+  容易改一個忘記改另一個。
+
+  課稅別代碼統一用A1手冊的定義：
+    0.免發票／3.免稅 → 不計稅，總金額=品項金額合計
+    1.應稅外加 → 品項金額視為「未稅」，稅額另外加在總金額之上
+    4.應稅內含 → 品項金額視為「已含稅」，總金額=品項金額合計，稅額用
+      反推的方式從裡面拆出來
+  稅率固定用5%（手冊範例皆用此稅率）。
+  回傳 (稅額, 總金額)，皆四捨五入到小數點後2位。
+  """
+  if tax_type in ("0", "3"):
+    return 0.0, round(subtotal, 2)
+  if tax_type == "1":
+    tax = round(subtotal * tax_rate, 2)
+    return tax, round(subtotal + tax, 2)
+  # "4" 應稅內含
+  tax = round(subtotal - subtotal / (1 + tax_rate), 2)
+  return tax, round(subtotal, 2)
+
+
 def ceil_qty(value, default=0):
   """庫存/銷量這類「數量」欄位統一無條件進位成整數（例如 12.3 顯示成 13），
   避免小數點讓人誤以為可以訂購零點幾件、或看起來像是算錯了。
@@ -1386,7 +1409,30 @@ def upload_order_to_a1(token, payload):
   409（唯一辨識碼重複）視為「這張訂單先前已經上傳過」，不當成錯誤，讓
   呼叫端可以正常統計、不用擔心重複按會出亂子。
   """
-  url = f"{A1_BASE_URL}/Orders"
+  return _upload_document_to_a1(token, "/Orders", payload, "訂單")
+
+
+def upload_sale_to_a1(token, payload):
+  """Sales[Post]：上傳單張銷貨單。回傳 (成功與否, 訊息)。"""
+  return _upload_document_to_a1(token, "/Sales", payload, "銷貨單")
+
+
+def upload_purchase_to_a1(token, payload):
+  """Purchases[Post]：上傳單張採購單。回傳 (成功與否, 訊息)。"""
+  return _upload_document_to_a1(token, "/Purchases", payload, "採購單")
+
+
+def upload_receive_to_a1(token, payload):
+  """Receives[Post]：上傳單張進貨單。回傳 (成功與否, 訊息)。"""
+  return _upload_document_to_a1(token, "/Receives", payload, "進貨單")
+
+
+def _upload_document_to_a1(token, path, payload, doc_label):
+  """訂單/銷貨單/採購單/進貨單上傳共用邏輯，差別只在API路徑跟錯誤訊息
+  裡的單據名稱。409（唯一辨識碼重複）視為「這張單先前已經上傳過」，不
+  當成錯誤，避免重複按會出亂子。
+  """
+  url = f"{A1_BASE_URL}{path}"
   headers = {"Content-Type": "application/json", "Authorization": token}
   try:
     response = requests.post(
@@ -1395,7 +1441,7 @@ def upload_order_to_a1(token, payload):
     if response.status_code == 200:
       return True, "上傳成功"
     if response.status_code == 409:
-      return False, "訂單編號重複（先前應該已經上傳過，正常現象）"
+      return False, f"{doc_label}編號重複（先前應該已經上傳過，正常現象）"
     return False, f"[{response.status_code}] {response.text}"
   except requests.exceptions.RequestException as e:
     return False, str(e)
@@ -4361,6 +4407,9 @@ def inventory_dashboard():
             with ui.tabs().classes("w-full mb-2") as orders_sub_tabs:
               tab_create_order = ui.tab("建立訂單")
               tab_unshipped_query = ui.tab("未出訂單查詢")
+              tab_create_sale = ui.tab("銷貨單")
+              tab_create_purchase = ui.tab("採購單")
+              tab_create_receive = ui.tab("進貨單")
 
             with ui.tab_panels(orders_sub_tabs, value=tab_create_order).classes(
                 "w-full bg-transparent"
@@ -4546,23 +4595,10 @@ def inventory_dashboard():
                       details.append(line)
                       subtotal += amount
 
-                    # 依課稅別算稅額/總金額（手冊規則）：
-                    # 0.免發票／3.免稅 → 不計稅，總金額=明細金額合計
-                    # 1.應稅外加 → 明細金額視為「未稅」，稅額另外加總金額之上
-                    # 4.應稅內含 → 明細金額視為「已含稅」，總金額=明細金額合計
-                    # 稅率固定用5%（手冊範例皆用此稅率），如果之後稅率不同，
-                    # 這裡要跟著調整。
                     tax_type = manual_taxtype_select.value
-                    TAX_RATE = 0.05
-                    if tax_type in ("0", "3"):
-                      total_tax = 0.0
-                      total_sale_amount = subtotal
-                    elif tax_type == "1":
-                      total_tax = round(subtotal * TAX_RATE, 2)
-                      total_sale_amount = round(subtotal + total_tax, 2)
-                    else:  # "4" 應稅內含
-                      total_tax = round(subtotal - subtotal / (1 + TAX_RATE), 2)
-                      total_sale_amount = round(subtotal, 2)
+                    total_tax, total_sale_amount = compute_tax_and_total(
+                        subtotal, tax_type
+                    )
 
                     order_id = f"WEB{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
                     payload = {
@@ -4785,6 +4821,622 @@ def inventory_dashboard():
                   orders_status_select.on_value_change(lambda e: update_orders_list())
                   update_orders_list()
                   refs["update_orders_list"] = update_orders_list
+
+              # ---------------------------------------------------------
+              # 銷貨單／採購單／進貨單：邏輯跟「建立訂單」一樣（表單+確認
+              # 彈窗+送出），但不統計已上傳紀錄，單純當上傳管道。
+              # ---------------------------------------------------------
+              customer_options_doc = {
+                  cid: f"{cid} - {name}"
+                  for cid, name in (app_state.get("customers_map") or {}).items()
+              }
+              supplier_options_doc = {
+                  sid: f"{sid} - {name}"
+                  for sid, name in (app_state.get("suppliers_map") or {}).items()
+              }
+              item_options_doc = {
+                  iid: f"{iid} - {info.get('Name', '')}"
+                  for iid, info in (app_state.get("items_map") or {}).items()
+              }
+              warehouse_options_doc = {
+                  w: w for w in (app_state.get("warehouses") or [])
+              }
+
+              with ui.tab_panel(tab_create_sale):
+                with ui.card().classes(
+                    "w-full p-6 bg-white border border-[#e6e1d4]"
+                    " shadow-[0_1px_3px_rgba(42,40,35,0.06)] rounded-lg"
+                ):
+                  ui.label("上傳銷貨單").classes(
+                      "text-base font-bold text-zinc-900 mb-2"
+                  )
+                  ui.label(
+                      "會建立成 A1 的「銷貨單」（Sales[Post]），會馬上扣庫存"
+                      "、視同已完成的銷售，跟「訂單」不一樣。這裡不會留存"
+                      "上傳紀錄，純粹是送出管道，正式紀錄請至 A1 查看。"
+                  ).classes("text-xs text-zinc-500 mb-3")
+
+                  with ui.row().classes("items-end gap-3 flex-wrap mb-3"):
+                    sale_customer_select = ui.select(
+                        options=customer_options_doc, label="客戶", with_input=True,
+                    ).props("dense outlined").classes("w-64")
+                    sale_payment_select = ui.select(
+                        options={
+                            "1": "現金", "2": "信用卡", "3": "轉帳", "M": "賒銷(月結)",
+                        },
+                        label="收款方式", value="M",
+                    ).props("dense outlined").classes("w-32")
+                    sale_taxtype_select = ui.select(
+                        options=MANUAL_TAXTYPE_OPTIONS, label="課稅別", value="0",
+                    ).props("dense outlined").classes("w-32")
+
+                  sale_lines_container = ui.column().classes("w-full gap-2 mb-2")
+                  sale_line_rows = []
+                  sale_total_label = ui.label("合計金額：0").classes(
+                      "text-sm font-bold text-zinc-700 mb-3"
+                  )
+
+                  def update_sale_total():
+                    total = sum(float(r["amount"].value or 0) for r in sale_line_rows)
+                    sale_total_label.text = f"合計金額：{total:,.0f}"
+
+                  def add_sale_line():
+                    with sale_lines_container:
+                      with ui.row().classes("w-full items-center gap-2") as row:
+                        item_sel = ui.select(
+                            options=item_options_doc, label="商品", with_input=True,
+                        ).props("dense outlined").classes("flex-1")
+                        qty_input = ui.number(label="數量", value=1, min=0).props(
+                            "dense outlined"
+                        ).classes("w-20")
+                        amount_input = ui.number(label="金額", value=0, min=0).props(
+                            "dense outlined"
+                        ).classes("w-24")
+                        warehouse_sel = ui.select(
+                            options=warehouse_options_doc, label="倉庫",
+                        ).props("dense outlined").classes("w-28")
+                        lotno_input = ui.input(label="批號").props(
+                            "dense outlined"
+                        ).classes("w-24")
+                        isfree_checkbox = ui.checkbox("贈品")
+                        memo_input = ui.input(label="備註").props(
+                            "dense outlined"
+                        ).classes("w-28")
+
+                        def remove_this_line():
+                          sale_lines_container.remove(row)
+                          sale_line_rows.remove(entry)
+                          update_sale_total()
+
+                        ui.button(icon="close", on_click=remove_this_line).props(
+                            "flat dense round"
+                        )
+                    entry = {
+                        "item_sel": item_sel, "qty": qty_input, "amount": amount_input,
+                        "warehouse": warehouse_sel, "lotno": lotno_input,
+                        "isfree": isfree_checkbox, "memo": memo_input,
+                    }
+                    sale_line_rows.append(entry)
+                    amount_input.on_value_change(lambda e: update_sale_total())
+                    update_sale_total()
+
+                  with ui.row().classes("gap-2 mb-3"):
+                    ui.button("+ 新增品項", on_click=add_sale_line).classes(
+                        "px-3 py-1 text-xs rounded-lg"
+                    )
+                  add_sale_line()
+
+                  with ui.dialog() as sale_confirm_dialog, ui.card().classes(
+                      "min-w-[360px] max-w-[90vw] p-5"
+                  ):
+                    sale_confirm_dialog_body = ui.column().classes("w-full gap-2")
+                    with ui.row().classes("w-full justify-end gap-2 mt-4"):
+                      ui.button(
+                          "取消", on_click=sale_confirm_dialog.close
+                      ).classes("px-4 py-1 text-xs rounded-lg")
+                      sale_confirm_button = ui.button("確認建立").classes(
+                          "sync-btn px-4 py-1 text-xs rounded-lg"
+                      )
+
+                  sale_pending_payload = {"value": None}
+
+                  def reset_sale_form():
+                    sale_customer_select.value = None
+                    sale_payment_select.value = "M"
+                    sale_taxtype_select.value = "0"
+                    sale_lines_container.clear()
+                    sale_line_rows.clear()
+                    add_sale_line()
+
+                  def handle_sale_submit_click():
+                    if not sale_customer_select.value:
+                      ui.notify("請選擇客戶", color="warning")
+                      return
+                    if not sale_line_rows:
+                      ui.notify("請至少新增一個品項", color="warning")
+                      return
+                    details = []
+                    subtotal = 0.0
+                    for i, r in enumerate(sale_line_rows, start=1):
+                      item_id = r["item_sel"].value
+                      qty = float(r["qty"].value or 0)
+                      amount = float(r["amount"].value or 0)
+                      warehouse = r["warehouse"].value
+                      if not item_id or qty <= 0 or not warehouse:
+                        ui.notify(
+                            f"第 {i} 行商品／數量／倉庫沒填好（倉庫必填）",
+                            color="warning",
+                        )
+                        return
+                      line = {
+                          "ID": i, "ItemID": item_id, "Qty": qty, "Amount": amount,
+                          "Warehouse": warehouse, "IsFree": bool(r["isfree"].value),
+                      }
+                      if (r["lotno"].value or "").strip():
+                        line["LotNo"] = r["lotno"].value.strip()
+                      if (r["memo"].value or "").strip():
+                        line["Memo"] = r["memo"].value.strip()
+                      details.append(line)
+                      subtotal += amount
+
+                    tax_type = sale_taxtype_select.value
+                    total_tax, total_amount = compute_tax_and_total(subtotal, tax_type)
+
+                    sale_id = f"WEB{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+                    payload = {
+                        "ID": sale_id,
+                        "TradeDate": datetime.now().date().strftime("%Y/%m/%d"),
+                        "CustomerID": sale_customer_select.value,
+                        "Payment": sale_payment_select.value,
+                        "TaxType": tax_type,
+                        "TotalTax": total_tax,
+                        "TotalSaleAmount": total_amount,
+                        "SaleDetails": details,
+                    }
+                    sale_pending_payload["value"] = payload
+
+                    sale_confirm_dialog_body.clear()
+                    with sale_confirm_dialog_body:
+                      ui.label("確認建立銷貨單").classes(
+                          "text-base font-bold text-zinc-900"
+                      )
+                      ui.label(
+                          f"客戶：{customer_options_doc.get(sale_customer_select.value, '')}"
+                      ).classes("text-xs text-zinc-700")
+                      ui.label(
+                          f"課稅別：{MANUAL_TAXTYPE_OPTIONS[tax_type]}　"
+                          f"稅額：{total_tax:,.0f}"
+                      ).classes("text-xs text-zinc-700")
+                      ui.label(
+                          f"共 {len(details)} 個品項，總金額（含稅）"
+                          f" {total_amount:,.0f}"
+                      ).classes("text-xs text-zinc-700")
+                      ui.label(
+                          "銷貨單會馬上扣庫存，送出後無法在這裡復原，請確認"
+                          "無誤。"
+                      ).classes("text-xs text-amber-700 mt-2")
+                    sale_confirm_dialog.open()
+
+                  def handle_sale_confirm_click():
+                    payload = sale_pending_payload["value"]
+                    if not payload:
+                      sale_confirm_dialog.close()
+                      return
+                    token = get_a1_token()
+                    if not token:
+                      ui.notify("無法登入 A1，請確認 API 憑證", color="warning")
+                      return
+                    ok, msg = upload_sale_to_a1(token, payload)
+                    sale_confirm_dialog.close()
+                    if ok:
+                      ui.notify(f"銷貨單建立成功（{payload['ID']}）", color="positive")
+                      reset_sale_form()
+                    else:
+                      ui.notify(f"建立失敗：{msg}", color="negative")
+                      print(f"[銷貨單上傳] 失敗：{payload['ID']}｜{msg}")
+
+                  sale_confirm_button.on_click(handle_sale_confirm_click)
+                  ui.button("建立銷貨單", on_click=handle_sale_submit_click).classes(
+                      "px-4 py-2 text-xs rounded-lg bg-amber-600 text-white font-bold"
+                  )
+
+              with ui.tab_panel(tab_create_purchase):
+                with ui.card().classes(
+                    "w-full p-6 bg-white border border-[#e6e1d4]"
+                    " shadow-[0_1px_3px_rgba(42,40,35,0.06)] rounded-lg"
+                ):
+                  ui.label("上傳採購單").classes(
+                      "text-base font-bold text-zinc-900 mb-2"
+                  )
+                  ui.label(
+                      "會建立成 A1 的「採購單」（Purchases[Post]），只記錄"
+                      "要跟廠商採購的品項，不影響庫存，等實際進貨、開進貨單"
+                      "時才會增加庫存。這裡不會留存上傳紀錄，正式紀錄請至"
+                      "A1 查看。"
+                  ).classes("text-xs text-zinc-500 mb-3")
+
+                  with ui.row().classes("items-end gap-3 flex-wrap mb-3"):
+                    purchase_supplier_select = ui.select(
+                        options=supplier_options_doc, label="廠商", with_input=True,
+                    ).props("dense outlined").classes("w-64")
+                    purchase_predate_input = ui.input(
+                        label="預交日期",
+                        value=(datetime.now().date() + timedelta(days=3)).isoformat(),
+                    ).props('dense outlined type="date"').classes("w-44")
+                    purchase_taxtype_select = ui.select(
+                        options=MANUAL_TAXTYPE_OPTIONS, label="課稅別", value="0",
+                    ).props("dense outlined").classes("w-32")
+
+                  purchase_lines_container = ui.column().classes("w-full gap-2 mb-2")
+                  purchase_line_rows = []
+                  purchase_total_label = ui.label("合計金額：0").classes(
+                      "text-sm font-bold text-zinc-700 mb-3"
+                  )
+
+                  def update_purchase_total():
+                    total = sum(
+                        float(r["amount"].value or 0) for r in purchase_line_rows
+                    )
+                    purchase_total_label.text = f"合計金額：{total:,.0f}"
+
+                  def add_purchase_line():
+                    with purchase_lines_container:
+                      with ui.row().classes("w-full items-center gap-2") as row:
+                        item_sel = ui.select(
+                            options=item_options_doc, label="商品", with_input=True,
+                        ).props("dense outlined").classes("flex-1")
+                        qty_input = ui.number(label="數量", value=1, min=0).props(
+                            "dense outlined"
+                        ).classes("w-24")
+                        amount_input = ui.number(label="金額", value=0, min=0).props(
+                            "dense outlined"
+                        ).classes("w-28")
+                        memo_input = ui.input(label="備註").props(
+                            "dense outlined"
+                        ).classes("w-36")
+
+                        def remove_this_line():
+                          purchase_lines_container.remove(row)
+                          purchase_line_rows.remove(entry)
+                          update_purchase_total()
+
+                        ui.button(icon="close", on_click=remove_this_line).props(
+                            "flat dense round"
+                        )
+                    entry = {
+                        "item_sel": item_sel, "qty": qty_input,
+                        "amount": amount_input, "memo": memo_input,
+                    }
+                    purchase_line_rows.append(entry)
+                    amount_input.on_value_change(lambda e: update_purchase_total())
+                    update_purchase_total()
+
+                  with ui.row().classes("gap-2 mb-3"):
+                    ui.button("+ 新增品項", on_click=add_purchase_line).classes(
+                        "px-3 py-1 text-xs rounded-lg"
+                    )
+                  add_purchase_line()
+
+                  with ui.dialog() as purchase_confirm_dialog, ui.card().classes(
+                      "min-w-[360px] max-w-[90vw] p-5"
+                  ):
+                    purchase_confirm_dialog_body = ui.column().classes("w-full gap-2")
+                    with ui.row().classes("w-full justify-end gap-2 mt-4"):
+                      ui.button(
+                          "取消", on_click=purchase_confirm_dialog.close
+                      ).classes("px-4 py-1 text-xs rounded-lg")
+                      purchase_confirm_button = ui.button("確認建立").classes(
+                          "sync-btn px-4 py-1 text-xs rounded-lg"
+                      )
+
+                  purchase_pending_payload = {"value": None}
+
+                  def reset_purchase_form():
+                    purchase_supplier_select.value = None
+                    purchase_predate_input.value = (
+                        datetime.now().date() + timedelta(days=3)
+                    ).isoformat()
+                    purchase_taxtype_select.value = "0"
+                    purchase_lines_container.clear()
+                    purchase_line_rows.clear()
+                    add_purchase_line()
+
+                  def handle_purchase_submit_click():
+                    if not purchase_supplier_select.value:
+                      ui.notify("請選擇廠商", color="warning")
+                      return
+                    if not purchase_line_rows:
+                      ui.notify("請至少新增一個品項", color="warning")
+                      return
+                    try:
+                      pre_date = datetime.strptime(
+                          purchase_predate_input.value, "%Y-%m-%d"
+                      ).date()
+                    except (ValueError, TypeError):
+                      ui.notify("預交日期格式錯誤", color="warning")
+                      return
+
+                    details = []
+                    subtotal = 0.0
+                    for i, r in enumerate(purchase_line_rows, start=1):
+                      item_id = r["item_sel"].value
+                      qty = float(r["qty"].value or 0)
+                      amount = float(r["amount"].value or 0)
+                      if not item_id or qty <= 0:
+                        ui.notify(f"第 {i} 行商品或數量沒填好", color="warning")
+                        return
+                      line = {
+                          "ID": i, "ItemID": item_id, "Qty": qty, "Amount": amount,
+                          "PreDeliveryDate": pre_date.strftime("%Y/%m/%d"),
+                      }
+                      if (r["memo"].value or "").strip():
+                        line["Memo"] = r["memo"].value.strip()
+                      details.append(line)
+                      subtotal += amount
+
+                    tax_type = purchase_taxtype_select.value
+                    total_tax, total_amount = compute_tax_and_total(subtotal, tax_type)
+
+                    purchase_id = f"WEB{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+                    payload = {
+                        "ID": purchase_id,
+                        "TradeDate": datetime.now().date().strftime("%Y/%m/%d"),
+                        "SupplierID": purchase_supplier_select.value,
+                        "TaxType": tax_type,
+                        "TotalTax": total_tax,
+                        "TotalAmount": total_amount,
+                        "PreDeliveryDate": pre_date.strftime("%Y/%m/%d"),
+                        "PurchaseDetails": details,
+                    }
+                    purchase_pending_payload["value"] = payload
+
+                    purchase_confirm_dialog_body.clear()
+                    with purchase_confirm_dialog_body:
+                      ui.label("確認建立採購單").classes(
+                          "text-base font-bold text-zinc-900"
+                      )
+                      ui.label(
+                          f"廠商：{supplier_options_doc.get(purchase_supplier_select.value, '')}"
+                      ).classes("text-xs text-zinc-700")
+                      ui.label(f"預交日期：{pre_date.isoformat()}").classes(
+                          "text-xs text-zinc-700"
+                      )
+                      ui.label(
+                          f"共 {len(details)} 個品項，總金額（含稅）"
+                          f" {total_amount:,.0f}"
+                      ).classes("text-xs text-zinc-700")
+                      ui.label(
+                          "送出後會直接寫入 A1 正式系統，請確認無誤。"
+                      ).classes("text-xs text-amber-700 mt-2")
+                    purchase_confirm_dialog.open()
+
+                  def handle_purchase_confirm_click():
+                    payload = purchase_pending_payload["value"]
+                    if not payload:
+                      purchase_confirm_dialog.close()
+                      return
+                    token = get_a1_token()
+                    if not token:
+                      ui.notify("無法登入 A1，請確認 API 憑證", color="warning")
+                      return
+                    ok, msg = upload_purchase_to_a1(token, payload)
+                    purchase_confirm_dialog.close()
+                    if ok:
+                      ui.notify(f"採購單建立成功（{payload['ID']}）", color="positive")
+                      reset_purchase_form()
+                    else:
+                      ui.notify(f"建立失敗：{msg}", color="negative")
+                      print(f"[採購單上傳] 失敗：{payload['ID']}｜{msg}")
+
+                  purchase_confirm_button.on_click(handle_purchase_confirm_click)
+                  ui.button(
+                      "建立採購單", on_click=handle_purchase_submit_click,
+                  ).classes(
+                      "px-4 py-2 text-xs rounded-lg bg-amber-600 text-white font-bold"
+                  )
+
+              with ui.tab_panel(tab_create_receive):
+                with ui.card().classes(
+                    "w-full p-6 bg-white border border-[#e6e1d4]"
+                    " shadow-[0_1px_3px_rgba(42,40,35,0.06)] rounded-lg"
+                ):
+                  ui.label("上傳進貨單").classes(
+                      "text-base font-bold text-zinc-900 mb-2"
+                  )
+                  ui.label(
+                      "會建立成 A1 的「進貨單」（Receives[Post]），會馬上"
+                      "增加庫存。這裡不會留存上傳紀錄，正式紀錄請至 A1"
+                      "查看。"
+                  ).classes("text-xs text-zinc-500 mb-3")
+                  ui.label(
+                      "手冊裡這個欄位名稱有兩種寫法（欄位表寫"
+                      "「ReceiveDetails」，範例JSON寫成「ReceiDetails」，"
+                      "兩者不一致），這裡先用手冊表格的完整拼法，如果送出"
+                      "後跟「上傳訂單」一開始遇到的狀況一樣出現"
+                      "「400002訂單單身不可空白」，代表要改成另一種拼法，"
+                      "跟我說一聲我立刻改。"
+                  ).classes("text-xs text-amber-700 mb-3")
+
+                  with ui.row().classes("items-end gap-3 flex-wrap mb-3"):
+                    receive_supplier_select = ui.select(
+                        options=supplier_options_doc, label="廠商", with_input=True,
+                    ).props("dense outlined").classes("w-64")
+                    receive_payment_select = ui.select(
+                        options={"1": "現金", "M": "賒進(月結)"},
+                        label="付款方式", value="M",
+                    ).props("dense outlined").classes("w-32")
+                    receive_taxtype_select = ui.select(
+                        options=MANUAL_TAXTYPE_OPTIONS, label="課稅別", value="0",
+                    ).props("dense outlined").classes("w-32")
+
+                  receive_lines_container = ui.column().classes("w-full gap-2 mb-2")
+                  receive_line_rows = []
+                  receive_total_label = ui.label("合計金額：0").classes(
+                      "text-sm font-bold text-zinc-700 mb-3"
+                  )
+
+                  def update_receive_total():
+                    total = sum(
+                        float(r["amount"].value or 0) for r in receive_line_rows
+                    )
+                    receive_total_label.text = f"合計金額：{total:,.0f}"
+
+                  def add_receive_line():
+                    with receive_lines_container:
+                      with ui.row().classes("w-full items-center gap-2") as row:
+                        item_sel = ui.select(
+                            options=item_options_doc, label="商品", with_input=True,
+                        ).props("dense outlined").classes("flex-1")
+                        qty_input = ui.number(label="數量", value=1, min=0).props(
+                            "dense outlined"
+                        ).classes("w-20")
+                        amount_input = ui.number(label="金額", value=0, min=0).props(
+                            "dense outlined"
+                        ).classes("w-24")
+                        warehouse_sel = ui.select(
+                            options=warehouse_options_doc, label="倉庫",
+                        ).props("dense outlined").classes("w-28")
+                        purchaseno_input = ui.input(label="採購單號").props(
+                            "dense outlined"
+                        ).classes("w-28")
+                        memo_input = ui.input(label="備註").props(
+                            "dense outlined"
+                        ).classes("w-28")
+
+                        def remove_this_line():
+                          receive_lines_container.remove(row)
+                          receive_line_rows.remove(entry)
+                          update_receive_total()
+
+                        ui.button(icon="close", on_click=remove_this_line).props(
+                            "flat dense round"
+                        )
+                    entry = {
+                        "item_sel": item_sel, "qty": qty_input, "amount": amount_input,
+                        "warehouse": warehouse_sel, "purchaseno": purchaseno_input,
+                        "memo": memo_input,
+                    }
+                    receive_line_rows.append(entry)
+                    amount_input.on_value_change(lambda e: update_receive_total())
+                    update_receive_total()
+
+                  with ui.row().classes("gap-2 mb-3"):
+                    ui.button("+ 新增品項", on_click=add_receive_line).classes(
+                        "px-3 py-1 text-xs rounded-lg"
+                    )
+                  add_receive_line()
+
+                  with ui.dialog() as receive_confirm_dialog, ui.card().classes(
+                      "min-w-[360px] max-w-[90vw] p-5"
+                  ):
+                    receive_confirm_dialog_body = ui.column().classes("w-full gap-2")
+                    with ui.row().classes("w-full justify-end gap-2 mt-4"):
+                      ui.button(
+                          "取消", on_click=receive_confirm_dialog.close
+                      ).classes("px-4 py-1 text-xs rounded-lg")
+                      receive_confirm_button = ui.button("確認建立").classes(
+                          "sync-btn px-4 py-1 text-xs rounded-lg"
+                      )
+
+                  receive_pending_payload = {"value": None}
+
+                  def reset_receive_form():
+                    receive_supplier_select.value = None
+                    receive_payment_select.value = "M"
+                    receive_taxtype_select.value = "0"
+                    receive_lines_container.clear()
+                    receive_line_rows.clear()
+                    add_receive_line()
+
+                  def handle_receive_submit_click():
+                    if not receive_supplier_select.value:
+                      ui.notify("請選擇廠商", color="warning")
+                      return
+                    if not receive_line_rows:
+                      ui.notify("請至少新增一個品項", color="warning")
+                      return
+                    details = []
+                    subtotal = 0.0
+                    for i, r in enumerate(receive_line_rows, start=1):
+                      item_id = r["item_sel"].value
+                      qty = float(r["qty"].value or 0)
+                      amount = float(r["amount"].value or 0)
+                      warehouse = r["warehouse"].value
+                      if not item_id or qty <= 0 or not warehouse:
+                        ui.notify(
+                            f"第 {i} 行商品／數量／倉庫沒填好（倉庫必填）",
+                            color="warning",
+                        )
+                        return
+                      line = {
+                          "ID": i, "ItemID": item_id, "Qty": qty, "Amount": amount,
+                          "Warehouse": warehouse,
+                      }
+                      if (r["purchaseno"].value or "").strip():
+                        line["PurchaseNo"] = r["purchaseno"].value.strip()
+                      if (r["memo"].value or "").strip():
+                        line["Memo"] = r["memo"].value.strip()
+                      details.append(line)
+                      subtotal += amount
+
+                    tax_type = receive_taxtype_select.value
+                    total_tax, total_amount = compute_tax_and_total(subtotal, tax_type)
+
+                    receive_id = f"WEB{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+                    payload = {
+                        "ID": receive_id,
+                        "TradeDate": datetime.now().date().strftime("%Y/%m/%d"),
+                        "SupplierID": receive_supplier_select.value,
+                        "Payment": receive_payment_select.value,
+                        "TaxType": tax_type,
+                        "TotalTax": total_tax,
+                        "TotalAmount": total_amount,
+                        "ReceiveDetails": details,
+                    }
+                    receive_pending_payload["value"] = payload
+
+                    receive_confirm_dialog_body.clear()
+                    with receive_confirm_dialog_body:
+                      ui.label("確認建立進貨單").classes(
+                          "text-base font-bold text-zinc-900"
+                      )
+                      ui.label(
+                          f"廠商：{supplier_options_doc.get(receive_supplier_select.value, '')}"
+                      ).classes("text-xs text-zinc-700")
+                      ui.label(
+                          f"共 {len(details)} 個品項，總金額（含稅）"
+                          f" {total_amount:,.0f}"
+                      ).classes("text-xs text-zinc-700")
+                      ui.label(
+                          "進貨單會馬上增加庫存，送出後無法在這裡復原，請"
+                          "確認無誤。"
+                      ).classes("text-xs text-amber-700 mt-2")
+                    receive_confirm_dialog.open()
+
+                  def handle_receive_confirm_click():
+                    payload = receive_pending_payload["value"]
+                    if not payload:
+                      receive_confirm_dialog.close()
+                      return
+                    token = get_a1_token()
+                    if not token:
+                      ui.notify("無法登入 A1，請確認 API 憑證", color="warning")
+                      return
+                    ok, msg = upload_receive_to_a1(token, payload)
+                    receive_confirm_dialog.close()
+                    if ok:
+                      ui.notify(f"進貨單建立成功（{payload['ID']}）", color="positive")
+                      reset_receive_form()
+                    else:
+                      ui.notify(f"建立失敗：{msg}", color="negative")
+                      print(f"[進貨單上傳] 失敗：{payload['ID']}｜{msg}")
+
+                  receive_confirm_button.on_click(handle_receive_confirm_click)
+                  ui.button(
+                      "建立進貨單", on_click=handle_receive_submit_click,
+                  ).classes(
+                      "px-4 py-2 text-xs rounded-lg bg-amber-600 text-white font-bold"
+                  )
 
           # ==================================================
           # 4. 生產與包裝排程
