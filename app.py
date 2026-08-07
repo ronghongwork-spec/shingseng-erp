@@ -2010,16 +2010,23 @@ def compute_dashboard_announcements(orders, items_map, bom_map, stock_lookup, se
       orders, items_map, bom_map, stock_lookup, settings, horizon_days
   )
 
+  # 訂單出貨提醒：同一張訂單如果有好幾個品項，原始資料(orders_in_horizon)
+  # 會是一個品項一列，這裡先依「訂單編號」分組，同一張訂單只顯示一行
+  # （取最早的預計出貨日），不逐項列出品名/數量明細，畫面才不會被拆成
+  # 一堆瑣碎的品項提醒。沒有訂單編號的品項(用品號當識別碼)不會被誤併，
+  # 分組鍵固定用「訂單編號 or 品號」跟原本order_label邏輯一致。
+  orders_by_key = {}
+  for o in result["orders_in_horizon"]:
+    key = o["訂單編號"] or o["品號"]
+    if key not in orders_by_key or o["預計出貨日"] < orders_by_key[key]["預計出貨日"]:
+      orders_by_key[key] = o
+
   shipping = []
-  for o in sorted(result["orders_in_horizon"], key=lambda x: x["預計出貨日"]):
+  for key, o in sorted(orders_by_key.items(), key=lambda kv: kv[1]["預計出貨日"]):
     days_left = (o["預計出貨日"] - today).days
     severity = "danger" if days_left <= 1 else "warning" if days_left <= 3 else "info"
-    order_label = o["訂單編號"] or o["品號"]
     shipping.append({
-        "text": (
-            f"訂單 {order_label}（{o.get('品名') or o['品號']}）需於"
-            f" {o['預計出貨日'].isoformat()} 出貨（數量 {o['預計出貨數量']:g}）"
-        ),
+        "text": f"訂單 {key} 需於 {o['預計出貨日'].isoformat()} 出貨",
         "severity": severity,
     })
 
@@ -2041,8 +2048,8 @@ def compute_dashboard_announcements(orders, items_map, bom_map, stock_lookup, se
     severity = "danger" if (days_left is not None and days_left <= 2) else "warning"
     production.append({
         "text": (
-            f"生產組裝確認：{r.get('品名') or item_id} 缺口 {r['缺口']:g}，"
-            f"原料已備妥，建議安排組裝／生產（最早出貨日 {r['最早出貨日']}）"
+            f"生產組裝確認：{item_id}，原料已備妥，建議安排組裝／生產"
+            f"（最早出貨日 {r['最早出貨日']}）"
         ),
         "severity": severity,
     })
@@ -2595,7 +2602,7 @@ def inventory_dashboard():
       ui.label(title).classes("text-sm font-bold text-zinc-700 mb-2")
       ui.label(hint).classes("text-xs text-zinc-500")
 
-  async def render_shopline_channel(access_token, user_agent, channel_title):
+  async def render_shopline_channel(access_token, user_agent, channel_title, restock_target=None):
     """SHOPLINE官網訂單通路的共用畫面（興聖官網(海濤客)／官網(JDH)／
     芙萊柏官網-B'f 都呼叫這支，只是傳入的access_token/user_agent/標題不同）。
     抓近3個月「待處理」+「已確認」訂單，畫面：
@@ -2608,11 +2615,16 @@ def inventory_dashboard():
     每次「切換到這個分頁」都會重新打一次API抓最新資料；分頁內也有「重新
     整理」按鈕，不用離開分頁再切回來也能手動重抓一次。
 
+    restock_target：這個通路的商品要向誰請備貨/採購，會顯示在商品需求
+    彙總的標題裡（不同通路賣的商品可能來自不同工廠/公司，備貨對象不一定
+    跟通路本身掛在哪個公司頁籤一樣）。沒傳的話預設用channel_title。
+
     這支是async函式，實際打API的地方都用 run.io_bound() 包起來，讓抓資料
     這段「同步阻塞」的過程丟到背景執行緒跑，不會卡住整個伺服器的事件
     迴圈──不然一個人切到這個分頁在等API回應時，全部人的畫面都會跟著
     卡住沒反應。
     """
+    restock_target = restock_target or channel_title
     def fetch_data():
       created_after = (
           datetime.utcnow() - timedelta(days=SHOPLINE_LOOKBACK_DAYS)
@@ -2752,8 +2764,8 @@ def inventory_dashboard():
         ):
           with ui.row().classes("w-full items-center justify-between mb-3"):
             ui.label(
-                f"未出貨商品需求彙總（共 {len(rows)} 個品項，供向海濤客"
-                "食品工廠請備貨/採購用）"
+                f"未出貨商品需求彙總（共 {len(rows)} 個品項，"
+                f"供向{restock_target}請備貨/採購用）"
             ).classes("text-sm font-bold text-zinc-700")
 
             def handle_export():
@@ -2830,6 +2842,15 @@ def inventory_dashboard():
       ("興聖(股)公司", "官網(海濤客)"): (SHOPLINE_XINGSHENG_ACCESS_TOKEN, SHOPLINE_XINGSHENG_USER_AGENT),
       ("興聖(股)公司", "官網(JDH)"): (SHOPLINE_XINGSHENG_JDH_ACCESS_TOKEN, SHOPLINE_XINGSHENG_JDH_USER_AGENT),
       ("芙萊柏(股)公司", "官網-B'f"): (SHOPLINE_FULAIBO_ACCESS_TOKEN, SHOPLINE_FULAIBO_USER_AGENT),
+  }
+
+  # (公司, 通路標籤) -> 這個通路的商品需求彙總要向誰請備貨/採購（不同
+  # 通路賣的商品可能來自不同工廠/公司，備貨對象不一定跟頁籤本身的公司
+  # 一樣，例如興聖官網(JDH)是要跟容鴻請備貨）。沒列出的通路，預設用該
+  # 頁籤所屬的公司名稱。
+  SHOPLINE_RESTOCK_TARGET = {
+      ("興聖(股)公司", "官網(海濤客)"): "海濤客食品工廠",
+      ("興聖(股)公司", "官網(JDH)"): "容鴻(股)公司",
   }
 
   # 公司 -> 每日出貨要用的A1帳密(api_key, api_password)。目前只有興聖，
@@ -3193,11 +3214,16 @@ def inventory_dashboard():
     等，依公司不同而不同）。一樣做成懶載入：只有實際點進某個通路，才會
     去打那個通路的API，不會切到「訂單出貨」就把底下所有通路一次全部
     打完。
+
+    注意：分頁列(ui.tabs)一定要在內容容器(channel_body)「之前」建立，
+    這樣分頁列在畫面排列順序上才會排在內容前面（天生在最上方）。順序
+    反過來的話，分頁列雖然視覺上看起來應該在上面，但因為content容器的
+    位置已經先佔走了，分頁列反而會被排到內容下方——這是之前修過的同一
+    種bug，這裡也要注意。
     """
     order_channels = ORDER_CHANNELS_BY_COMPANY.get(
         company_name, DEFAULT_ORDER_CHANNELS
     )
-    channel_body = ui.column().classes("w-full")
 
     async def handle_channel_change(ch):
       channel_body.clear()
@@ -3209,9 +3235,12 @@ def inventory_dashboard():
 
       channel_body.clear()
       shopline_creds = SHOPLINE_CHANNEL_CREDENTIALS.get((company_name, ch))
+      restock_target = SHOPLINE_RESTOCK_TARGET.get((company_name, ch), company_name)
       with channel_body:
         if shopline_creds:
-          await render_shopline_channel(shopline_creds[0], shopline_creds[1], ch)
+          await render_shopline_channel(
+              shopline_creds[0], shopline_creds[1], ch, restock_target
+          )
         else:
           render_section_placeholder(
               f"訂單出貨－{ch}",
@@ -3223,6 +3252,8 @@ def inventory_dashboard():
     ).classes("w-full") as channel_tabs:
       for ch in order_channels:
         ui.tab(ch)
+
+    channel_body = ui.column().classes("w-full")
     channel_tabs.set_value(order_channels[0])
 
   def render_channel_company_page(company_name):
