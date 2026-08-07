@@ -1529,6 +1529,26 @@ def load_bom_from_excel(path):
   return bom_map
 
 
+def _get_gspread_client():
+  """建立可讀寫的 gspread client（共用給讀取跟寫入用）。
+  回傳 None 代表沒有設定 Google Sheets 憑證。
+  """
+  if not GOOGLE_SHEETS_CREDENTIALS_JSON or not GOOGLE_SHEET_ID:
+    return None
+  import gspread
+  from google.oauth2.service_account import Credentials
+
+  creds_info = json.loads(GOOGLE_SHEETS_CREDENTIALS_JSON)
+  creds = Credentials.from_service_account_info(
+      creds_info,
+      # 用完整的 spreadsheets 權限（含寫入），不是唯讀，這樣同一組憑證
+      # 讀取跟「手動建立訂單」要寫回Sheet兩邊都能共用，不用維護兩種
+      # scope的client。
+      scopes=["https://www.googleapis.com/auth/spreadsheets"],
+  )
+  return gspread.authorize(creds)
+
+
 def _fetch_google_sheet_records(tab_name):
   """共用的 Google Sheet 讀取邏輯（BOM／訂單資訊／銷售歷史都靠這支）。
 
@@ -1540,32 +1560,54 @@ def _fetch_google_sheet_records(tab_name):
   1. Google Cloud Console 建立服務帳號，下載 JSON 金鑰
   2. 把金鑰 JSON 的完整內容存進環境變數 GOOGLE_SHEETS_CREDENTIALS_JSON
   3. 把該服務帳號的 email（金鑰 JSON 裡的 client_email）加入 Google
-     Sheet 的「共用」名單，權限「檢視者」即可
+     Sheet 的「共用」名單，權限「編輯者」（不是唯讀，因為手動建立訂單
+     功能需要寫回這份Sheet）
   4. 設定 GOOGLE_SHEET_ID（Sheet 網址中 /d/ 與 /edit 中間那串）
   5. 分頁名稱要跟 BOM_GOOGLE_SHEET_TAB／ORDERS_GOOGLE_SHEET_TAB／
      SALES_HISTORY_GOOGLE_SHEET_TAB 一致，欄位標題要跟本檔案裡的
      BOM_COL_* / ORDER_COL_* / SALES_COL_* 常數完全一致
   6. requirements.txt 需要加上 gspread、google-auth
   """
-  if not GOOGLE_SHEETS_CREDENTIALS_JSON or not GOOGLE_SHEET_ID:
+  gc = _get_gspread_client()
+  if gc is None:
     return None
 
   try:
-    import gspread
-    from google.oauth2.service_account import Credentials
-
-    creds_info = json.loads(GOOGLE_SHEETS_CREDENTIALS_JSON)
-    creds = Credentials.from_service_account_info(
-        creds_info,
-        scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
-    )
-    gc = gspread.authorize(creds)
     sh = gc.open_by_key(GOOGLE_SHEET_ID)
     ws = sh.worksheet(tab_name)
     return ws.get_all_records()
   except Exception as e:
     print(f"讀取 Google Sheet「{tab_name}」分頁失敗：{e}")
     return []
+
+
+def append_rows_to_google_sheet(tab_name, rows):
+  """把 rows（list[dict]，key要對到Sheet的欄位標題）依照該分頁目前的
+  欄位順序，逐列附加到分頁最後面。用來讓「手動建立訂單」等功能可以把
+  新資料直接寫回Sheet，跟既有的訂單資訊共用同一份，不用另外維護一份
+  紀錄。
+
+  回傳 (成功筆數, 錯誤訊息)；成功時錯誤訊息是 None。
+  沒設定Google Sheets憑證時，回傳 (0, "尚未設定Google Sheets")。
+  """
+  gc = _get_gspread_client()
+  if gc is None:
+    return 0, "尚未設定 Google Sheets"
+  if not rows:
+    return 0, None
+
+  try:
+    sh = gc.open_by_key(GOOGLE_SHEET_ID)
+    ws = sh.worksheet(tab_name)
+    header = ws.row_values(1)
+    if not header:
+      return 0, f"「{tab_name}」分頁沒有標題列，無法對應欄位順序"
+
+    values = [[str(row.get(col, "")) for col in header] for row in rows]
+    ws.append_rows(values, value_input_option="USER_ENTERED")
+    return len(values), None
+  except Exception as e:
+    return 0, str(e)
 
 
 def load_bom_from_google_sheet():
@@ -4407,6 +4449,277 @@ def inventory_dashboard():
                     "會實際寫入 A1，上傳前請先確認 Sheet 裡的客戶代號／"
                     "金額都填對"
                 ).classes("text-xs text-amber-700")
+
+            # -----------------------------------------------------------
+            # 手動建立訂單：給「經銷／團購」這種沒有系統資料來源、業務用
+            # 電話/LINE臨時談成的訂單用——沒有任何自動化資料可以帶入，
+            # 只能人工填。做成表單直接送出 Orders[Post]，避免還要切到
+            # A1 系統裡重新輸入一次。客戶/商品選單直接用app_state裡已經
+            # 抓好的資料（跟「商品資訊」「庫存查詢」用同一份），不用額外
+            # 再打一次API。
+            # -----------------------------------------------------------
+            with ui.card().classes(
+                "w-full p-6 bg-white border border-[#e6e1d4]"
+                " shadow-[0_1px_3px_rgba(42,40,35,0.06)] rounded-lg mb-4"
+            ):
+              ui.label("手動建立訂單（經銷／團購臨時接單）").classes(
+                  "text-base font-bold text-zinc-900 mb-2"
+              )
+              ui.label(
+                  "沒有系統資料來源的臨時訂單，在這裡填寫送出，會建立成 A1"
+                  "的「訂單」（Orders[Post]，只記錄未來要出貨的承諾，不會"
+                  "馬上扣庫存，出貨時仍要另外在 A1 開銷貨單），同時會把"
+                  "品項寫進「訂單資訊」Google Sheet，出現在上面的訂單查詢"
+                  "/缺貨提醒裡，食品廠可以直接看到還有多少未出、何時要出。"
+              ).classes("text-xs text-zinc-500 mb-3")
+
+              customer_options = {
+                  cid: f"{cid} - {name}"
+                  for cid, name in (app_state.get("customers_map") or {}).items()
+              }
+              item_options = {
+                  iid: f"{iid} - {info.get('Name', '')}"
+                  for iid, info in (app_state.get("items_map") or {}).items()
+              }
+
+              with ui.row().classes("items-end gap-3 flex-wrap mb-3"):
+                manual_customer_select = ui.select(
+                    options=customer_options, label="客戶", with_input=True,
+                ).props("dense outlined").classes("w-72")
+                manual_predate_input = ui.input(
+                    label="預交日期",
+                    value=(datetime.now().date() + timedelta(days=3)).isoformat(),
+                ).props('dense outlined type="date"').classes("w-44")
+
+              manual_lines_container = ui.column().classes("w-full gap-2 mb-2")
+              manual_line_rows = []
+
+              manual_total_label = ui.label("合計金額：0").classes(
+                  "text-sm font-bold text-zinc-700 mb-3"
+              )
+
+              def update_manual_total():
+                total = sum(
+                    float(r["amount"].value or 0) for r in manual_line_rows
+                )
+                manual_total_label.text = f"合計金額：{total:,.0f}"
+
+              def add_manual_line():
+                with manual_lines_container:
+                  with ui.row().classes("w-full items-center gap-2") as row:
+                    item_sel = ui.select(
+                        options=item_options, label="商品", with_input=True,
+                    ).props("dense outlined").classes("flex-1")
+                    qty_input = ui.number(
+                        label="數量", value=1, min=0,
+                    ).props("dense outlined").classes("w-24")
+                    amount_input = ui.number(
+                        label="金額", value=0, min=0,
+                    ).props("dense outlined").classes("w-28")
+
+                    def remove_this_line():
+                      manual_lines_container.remove(row)
+                      manual_line_rows.remove(entry)
+                      update_manual_total()
+
+                    ui.button(icon="close", on_click=remove_this_line).props(
+                        "flat dense round"
+                    )
+                entry = {
+                    "item_sel": item_sel, "qty": qty_input, "amount": amount_input,
+                }
+                manual_line_rows.append(entry)
+                amount_input.on_value_change(lambda e: update_manual_total())
+                update_manual_total()
+
+              with ui.row().classes("gap-2 mb-3"):
+                ui.button("+ 新增品項", on_click=add_manual_line).classes(
+                    "px-3 py-1 text-xs rounded-lg"
+                )
+
+              add_manual_line()
+
+              manual_created_container = ui.column().classes("w-full gap-1 mt-2")
+              manual_created_list = []
+
+              def render_manual_created_list():
+                manual_created_container.clear()
+                if not manual_created_list:
+                  return
+                with manual_created_container:
+                  ui.label(
+                      f"本次工作階段已建立 {len(manual_created_list)} 張"
+                      "（這份清單只是操作確認、重新整理頁面就會消失；正式"
+                      "持久的紀錄在上面的「訂單與出貨管理」表格跟「訂單"
+                      "資訊」Google Sheet 裡都查得到）"
+                  ).classes("text-xs text-zinc-400")
+                  for rec in reversed(manual_created_list[-10:]):
+                    ui.label(
+                        f"{rec['訂單編號']}｜{rec['客戶']}｜"
+                        f"{rec['品項數']}個品項｜{rec['金額']:,.0f}元｜"
+                        f"預交 {rec['預交日期']}"
+                    ).classes("text-xs text-zinc-600")
+
+              with ui.dialog() as manual_confirm_dialog, ui.card().classes(
+                  "min-w-[360px] max-w-[90vw] p-5"
+              ):
+                manual_confirm_dialog_body = ui.column().classes("w-full gap-2")
+                with ui.row().classes("w-full justify-end gap-2 mt-4"):
+                  ui.button(
+                      "取消", on_click=manual_confirm_dialog.close
+                  ).classes("px-4 py-1 text-xs rounded-lg")
+                  manual_confirm_button = ui.button("確認建立").classes(
+                      "sync-btn px-4 py-1 text-xs rounded-lg"
+                  )
+
+              manual_pending_payload = {"value": None}
+
+              def reset_manual_form():
+                manual_customer_select.value = None
+                manual_predate_input.value = (
+                    datetime.now().date() + timedelta(days=3)
+                ).isoformat()
+                manual_lines_container.clear()
+                manual_line_rows.clear()
+                add_manual_line()
+
+              def handle_manual_submit_click():
+                if not manual_customer_select.value:
+                  ui.notify("請選擇客戶", color="warning")
+                  return
+                if not manual_line_rows:
+                  ui.notify("請至少新增一個品項", color="warning")
+                  return
+                try:
+                  pre_date = datetime.strptime(
+                      manual_predate_input.value, "%Y-%m-%d"
+                  ).date()
+                except (ValueError, TypeError):
+                  ui.notify("預交日期格式錯誤", color="warning")
+                  return
+
+                details = []
+                total = 0.0
+                for i, r in enumerate(manual_line_rows, start=1):
+                  item_id = r["item_sel"].value
+                  qty = float(r["qty"].value or 0)
+                  amount = float(r["amount"].value or 0)
+                  if not item_id or qty <= 0:
+                    ui.notify(f"第 {i} 行商品或數量沒填好", color="warning")
+                    return
+                  details.append({
+                      "ID": i, "ItemID": item_id, "Qty": qty, "Amount": amount,
+                      "PreDeliveryDate": pre_date.strftime("%Y/%m/%d"),
+                  })
+                  total += amount
+
+                order_id = f"WEB{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+                payload = {
+                    "ID": order_id,
+                    "TradeDate": datetime.now().date().strftime("%Y/%m/%d"),
+                    "CustomerID": manual_customer_select.value,
+                    "TotalSaleAmount": round(total, 2),
+                    "PreDeliveryDate": pre_date.strftime("%Y/%m/%d"),
+                    "Details": details,
+                }
+                manual_pending_payload["value"] = payload
+
+                manual_confirm_dialog_body.clear()
+                with manual_confirm_dialog_body:
+                  ui.label("確認建立訂單").classes(
+                      "text-base font-bold text-zinc-900"
+                  )
+                  ui.label(
+                      f"客戶：{customer_options.get(manual_customer_select.value, '')}"
+                  ).classes("text-xs text-zinc-700")
+                  ui.label(f"預交日期：{pre_date.isoformat()}").classes(
+                      "text-xs text-zinc-700"
+                  )
+                  ui.label(
+                      f"共 {len(details)} 個品項，合計金額 {total:,.0f}"
+                  ).classes("text-xs text-zinc-700")
+                  ui.label(
+                      "送出後會直接寫入 A1 正式系統，請確認無誤。"
+                  ).classes("text-xs text-amber-700 mt-2")
+                manual_confirm_dialog.open()
+
+              def handle_manual_confirm_click():
+                payload = manual_pending_payload["value"]
+                if not payload:
+                  manual_confirm_dialog.close()
+                  return
+                token = get_a1_token()
+                if not token:
+                  ui.notify("無法登入 A1，請確認 API 憑證", color="warning")
+                  return
+                ok, msg = upload_order_to_a1(token, payload)
+                manual_confirm_dialog.close()
+                if ok:
+                  ui.notify(f"訂單建立成功（{payload['ID']}）", color="positive")
+
+                  # 同時把每個品項寫成一列，附加到「訂單資訊」Google
+                  # Sheet——這樣食品廠原本就在看的訂單出貨查詢/缺貨提醒
+                  # 會自動看到這張新訂單，不用另外開地方查。就算Sheet
+                  # 沒設定或寫入失敗，A1訂單已經成功建立，不會因此卡住，
+                  # 只會另外提示一次警告。
+                  items_map_now = app_state.get("items_map") or {}
+                  sheet_rows = [
+                      {
+                          ORDER_COL_NO: payload["ID"],
+                          ORDER_COL_ITEM_ID: d["ItemID"],
+                          ORDER_COL_ITEM_NAME: items_map_now.get(
+                              d["ItemID"], {}
+                          ).get("Name", ""),
+                          ORDER_COL_DUE_DATE: payload["PreDeliveryDate"],
+                          ORDER_COL_QTY: d["Qty"],
+                          ORDER_COL_STATUS: "未出貨",
+                          ORDER_COL_CUSTOMER_ID: payload["CustomerID"],
+                          ORDER_COL_AMOUNT: d["Amount"],
+                          ORDER_COL_MEMO: "經銷/團購臨時接單，網頁手動建立",
+                      }
+                      for d in payload["Details"]
+                  ]
+                  sheet_count, sheet_err = append_rows_to_google_sheet(
+                      ORDERS_GOOGLE_SHEET_TAB, sheet_rows
+                  )
+                  if sheet_err:
+                    ui.notify(
+                        f"A1訂單已建立成功，但寫入Google Sheet失敗："
+                        f"{sheet_err}（訂單編號：{payload['ID']}，可以自己"
+                        f"手動補登記到Sheet）",
+                        color="warning",
+                    )
+                  else:
+                    ui.notify(
+                        f"已同步寫入「訂單資訊」Sheet（{sheet_count}列）",
+                        color="positive",
+                    )
+                    if refs.get("update_orders_list"):
+                      refs["update_orders_list"]()
+
+                  manual_created_list.append({
+                      "訂單編號": payload["ID"],
+                      "客戶": customer_options.get(
+                          payload["CustomerID"], payload["CustomerID"]
+                      ),
+                      "預交日期": payload["PreDeliveryDate"],
+                      "金額": payload["TotalSaleAmount"],
+                      "品項數": len(payload["Details"]),
+                  })
+                  render_manual_created_list()
+                  reset_manual_form()
+                else:
+                  ui.notify(f"建立失敗：{msg}", color="negative")
+
+              manual_confirm_button.on_click(handle_manual_confirm_click)
+
+              ui.button(
+                  "建立訂單", on_click=handle_manual_submit_click,
+              ).classes(
+                  "px-4 py-2 text-xs rounded-lg bg-amber-600 text-white font-bold"
+              )
+
+              render_manual_created_list()
 
               orders_reminder_container = ui.column().classes("w-full gap-2 mb-4")
 
