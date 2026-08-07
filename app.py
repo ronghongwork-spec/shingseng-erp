@@ -4482,6 +4482,10 @@ def inventory_dashboard():
                   for iid, info in (app_state.get("items_map") or {}).items()
               }
 
+              MANUAL_TAXTYPE_OPTIONS = {
+                  "0": "免發票", "1": "應稅外加", "3": "免稅", "4": "應稅內含",
+              }
+
               with ui.row().classes("items-end gap-3 flex-wrap mb-3"):
                 manual_customer_select = ui.select(
                     options=customer_options, label="客戶", with_input=True,
@@ -4490,6 +4494,10 @@ def inventory_dashboard():
                     label="預交日期",
                     value=(datetime.now().date() + timedelta(days=3)).isoformat(),
                 ).props('dense outlined type="date"').classes("w-44")
+                manual_taxtype_select = ui.select(
+                    options=MANUAL_TAXTYPE_OPTIONS,
+                    label="課稅別", value="0",
+                ).props("dense outlined").classes("w-32")
 
               manual_lines_container = ui.column().classes("w-full gap-2 mb-2")
               manual_line_rows = []
@@ -4516,6 +4524,9 @@ def inventory_dashboard():
                     amount_input = ui.number(
                         label="金額", value=0, min=0,
                     ).props("dense outlined").classes("w-28")
+                    memo_input = ui.input(
+                        label="備註",
+                    ).props("dense outlined").classes("w-36")
 
                     def remove_this_line():
                       manual_lines_container.remove(row)
@@ -4527,6 +4538,7 @@ def inventory_dashboard():
                     )
                 entry = {
                     "item_sel": item_sel, "qty": qty_input, "amount": amount_input,
+                    "memo": memo_input,
                 }
                 manual_line_rows.append(entry)
                 amount_input.on_value_change(lambda e: update_manual_total())
@@ -4579,6 +4591,7 @@ def inventory_dashboard():
                 manual_predate_input.value = (
                     datetime.now().date() + timedelta(days=3)
                 ).isoformat()
+                manual_taxtype_select.value = "0"
                 manual_lines_container.clear()
                 manual_line_rows.clear()
                 add_manual_line()
@@ -4599,7 +4612,7 @@ def inventory_dashboard():
                   return
 
                 details = []
-                total = 0.0
+                subtotal = 0.0
                 for i, r in enumerate(manual_line_rows, start=1):
                   item_id = r["item_sel"].value
                   qty = float(r["qty"].value or 0)
@@ -4607,18 +4620,42 @@ def inventory_dashboard():
                   if not item_id or qty <= 0:
                     ui.notify(f"第 {i} 行商品或數量沒填好", color="warning")
                     return
-                  details.append({
+                  line = {
                       "ID": i, "ItemID": item_id, "Qty": qty, "Amount": amount,
                       "PreDeliveryDate": pre_date.strftime("%Y/%m/%d"),
-                  })
-                  total += amount
+                  }
+                  memo_val = (r["memo"].value or "").strip()
+                  if memo_val:
+                    line["Memo"] = memo_val
+                  details.append(line)
+                  subtotal += amount
+
+                # 依課稅別算稅額/總金額（手冊規則）：
+                # 0.免發票／3.免稅 → 不計稅，總金額=明細金額合計
+                # 1.應稅外加 → 明細金額視為「未稅」，稅額另外加總金額之上
+                # 4.應稅內含 → 明細金額視為「已含稅」，總金額=明細金額合計
+                # 稅率固定用5%（手冊範例皆用此稅率），如果之後稅率不同，
+                # 這裡要跟著調整。
+                tax_type = manual_taxtype_select.value
+                TAX_RATE = 0.05
+                if tax_type in ("0", "3"):
+                  total_tax = 0.0
+                  total_sale_amount = subtotal
+                elif tax_type == "1":
+                  total_tax = round(subtotal * TAX_RATE, 2)
+                  total_sale_amount = round(subtotal + total_tax, 2)
+                else:  # "4" 應稅內含
+                  total_tax = round(subtotal - subtotal / (1 + TAX_RATE), 2)
+                  total_sale_amount = round(subtotal, 2)
 
                 order_id = f"WEB{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
                 payload = {
                     "ID": order_id,
                     "TradeDate": datetime.now().date().strftime("%Y/%m/%d"),
                     "CustomerID": manual_customer_select.value,
-                    "TotalSaleAmount": round(total, 2),
+                    "TaxType": tax_type,
+                    "TotalTax": total_tax,
+                    "TotalSaleAmount": total_sale_amount,
                     "PreDeliveryDate": pre_date.strftime("%Y/%m/%d"),
                     "Details": details,
                 }
@@ -4636,7 +4673,12 @@ def inventory_dashboard():
                       "text-xs text-zinc-700"
                   )
                   ui.label(
-                      f"共 {len(details)} 個品項，合計金額 {total:,.0f}"
+                      f"課稅別：{MANUAL_TAXTYPE_OPTIONS[tax_type]}"
+                      f"　稅額：{total_tax:,.0f}"
+                  ).classes("text-xs text-zinc-700")
+                  ui.label(
+                      f"共 {len(details)} 個品項，總金額（含稅）"
+                      f" {total_sale_amount:,.0f}"
                   ).classes("text-xs text-zinc-700")
                   ui.label(
                       "送出後會直接寫入 A1 正式系統，請確認無誤。"
