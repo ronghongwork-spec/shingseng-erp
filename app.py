@@ -2478,6 +2478,159 @@ def compute_channel_breakdown(forecast_result, channel_percentages, target_reven
 COMPANIES = ["興聖(股)公司", "海濤客食品工業(股)公司", "容鴻(股)公司", "芙萊柏(股)公司"]
 ACTIVE_COMPANY_LABEL = "海濤客食品工業(股)公司"
 
+COMPANY_TAB_COLORS = {
+    "興聖(股)公司": {"text": "#5bc0be", "active_bg": "#5bc0be"},
+    "海濤客食品工業(股)公司": {"text": "#e0824a", "active_bg": "#e0824a"},
+    "容鴻(股)公司": {"text": "#8e7cc3", "active_bg": "#8e7cc3"},
+    "芙萊柏(股)公司": {"text": "#5b8fc0", "active_bg": "#5b8fc0"},
+}
+
+# -------------------------------------------------------------------------
+# App 切換器（雲端進銷存／雲端電商訂單／雲端會計／銷售分析 四個獨立頁面）
+# 每個App是一個獨立的 @ui.page 路由，共用同一個Render服務、同一組
+# Basic Auth登入，不用重複登入。之後陸續把內容搬過去對應的App時，這份
+# 清單也要記得同步更新標籤名稱/路徑。
+# -------------------------------------------------------------------------
+APP_SWITCHER_ITEMS = [
+    ("雲端進銷存", "/"),
+    ("雲端電商訂單", "/orders"),
+    ("雲端會計", "/accounting"),
+    ("銷售分析", "/analytics"),
+]
+
+
+def render_app_switcher(active_path):
+  """四個App之間的切換器，放在畫面最上方。用ui.link做頁面跳轉（不是
+  NiceGUI的tab_panels切換，因為這是四個「不同網址」的獨立頁面，要真的
+  換頁，不是同一頁裡切換內容）。
+  """
+  with ui.row().classes(
+      "w-full items-center gap-1 bg-[#f7f5ef] border-b border-[#e6e1d4] px-8 py-2"
+  ):
+    for label, path in APP_SWITCHER_ITEMS:
+      is_active = path == active_path
+      ui.link(label, path).classes(
+          "px-3 py-1 text-xs no-underline rounded-lg "
+          + (
+              "bg-[#2a2823] text-white font-bold"
+              if is_active
+              else "text-zinc-600 hover:bg-[#ece6d6]"
+          )
+      )
+
+
+def inject_global_theme_css():
+  """全站共用的字型/配色/元件樣式（暖石色底、襯線標題、柔和圓角+陰影）。
+  四個App頁面（進銷存／電商訂單／會計／銷售分析）都呼叫這支，確保視覺
+  風格一致，不會有的頁面有質感、有的頁面看起來像沒套用到設計。
+  """
+  ui.add_head_html("""
+        <link rel="preconnect" href="https://fonts.googleapis.com">
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+TC:wght@600;700&family=Noto+Sans+TC:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+        <style>
+            :root {
+              --bg: #f2f0ea;
+              --surface: #ffffff;
+              --surface-2: #f7f5ef;
+              --border: #e6e1d4;
+              --ink: #2a2823;
+              --muted: #8a8577;
+              --font-display: 'Noto Serif TC', serif;
+              --font-body: 'Noto Sans TC', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+              --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, monospace;
+            }
+            body { background-color: var(--bg); color: var(--ink); font-family: var(--font-body); }
+
+            /* 表格：白底卡片、柔和陰影取代生硬的滿版邊框，數字用等寬字體 */
+            .q-table__container { background-color: var(--surface) !important; border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 1px 3px rgba(42,40,35,.06) !important; overflow: hidden; }
+            .q-table th { color: var(--muted) !important; font-weight: 700 !important; font-size: 12px; letter-spacing: .02em; background: var(--surface-2) !important; border-bottom: 1px solid var(--border) !important; }
+            .q-table td { color: var(--ink) !important; border-bottom: 1px solid var(--surface-2) !important; font-family: var(--font-body); }
+            .q-table tbody tr:hover td { background: var(--surface-2) !important; }
+
+            /* 分頁：底線取代粗黑框，字重輕一點更沉穩 */
+            .q-tabs { border-bottom: 1px solid var(--border); }
+            .q-tab { color: var(--muted) !important; font-weight: 500; text-transform: none; font-family: var(--font-body); }
+            .q-tab--active { color: var(--ink) !important; font-weight: 700; }
+            .q-tab-indicator { background: #5bc0be !important; height: 2px !important; }
+
+            /* 按鈕：柔和圓角，主要動作按鈕用品牌色 */
+            .q-btn { border-radius: 6px !important; font-family: var(--font-body); }
+            .sync-btn { background-color: #4f9d9b !important; color: #ffffff !important; font-weight: 700; }
+
+            /* 輸入框/下拉選單也統一柔和圓角 */
+            .q-field__control { border-radius: 6px !important; }
+
+            /* 標題用襯線字型，跟內文區分出層次 */
+            h1, h2, .text-lg.font-bold, .text-xl.font-bold { font-family: var(--font-display); }
+        </style>
+    """)
+
+
+def inject_company_tab_css():
+  """公司分頁的顏色樣式（.company-tab-0～3），四個App頁面共用同一套，
+  只要呼叫這支就能套用，不用每個頁面各自重複寫一次CSS字串。
+  """
+  ui.add_head_html(
+      "<style>"
+      + "".join(
+          f".company-tab-{i} {{ color: {c['text']} !important; "
+          f"font-weight: 700 !important; }}"
+          f".company-tab-{i}.q-tab--active {{ background: {c['active_bg']}22 !important; "
+          f"border-bottom: 3px solid {c['active_bg']} !important; }}"
+          for i, c in enumerate(COMPANY_TAB_COLORS.values())
+      )
+      + "</style>"
+  )
+
+
+def render_company_switcher_placeholder(app_label):
+  """公司切換列的骨架版本——四個新App目前還沒把實際內容搬過去，先讓
+  「App切換＋公司切換」兩排並列的架構長出來，公司分頁點下去先顯示佔位
+  畫面。之後搬內容過來時，把render_section_placeholder(...)那行換成
+  真正的頁面渲染函式即可，不用動這裡的分頁結構。
+
+  注意：公司分頁列(ui.tabs)一定要在內容容器(content_container)「之前」
+  建立，這樣分頁列在畫面排列順序上才會天生排在內容前面（最上方）。順序
+  反過來的話，分頁列雖然視覺上看起來應該在上面，內容容器的位置卻已經
+  先佔走了，分頁列反而會被排到內容下方——這是本專案已經踩過兩次的坑，
+  這裡先直接避開。
+  """
+  inject_company_tab_css()
+
+  def handle_company_change(e):
+    content_container.clear()
+    with content_container:
+      with ui.column().classes(
+          "w-full p-8 max-w-[1600px] mx-auto items-center justify-center"
+      ):
+        with ui.card().classes(
+            "w-full p-16 bg-white border border-[#e6e1d4]"
+            " shadow-[0_1px_3px_rgba(42,40,35,0.06)] rounded-lg text-center"
+        ):
+          ui.label(f"{app_label}｜{e.value}").classes(
+              "text-lg font-bold text-zinc-900 mb-2"
+          )
+          ui.label("這個App的內容還沒搬過來，敬請期待").classes(
+              "text-sm text-zinc-500"
+          )
+
+  with ui.row().classes(
+      "w-full flex flex-nowrap items-center bg-white border-b border-[#e6e1d4]"
+      " px-8 py-3 sticky top-[41px] z-40"
+  ):
+    with ui.tabs(on_change=handle_company_change).props(
+        "dense no-caps"
+    ).classes("flex-shrink-0") as company_tabs:
+      for i, c in enumerate(COMPANIES):
+        ui.tab(c).classes(f"company-tab-{i}")
+
+  content_container = ui.column().classes("w-full")
+  company_tabs.set_value(COMPANIES[0])
+
+  return content_container, company_tabs
+
+
 # -------------------------------------------------------------------------
 # 靜態檔案（Logo 圖片）
 # 把公司 Logo 檔案放在 app.py 同層的 static/ 資料夾裡（例如
@@ -2563,47 +2716,8 @@ app_state = {
 
 @ui.page("/")
 def inventory_dashboard():
-  ui.add_head_html("""
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+TC:wght@600;700&family=Noto+Sans+TC:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
-        <style>
-            :root {
-              --bg: #f2f0ea;
-              --surface: #ffffff;
-              --surface-2: #f7f5ef;
-              --border: #e6e1d4;
-              --ink: #2a2823;
-              --muted: #8a8577;
-              --font-display: 'Noto Serif TC', serif;
-              --font-body: 'Noto Sans TC', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-              --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, monospace;
-            }
-            body { background-color: var(--bg); color: var(--ink); font-family: var(--font-body); }
-
-            /* 表格：白底卡片、柔和陰影取代生硬的滿版邊框，數字用等寬字體 */
-            .q-table__container { background-color: var(--surface) !important; border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 1px 3px rgba(42,40,35,.06) !important; overflow: hidden; }
-            .q-table th { color: var(--muted) !important; font-weight: 700 !important; font-size: 12px; letter-spacing: .02em; background: var(--surface-2) !important; border-bottom: 1px solid var(--border) !important; }
-            .q-table td { color: var(--ink) !important; border-bottom: 1px solid var(--surface-2) !important; font-family: var(--font-body); }
-            .q-table tbody tr:hover td { background: var(--surface-2) !important; }
-
-            /* 分頁：底線取代粗黑框，字重輕一點更沉穩 */
-            .q-tabs { border-bottom: 1px solid var(--border); }
-            .q-tab { color: var(--muted) !important; font-weight: 500; text-transform: none; font-family: var(--font-body); }
-            .q-tab--active { color: var(--ink) !important; font-weight: 700; }
-            .q-tab-indicator { background: #5bc0be !important; height: 2px !important; }
-
-            /* 按鈕：柔和圓角，主要動作按鈕用品牌色 */
-            .q-btn { border-radius: 6px !important; font-family: var(--font-body); }
-            .sync-btn { background-color: #4f9d9b !important; color: #ffffff !important; font-weight: 700; }
-
-            /* 輸入框/下拉選單也統一柔和圓角 */
-            .q-field__control { border-radius: 6px !important; }
-
-            /* 標題用襯線字型，跟內文區分出層次 */
-            h1, h2, .text-lg.font-bold, .text-xl.font-bold { font-family: var(--font-display); }
-        </style>
-    """)
+  inject_global_theme_css()
+  render_app_switcher("/")
 
   # -----------------------------------------------------------------------
   # 右上角分公司切換
@@ -2619,23 +2733,7 @@ def inventory_dashboard():
   # 裡面用到的 render_hai_tao_ke_page() 等函式，要等下面 content_container
   # 建立完、這些函式都 def 好之後才存在。實際觸發放在函式最後面。
   # -----------------------------------------------------------------------
-  COMPANY_TAB_COLORS = {
-      "興聖(股)公司": {"text": "#5bc0be", "active_bg": "#5bc0be"},
-      "海濤客食品工業(股)公司": {"text": "#e0824a", "active_bg": "#e0824a"},
-      "容鴻(股)公司": {"text": "#8e7cc3", "active_bg": "#8e7cc3"},
-      "芙萊柏(股)公司": {"text": "#5b8fc0", "active_bg": "#5b8fc0"},
-  }
-  ui.add_head_html(
-      "<style>"
-      + "".join(
-          f".company-tab-{i} {{ color: {c['text']} !important; "
-          f"font-weight: 700 !important; }}"
-          f".company-tab-{i}.q-tab--active {{ background: {c['active_bg']}22 !important; "
-          f"border-bottom: 3px solid {c['active_bg']} !important; }}"
-          for i, c in enumerate(COMPANY_TAB_COLORS.values())
-      )
-      + "</style>"
-  )
+  inject_company_tab_css()
 
   def handle_company_change(e):
     selected = e.value
@@ -2648,7 +2746,7 @@ def inventory_dashboard():
 
   with ui.row().classes(
       "w-full flex flex-nowrap items-center justify-between bg-white"
-      " border-b border-[#e6e1d4] px-8 py-4 sticky top-0 z-50"
+      " border-b border-[#e6e1d4] px-8 py-4 sticky top-[41px] z-50"
   ):
     with ui.row().classes("items-center gap-3 flex-shrink-0"):
       ui.label("興聖集團｜A1 智慧進銷存總管理系統").classes(
@@ -6518,6 +6616,34 @@ def inventory_dashboard():
   # render_xxx 函式都定義好之後，觸發一次「畫面初始內容」即可。
   company_tabs.set_value(ACTIVE_COMPANY_LABEL)
   render_hai_tao_ke_page()
+
+
+# =============================================================================
+# 以下三個是新規劃的App骨架（雲端電商訂單／雲端會計／銷售分析），目前都
+# 只有「App切換器 + 公司切換器」的架子，公司分頁點下去先顯示佔位畫面。
+# 之後陸續把內容搬過來時，是把 render_company_switcher_placeholder() 內部
+# handle_company_change() 裡「顯示佔位畫面」那段，換成真正的頁面渲染函式，
+# 不用動這個檔案其他地方，也不用重新設計App切換器/公司切換器。
+# =============================================================================
+@ui.page("/orders")
+def cloud_orders_dashboard():
+  inject_global_theme_css()
+  render_app_switcher("/orders")
+  render_company_switcher_placeholder("雲端電商訂單")
+
+
+@ui.page("/accounting")
+def cloud_accounting_dashboard():
+  inject_global_theme_css()
+  render_app_switcher("/accounting")
+  render_company_switcher_placeholder("雲端會計")
+
+
+@ui.page("/analytics")
+def sales_analytics_dashboard():
+  inject_global_theme_css()
+  render_app_switcher("/analytics")
+  render_company_switcher_placeholder("銷售分析")
 
 
 ui.run(port=8080, title="興聖集團 A1 智慧進銷存總管理系統", host="0.0.0.0")
