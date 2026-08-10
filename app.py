@@ -2140,8 +2140,8 @@ def compute_dashboard_announcements(orders, items_map, bom_map, stock_lookup, se
     severity = "danger" if (days_left is not None and days_left <= 2) else "warning"
     production.append({
         "text": (
-            f"生產組裝確認：{item_id}，原料已備妥，建議安排組裝／生產"
-            f"（最早出貨日 {r['最早出貨日']}）"
+            f"生產組裝確認：{r.get('品名') or item_id}，原料已備妥，建議"
+            f"安排組裝／生產（最早出貨日 {r['最早出貨日']}）"
         ),
         "severity": severity,
     })
@@ -3470,7 +3470,10 @@ def inventory_dashboard():
     slug = COMPANY_SLUGS.get(company_name, "default")
     tabs_class = f"section-tabs-{slug}"
 
-    SECTION_TABS = ["儀表板", "調撥紀錄", "退換貨記錄", "採購分析"]
+    if company_name in ("容鴻(股)公司", "芙萊柏(股)公司"):
+      SECTION_TABS = ["儀表板", "商品資訊", "調撥紀錄", "退換貨記錄", "採購分析"]
+    else:
+      SECTION_TABS = ["儀表板", "調撥紀錄", "退換貨記錄", "採購分析"]
 
     with content_container:
       with ui.column().classes("w-full p-8 max-w-[1600px] mx-auto gap-4"):
@@ -3510,6 +3513,18 @@ def inventory_dashboard():
               render_section_placeholder(
                   "儀表板", "尚未串接此分公司的庫存／訂單資料，敬請期待"
               )
+          elif tab_label == "商品資訊":
+            section_body.clear()
+            with section_body:
+              with ui.tabs().props("dense no-caps").classes("w-full mb-2") as product_sub_tabs:
+                ui.tab("庫存查詢")
+              with ui.tab_panels(product_sub_tabs, value="庫存查詢").classes(
+                  "w-full bg-transparent"
+              ):
+                with ui.tab_panel("庫存查詢"):
+                  render_section_placeholder(
+                      "庫存查詢", "此分公司尚未開通 A1 API，敬請期待"
+                  )
           elif tab_label == "調撥紀錄":
             section_body.clear()
             with section_body:
@@ -3811,12 +3826,8 @@ def inventory_dashboard():
                     })
                 risk_rows.sort(key=lambda r: r["缺口"], reverse=True)
 
-                # ---- 1.1/1.2/1.3：訂單需求 + BOM 展開缺貨預警 ----
+                # ---- 1.1/1.2：訂單需求相關 ----
                 today = datetime.now().date()
-                result_30 = compute_order_demand_alerts(
-                    orders, items_map, bom_map, stock_lookup, settings,
-                    horizon_days=30,
-                )
                 orders_today = [
                     o for o in orders
                     if o["狀態"] != "已出貨" and o["預計出貨日"] == today
@@ -3904,54 +3915,6 @@ def inventory_dashboard():
                   else:
                     _kpi_card(
                         "今日預計出貨訂單數／總量",
-                        "－（待設定 Google Sheets）",
-                        "info",
-                    )
-
-                  # ---- 卡片4：未來30天缺貨風險，點擊看成品+原料缺口 ----
-                  shortage_count = (
-                      len(result_30["finished_goods_shortfall"])
-                      + len(result_30["raw_material_shortfall"])
-                  )
-                  if orders_configured:
-                    combined_shortage_rows = [
-                        {
-                            "類型": "成品",
-                            "品號": r["品號"],
-                            "品名": r["品名"],
-                            "缺口": r["缺口"],
-                            "說明": f"最早出貨日 {r['最早出貨日']}",
-                        }
-                        for r in result_30["finished_goods_shortfall"]
-                    ] + [
-                        {
-                            "類型": "原料/子件",
-                            "品號": r["品號"],
-                            "品名": r["品名"],
-                            "缺口": r["缺口"],
-                            "說明": f"建議下單日 {r['建議下單日']}",
-                        }
-                        for r in result_30["raw_material_shortfall"]
-                    ]
-                    _kpi_card(
-                        "未來30天缺貨風險品項",
-                        f"{shortage_count} 項",
-                        "danger" if shortage_count else "success",
-                        on_click=lambda e=None: open_kpi_dialog(
-                            "未來30天缺貨風險品項（成品＋原料/子件）",
-                            combined_shortage_rows,
-                            [
-                                {"name": "類型", "label": "類型", "field": "類型", "align": "left"},
-                                {"name": "品號", "label": "品號", "field": "品號", "align": "left"},
-                                {"name": "品名", "label": "品名", "field": "品名", "align": "left"},
-                                {"name": "缺口", "label": "缺口", "field": "缺口"},
-                                {"name": "說明", "label": "說明", "field": "說明", "align": "left"},
-                            ],
-                        ),
-                    )
-                  else:
-                    _kpi_card(
-                        "未來30天缺貨風險品項",
                         "－（待設定 Google Sheets）",
                         "info",
                     )
