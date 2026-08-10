@@ -882,14 +882,20 @@ def fetch_item_image_data_uri(item_id, headers, sequence=1):
 
 
 def fetch_items_map(token):
-  """取得商品詳細資料（對應品名、分類、單位、平均成本、商品圖片等）
+  """取得商品詳細資料（對應品名、分類、單位、平均成本等）
 
   手冊 Items[Get] 無傳入商品代號時，只回傳 ID/Name，要拿到 CategoryID、
   UnitName、StdPurPrice 等完整欄位，必須逐筆呼叫 Items/{ItemID}。
   商品數量多時逐一序列呼叫會很慢，這裡改用多執行緒平行抓取明細，
   並針對單筆失敗加入重試，避免暫時性網路錯誤讓某些商品被靜默漏掉。
-  同時依手冊 ItemImage[Get] 一併嘗試抓取每個品號的圖片（第 1 張），
-  沒有圖片的商品會是 None，前端會改用預留圖示顯示。
+
+  刻意不抓商品圖片：ItemImage[Get]抓回來的圖檔會轉成base64長期留在
+  items_map裡（隨A1同步常駐在記憶體，不會釋放），商品數量一多很容易把
+  Render服務的記憶體上限（512MB）吃爆，實測就是造成"Out of memory"服務
+  掛掉的主因。而且目前畫面上也沒有任何地方真的顯示商品圖片，等於是白
+  付出記憶體成本、沒有對應的功能價值，直接拿掉。如果之後真的需要顯示
+  圖片，建議做成「點進單一商品才即時抓一張」的隨選載入，不要在同步全部
+  商品時就整批抓、整批常駐在記憶體裡。
   """
   url = f"{A1_BASE_URL}/Items"
   headers = {"Authorization": token}
@@ -916,9 +922,7 @@ def fetch_items_map(token):
             detail_url, headers=headers, timeout=REQUEST_TIMEOUT
         )
         if detail_res.status_code == 200:
-          detail = detail_res.json()
-          detail["ImageDataURI"] = fetch_item_image_data_uri(item_id, headers)
-          return item_id, detail
+          return item_id, detail_res.json()
         last_error = f"[{detail_res.status_code}]: {detail_res.text}"
       except requests.exceptions.RequestException as e:
         last_error = str(e)
