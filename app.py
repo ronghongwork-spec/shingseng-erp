@@ -2958,10 +2958,20 @@ COMPANY_TAB_COLORS = {
 # 清單也要記得同步更新標籤名稱/路徑。
 # -------------------------------------------------------------------------
 APP_SWITCHER_ITEMS = [
-    ("雲端進銷存", "/"),
+    ("首頁", "/"),
+    ("雲端進銷存", "/inventory"),
     ("雲端電商訂單", "/orders"),
     ("雲端會計", "/accounting"),
     ("報表分析", "/analytics"),
+]
+
+# 首頁目錄要用的App介紹卡片（標題／路徑／說明），跟上面的App切換器分開
+# 維護，因為首頁的卡片需要多一行說明文字，切換器只需要短標籤。
+HOME_APP_CARDS = [
+    ("雲端進銷存", "/inventory", "商品、庫存、訂單出貨、生產排程、採購分析"),
+    ("雲端電商訂單", "/orders", "興聖／容鴻／芙萊柏 官網與各通路訂單出貨、每日出貨"),
+    ("雲端會計", "/accounting", "會計傳票、帳務相關功能（規劃中）"),
+    ("報表分析", "/analytics", "銷售趨勢、排行、通路比較等分析（規劃中）"),
 ]
 
 
@@ -3182,9 +3192,43 @@ app_state = {
 
 
 @ui.page("/")
-def inventory_dashboard():
+def home_dashboard():
+  """首頁目錄：不放任何實際業務內容，純粹是「選單頁」，列出4個App
+  讓人點選進去，跟App切換器共用同一份HOME_APP_CARDS/APP_SWITCHER_ITEMS
+  設定，不用維護兩份清單。
+  """
   inject_global_theme_css()
   render_app_switcher("/")
+
+  with ui.column().classes(
+      "w-full p-8 max-w-[1000px] mx-auto gap-6 items-center"
+  ):
+    ui.label("興聖集團 雲端系統").classes(
+        "text-2xl font-bold text-zinc-900 mt-8"
+    )
+    ui.label("選擇要進入的系統").classes("text-sm text-zinc-500 mb-4")
+
+    with ui.row().classes("w-full gap-4 flex-wrap justify-center"):
+      for label, path, description in HOME_APP_CARDS:
+        with ui.link(target=path).classes("no-underline"):
+          with ui.card().classes(
+              "w-64 p-6 bg-white border border-[#e6e1d4]"
+              " shadow-[0_1px_3px_rgba(42,40,35,0.06)] rounded-lg"
+              " hover:shadow-[0_4px_12px_rgba(42,40,35,0.12)]"
+              " transition-shadow cursor-pointer"
+          ):
+            ui.label(label).classes(
+                "text-lg font-bold text-zinc-900 mb-2"
+            )
+            ui.label(description).classes(
+                "text-xs text-zinc-500 leading-relaxed"
+            )
+
+
+@ui.page("/inventory")
+def inventory_dashboard():
+  inject_global_theme_css()
+  render_app_switcher("/inventory")
 
   # -----------------------------------------------------------------------
   # 右上角分公司切換
@@ -5098,6 +5142,220 @@ def inventory_dashboard():
                   ui.button("建立銷貨單", on_click=handle_sale_submit_click).classes(
                       "px-4 py-2 text-xs rounded-lg bg-amber-600 text-white font-bold"
                   )
+
+                # -----------------------------------------------------
+                # 批次上傳銷貨單（Excel）：一列一個商品，用「訂單編號」
+                # 欄位分組成同一張銷貨單；倉庫/課稅別/收款方式統一在畫面
+                # 上設定一次，套用到整批，不用每列都填。
+                # -----------------------------------------------------
+                with ui.card().classes(
+                    "w-full p-6 bg-white border border-[#e6e1d4]"
+                    " shadow-[0_1px_3px_rgba(42,40,35,0.06)] rounded-lg mt-4"
+                ):
+                  ui.label("批次上傳銷貨單（Excel）").classes(
+                      "text-base font-bold text-zinc-900 mb-2"
+                  )
+                  ui.label(
+                      "Excel 一列填一個商品，欄位：訂單編號、客戶代號、"
+                      "商品品號、數量、金額、備註（選填）、批號（選填）、"
+                      "贈品（選填，填Y代表是）。同一個「訂單編號」的列會"
+                      "合併成一張銷貨單。倉庫/課稅別/收款方式/日期統一在"
+                      "下面設定一次，套用到整批，不用在Excel裡逐列填。"
+                  ).classes("text-xs text-zinc-500 mb-3")
+
+                  with ui.row().classes("items-end gap-3 flex-wrap mb-3"):
+                    batch_sale_warehouse_select = ui.select(
+                        options=warehouse_options_doc, label="倉庫（整批統一）",
+                    ).props("dense outlined").classes("w-40")
+                    batch_sale_taxtype_select = ui.select(
+                        options=MANUAL_TAXTYPE_OPTIONS, label="課稅別", value="0",
+                    ).props("dense outlined").classes("w-32")
+                    batch_sale_payment_select = ui.select(
+                        options={
+                            "1": "現金", "2": "信用卡", "3": "轉帳", "M": "賒銷(月結)",
+                        },
+                        label="收款方式", value="M",
+                    ).props("dense outlined").classes("w-32")
+                    batch_sale_date_input = ui.input(
+                        label="交易日期",
+                        value=datetime.now().date().isoformat(),
+                    ).props('dense outlined type="date"').classes("w-40")
+
+                  batch_sale_state = {"groups": None}
+                  batch_sale_preview_container = ui.column().classes("w-full gap-2 mb-3")
+                  batch_sale_result_container = ui.column().classes("w-full gap-2")
+
+                  def handle_batch_sale_upload(e):
+                    batch_sale_preview_container.clear()
+                    batch_sale_result_container.clear()
+                    batch_sale_state["groups"] = None
+                    try:
+                      df = pd.read_excel(io.BytesIO(e.content.read()), dtype=str)
+                    except Exception as ex:
+                      ui.notify(f"讀取 Excel 失敗：{ex}", color="negative")
+                      return
+
+                    required_cols = {"訂單編號", "客戶代號", "商品品號", "數量", "金額"}
+                    missing = required_cols - set(df.columns)
+                    if missing:
+                      ui.notify(
+                          f"Excel 缺少欄位：{'、'.join(missing)}", color="negative"
+                      )
+                      return
+
+                    groups = {}
+                    problems = []
+                    for idx, row in df.iterrows():
+                      excel_row_no = idx + 2  # Excel 從第2列才是資料(第1列是標題)
+                      order_no = str(row.get("訂單編號") or "").strip()
+                      customer_id = str(row.get("客戶代號") or "").strip()
+                      item_id = str(row.get("商品品號") or "").strip()
+                      if not order_no or not customer_id or not item_id:
+                        problems.append(f"第{excel_row_no}列：訂單編號/客戶代號/商品品號有空白，已跳過")
+                        continue
+                      try:
+                        qty = float(row.get("數量"))
+                        amount = float(row.get("金額"))
+                      except (TypeError, ValueError):
+                        problems.append(f"第{excel_row_no}列：數量或金額不是數字，已跳過")
+                        continue
+
+                      line = {
+                          "ID": 0,  # 稍後在同一組內重新編流水號
+                          "ItemID": item_id,
+                          "Qty": qty,
+                          "Amount": amount,
+                          "IsFree": str(row.get("贈品") or "").strip().upper() == "Y",
+                      }
+                      lotno_val = str(row.get("批號") or "").strip()
+                      if lotno_val:
+                        line["LotNo"] = lotno_val
+                      memo_val = str(row.get("備註") or "").strip()
+                      if memo_val:
+                        line["Memo"] = memo_val
+
+                      group = groups.setdefault(order_no, {
+                          "customer_id": customer_id, "lines": [],
+                      })
+                      if group["customer_id"] != customer_id:
+                        problems.append(
+                            f"第{excel_row_no}列：訂單編號「{order_no}」的客戶代號"
+                            f"跟同一張訂單前面的列不一致，已忽略這列的客戶代號"
+                        )
+                      group["lines"].append(line)
+
+                    if not groups:
+                      ui.notify("沒有解析到任何有效資料列", color="warning")
+                      return
+
+                    preview_rows = []
+                    for order_no, g in groups.items():
+                      for i, line in enumerate(g["lines"], start=1):
+                        line["ID"] = i
+                      subtotal = sum(l["Amount"] for l in g["lines"])
+                      preview_rows.append({
+                          "訂單編號": order_no,
+                          "客戶代號": g["customer_id"],
+                          "品項數": len(g["lines"]),
+                          "金額合計": subtotal,
+                      })
+
+                    batch_sale_state["groups"] = groups
+
+                    with batch_sale_preview_container:
+                      if problems:
+                        with ui.card().classes(
+                            "w-full p-3 bg-[#fdecea] border border-[#f5c2c0] rounded-lg"
+                        ):
+                          for p in problems:
+                            ui.label(p).classes("text-xs text-red-700")
+                      ui.label(
+                          f"解析出 {len(groups)} 張銷貨單，共"
+                          f" {sum(len(g['lines']) for g in groups.values())} 個品項"
+                      ).classes("text-xs text-zinc-600")
+                      ui.table(
+                          columns=[
+                              {"name": c, "label": c, "field": c, "align": "left"}
+                              for c in ["訂單編號", "客戶代號", "品項數", "金額合計"]
+                          ],
+                          rows=preview_rows, row_key="訂單編號",
+                      ).classes("w-full")
+                      ui.button(
+                          "確認批次上傳", on_click=lambda: handle_batch_sale_confirm(),
+                      ).classes(
+                          "px-4 py-2 text-xs rounded-lg bg-amber-600 text-white"
+                          " font-bold mt-2"
+                      )
+
+                  def handle_batch_sale_confirm():
+                    groups = batch_sale_state["groups"]
+                    if not groups:
+                      return
+                    if not batch_sale_warehouse_select.value:
+                      ui.notify("請先選擇倉庫", color="warning")
+                      return
+                    token = get_a1_token()
+                    if not token:
+                      ui.notify("無法登入 A1，請確認 API 憑證", color="warning")
+                      return
+
+                    tax_type = batch_sale_taxtype_select.value
+                    trade_date = batch_sale_date_input.value or datetime.now().date().isoformat()
+                    try:
+                      trade_date_fmt = datetime.strptime(
+                          trade_date, "%Y-%m-%d"
+                      ).strftime("%Y/%m/%d")
+                    except (ValueError, TypeError):
+                      trade_date_fmt = datetime.now().date().strftime("%Y/%m/%d")
+
+                    batch_sale_result_container.clear()
+                    results = []
+                    for order_no, g in groups.items():
+                      subtotal = sum(l["Amount"] for l in g["lines"])
+                      total_tax, total_amount = compute_tax_and_total(subtotal, tax_type)
+                      for l in g["lines"]:
+                        l["Warehouse"] = batch_sale_warehouse_select.value
+                      payload = {
+                          "ID": f"WEBBATCH{order_no}",
+                          "TradeDate": trade_date_fmt,
+                          "CustomerID": g["customer_id"],
+                          "Payment": batch_sale_payment_select.value,
+                          "TaxType": tax_type,
+                          "TotalTax": total_tax,
+                          "TotalSaleAmount": total_amount,
+                          "SaleDetails": g["lines"],
+                      }
+                      ok, msg = upload_sale_to_a1(token, payload)
+                      results.append({
+                          "訂單編號": order_no, "狀態": "成功" if ok else "失敗", "訊息": msg,
+                      })
+                      if not ok:
+                        print(f"[銷貨單批次上傳] 失敗：{order_no}｜{msg}")
+
+                    success_count = sum(1 for r in results if r["狀態"] == "成功")
+                    with batch_sale_result_container:
+                      ui.label(
+                          f"批次上傳完成：{success_count}/{len(results)} 張成功"
+                      ).classes("text-sm font-bold text-zinc-700")
+                      ui.table(
+                          columns=[
+                              {"name": c, "label": c, "field": c, "align": "left"}
+                              for c in ["訂單編號", "狀態", "訊息"]
+                          ],
+                          rows=results, row_key="訂單編號",
+                      ).classes("w-full")
+                    ui.notify(
+                        f"批次上傳完成：{success_count}/{len(results)} 張成功",
+                        color="positive" if success_count == len(results) else "warning",
+                    )
+                    batch_sale_state["groups"] = None
+                    batch_sale_preview_container.clear()
+
+                  ui.upload(
+                      label="上傳 Excel（.xlsx）",
+                      on_upload=handle_batch_sale_upload,
+                      auto_upload=True,
+                  ).props('accept=".xlsx"').classes("max-w-sm text-xs mb-3")
 
               with ui.tab_panel(tab_create_purchase):
                 with ui.card().classes(
