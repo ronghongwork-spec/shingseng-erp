@@ -2475,6 +2475,468 @@ def compute_channel_breakdown(forecast_result, channel_percentages, target_reven
   return rows, total_pct
 
 
+def render_section_placeholder(title, hint="此區尚未串接資料來源，敬請期待"):
+  """訂單出貨／每日出貨／調撥紀錄／退換貨記錄 共用的「還沒串API」佔位畫面。
+  等之後陸續串接各分公司/各通路的 API 時，把對應區塊換成真的資料表格即可，
+  版面（分頁結構）不用重搭。
+  """
+  with ui.card().classes(
+      "w-full p-10 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)]"
+      " rounded-lg text-center"
+  ):
+    ui.label(title).classes("text-sm font-bold text-zinc-700 mb-2")
+    ui.label(hint).classes("text-xs text-zinc-500")
+
+async def render_shopline_channel(access_token, user_agent, channel_title, restock_target=None):
+  """SHOPLINE官網訂單通路的共用畫面（興聖官網(海濤客)／官網(JDH)／
+  芙萊柏官網-B'f 都呼叫這支，只是傳入的access_token/user_agent/標題不同）。
+  抓近3個月「待處理」+「已確認」訂單，畫面：
+    1. 篩選工具列（放在最上方，一進分頁就看得到）：狀態(全部/待處理/
+       已確認，各自帶筆數)、送貨方式下拉選單(全送貨方式+各送貨方式，
+       數字會依目前選的狀態即時重算)、商品關鍵字搜尋、匯出xlsx
+    2. 商品需求彙總表：依目前篩選條件即時算出的SKU加總結果，商品名稱
+       欄位可排序，右下角可切換每頁顯示筆數(10/30/50/全部)，不用一直
+       往下滑。所有篩選都是在「已經抓好的資料」裡做，不會重打API。
+  每次「切換到這個分頁」都會重新打一次API抓最新資料；分頁內也有「重新
+  整理」按鈕，不用離開分頁再切回來也能手動重抓一次。
+
+  restock_target：這個通路的商品要向誰請備貨/採購，會顯示在商品需求
+  彙總的標題裡（不同通路賣的商品可能來自不同工廠/公司，備貨對象不一定
+  跟通路本身掛在哪個公司頁籤一樣）。沒傳的話預設用channel_title。
+
+  這支是async函式，實際打API的地方都用 run.io_bound() 包起來，讓抓資料
+  這段「同步阻塞」的過程丟到背景執行緒跑，不會卡住整個伺服器的事件
+  迴圈──不然一個人切到這個分頁在等API回應時，全部人的畫面都會跟著
+  卡住沒反應。
+  """
+  restock_target = restock_target or channel_title
+  def fetch_data():
+    created_after = (
+        datetime.utcnow() - timedelta(days=SHOPLINE_LOOKBACK_DAYS)
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    return fetch_shopline_orders(
+        access_token, user_agent, SHOPLINE_ORDER_STATUSES, created_after,
+    )
+
+  orders, error = await run.io_bound(fetch_data)
+  if error:
+    render_section_placeholder(f"訂單出貨－{channel_title}", f"抓取失敗：{error}")
+    return
+  if not orders:
+    render_section_placeholder(
+        f"訂單出貨－{channel_title}", "近3個月沒有待處理或已確認的訂單"
+    )
+    return
+
+  stats = compute_shopline_stats(orders)
+  last_updated = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+  state = {
+      "status_filter": "all", "delivery_filter": "all", "keyword": "",
+      "date_from": "", "date_to": "",
+  }
+
+  # ---- 更新時間 + 手動重新整理按鈕 ----
+  refresh_row = ui.row().classes("w-full items-center gap-3 mb-2")
+
+  def render_refresh_row():
+    nonlocal last_updated
+    refresh_row.clear()
+    with refresh_row:
+      ui.label(f"資料更新時間：{last_updated}").classes("text-xs text-zinc-400")
+
+      async def handle_refresh():
+        nonlocal orders, stats, last_updated
+        new_orders, err = await run.io_bound(fetch_data)
+        if err:
+          ui.notify(f"重新整理失敗：{err}", color="negative")
+          return
+        orders = new_orders or []
+        stats = compute_shopline_stats(orders)
+        last_updated = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+        render_refresh_row()
+        render_toolbar()
+        refresh_results()
+        ui.notify("已重新整理", color="positive")
+
+      ui.button("重新整理", icon="refresh", on_click=handle_refresh).props(
+          "dense no-caps unelevated"
+      ).classes("px-3 py-1 rounded-lg text-xs").style(
+          "background:#ffffff !important; color:#4b5563 !important;"
+          " border:1px solid #e6e1d4;"
+      )
+
+  render_refresh_row()
+
+  # ---- 篩選工具列：放在最上方（在說明文字跟結果表格之前）----
+  toolbar_container = ui.row().classes("w-full items-end gap-3 mb-1 flex-wrap")
+
+  def render_toolbar():
+    toolbar_container.clear()
+    with toolbar_container:
+      status_options = [
+          ("全部", "all"),
+          (f"待處理 ({stats['pending']})", "pending"),
+          (f"已確認 ({stats['confirmed']})", "confirmed"),
+      ]
+      with ui.row().classes("gap-2"):
+        for label, value in status_options:
+          is_active = value == state["status_filter"]
+          bg = "#5bc0be" if is_active else "#ffffff"
+          fg = "#ffffff" if is_active else "#4b5563"
+          border = "#5bc0be" if is_active else "#e6e1d4"
+          # 用行內 style 強制指定顏色，避免被 NiceGUI/Quasar 按鈕預設的
+          # 文字顏色蓋掉（Tailwind的class在這裡權重會輸給Quasar內建樣式，
+          # 導致文字顏色跟背景一樣、整個看起來像空白按鈕）。
+          ui.button(
+              label, on_click=lambda v=value: set_status_filter(v)
+          ).props("dense no-caps unelevated").classes(
+              "px-4 py-1 rounded-lg"
+          ).style(
+              f"background:{bg} !important; color:{fg} !important;"
+              f" border:1px solid {border};"
+          )
+
+      delivery_counts_now = compute_shopline_delivery_counts(
+          orders, state["status_filter"]
+      )
+      total_now = sum(delivery_counts_now.values())
+      # 選項名單固定用全部送貨方式（避免篩選後某個方式暫時是0筆就從
+      # 選單裡消失），但數字用目前狀態篩選後的筆數，兩者分開處理
+      delivery_select_options = {"all": f"全送貨方式 ({total_now})"}
+      for method in sorted(stats["delivery_counts"].keys()):
+        cnt = delivery_counts_now.get(method, 0)
+        delivery_select_options[method] = f"{method} ({cnt})"
+      ui.select(
+          options=delivery_select_options,
+          value=state["delivery_filter"],
+          on_change=set_delivery_filter,
+          label="送貨方式",
+      ).props("dense outlined").classes("w-48")
+
+      ui.input(
+          label="搜尋商品關鍵字",
+          value=state["keyword"],
+          on_change=set_keyword,
+      ).props("dense outlined clearable").classes("w-56")
+
+      ui.input(
+          label="建立日期 起",
+          value=state["date_from"],
+          on_change=set_date_from,
+      ).props('dense outlined clearable type="date"').classes("w-40")
+
+      ui.input(
+          label="建立日期 迄",
+          value=state["date_to"],
+          on_change=set_date_to,
+      ).props('dense outlined clearable type="date"').classes("w-40")
+
+  ui.label(
+      f"{channel_title}・近{SHOPLINE_LOOKBACK_DAYS}天訂單建立時間"
+  ).classes("text-xs text-zinc-500 mb-3")
+
+  results_container = ui.column().classes("w-full")
+
+  def refresh_results():
+    results_container.clear()
+    rows = compute_shopline_sku_rows(
+        orders, state["status_filter"], state["delivery_filter"], state["keyword"],
+        state["date_from"], state["date_to"],
+    )
+    with results_container:
+      with ui.card().classes(
+          "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)] rounded-lg"
+      ):
+        with ui.row().classes("w-full items-center justify-between mb-3"):
+          ui.label(
+              f"未出貨商品需求彙總（共 {len(rows)} 個品項，"
+              f"供向{restock_target}請備貨/採購用）"
+          ).classes("text-sm font-bold text-zinc-700")
+
+          def handle_export():
+            try:
+              xlsx_bytes = rows_to_xlsx_bytes(rows, sheet_name="商品需求彙總")
+              ui.download(
+                  xlsx_bytes,
+                  f"{channel_title}商品需求彙總.xlsx",
+                  media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+              )
+            except Exception as e:
+              ui.notify(f"匯出失敗：{e}", color="negative")
+
+          ui.button("匯出 xlsx", on_click=handle_export).classes(
+              "sync-btn px-3 py-1 text-xs rounded-lg"
+          )
+
+        if not rows:
+          ui.label("目前沒有符合篩選條件的品項").classes("text-xs text-zinc-400")
+        else:
+          # rows-per-page-options 用 Quasar 慣例：0 代表「全部」，
+          # 表格右下角會有內建的每頁筆數切換選單(10/30/50/全部)。
+          ui.table(
+              columns=[
+                  {"name": "SKU", "label": "SKU", "field": "SKU", "align": "left", "sortable": True},
+                  {"name": "商品", "label": "商品", "field": "商品", "align": "left", "sortable": True},
+                  {"name": "細項", "label": "細項", "field": "細項", "align": "left", "sortable": True},
+                  {"name": "需求數量", "label": "需求數量", "field": "需求數量", "align": "right", "sortable": True},
+              ],
+              rows=rows,
+              row_key="SKU",
+              pagination={"rowsPerPage": 10, "sortBy": "需求數量", "descending": True},
+          ).classes("w-full").props(':rows-per-page-options="[10,30,50,0]"')
+
+  def set_status_filter(v):
+    state["status_filter"] = v
+    render_toolbar()
+    refresh_results()
+
+  def set_delivery_filter(e):
+    state["delivery_filter"] = e.value
+    refresh_results()
+
+  def set_keyword(e):
+    state["keyword"] = e.value
+    refresh_results()
+
+  def set_date_from(e):
+    state["date_from"] = e.value or ""
+    refresh_results()
+
+  def set_date_to(e):
+    state["date_to"] = e.value or ""
+    refresh_results()
+
+  render_toolbar()
+  refresh_results()
+
+
+
+# 訂單出貨底下的通路子分頁，之後每個通路會各自串不同的訂單來源API。
+# 各分公司實際通路不完全一樣，用字典各自設定；沒特別列出的公司預設
+# 用完整4通路。
+ORDER_CHANNELS_BY_COMPANY = {
+    # 興聖沒有蝦皮通路，官網部分有兩個獨立SHOPLINE據點：海濤客品牌、JDH
+    "興聖(股)公司": ["官網(海濤客)", "官網(JDH)", "經銷", "其它"],
+    # 芙萊柏的官網通路標籤用他們自己的代稱
+    "芙萊柏(股)公司": ["官網-B'f", "蝦皮", "經銷", "其它"],
+}
+DEFAULT_ORDER_CHANNELS = ["SHOPLINE官網", "蝦皮", "經銷", "其它"]
+
+# (公司, 通路標籤) -> 呼叫render_shopline_channel()要用的(access_token, user_agent)
+SHOPLINE_CHANNEL_CREDENTIALS = {
+    ("興聖(股)公司", "官網(海濤客)"): (SHOPLINE_XINGSHENG_ACCESS_TOKEN, SHOPLINE_XINGSHENG_USER_AGENT),
+    ("興聖(股)公司", "官網(JDH)"): (SHOPLINE_XINGSHENG_JDH_ACCESS_TOKEN, SHOPLINE_XINGSHENG_JDH_USER_AGENT),
+    ("芙萊柏(股)公司", "官網-B'f"): (SHOPLINE_FULAIBO_ACCESS_TOKEN, SHOPLINE_FULAIBO_USER_AGENT),
+}
+
+# (公司, 通路標籤) -> 這個通路的商品需求彙總要向誰請備貨/採購（不同
+# 通路賣的商品可能來自不同工廠/公司，備貨對象不一定跟頁籤本身的公司
+# 一樣，例如興聖官網(JDH)是要跟容鴻請備貨）。沒列出的通路，預設用該
+# 頁籤所屬的公司名稱。
+SHOPLINE_RESTOCK_TARGET = {
+    ("興聖(股)公司", "官網(海濤客)"): "海濤客食品工廠",
+    ("興聖(股)公司", "官網(JDH)"): "容鴻(股)公司",
+}
+
+# 公司 -> 每日出貨要用的A1帳密(api_key, api_password)。目前只有興聖，
+# 容鴻/芙萊柏之後拿到帳密再補進來即可，沒列出的公司會顯示佔位畫面。
+DAILY_SHIPPING_CREDENTIALS = {
+    "興聖(股)公司": (A1_XINGSHENG_API_KEY, A1_XINGSHENG_API_PASSWORD),
+}
+
+# 公司 -> 採購分析要用的A1帳密(api_key, api_password)。目前是容鴻、
+# 芙萊柏；興聖如果之後也要這個功能，可以直接沿用A1_XINGSHENG_API_KEY/
+# PASSWORD，把這行也加進來即可。
+PROCUREMENT_ANALYSIS_CREDENTIALS = {
+    "容鴻(股)公司": (A1_RONGHONG_API_KEY, A1_RONGHONG_API_PASSWORD),
+    "芙萊柏(股)公司": (A1_FULAIBO_API_KEY, A1_FULAIBO_API_PASSWORD),
+}
+
+# 公司名稱轉成安全的英文代碼，用來組CSS class名稱（中文當class名稱在
+# 部分瀏覽器/選擇器語法下容易出錯，改用英文代碼比較保險）
+COMPANY_SLUGS = {
+    "興聖(股)公司": "xingsheng",
+    "容鴻(股)公司": "ronghong",
+    "芙萊柏(股)公司": "fulaibo",
+}
+
+async def render_daily_shipping(api_key, api_password, company_label):
+  """分公司／每日出貨：抓鼎新A1銷貨單，依「銷貨單建立日期」區間彙總
+  品項數量＝揀貨表；下方另外提供一張「通路分類數量」讓人員手動填寫
+  （全家/7-11/黑貓/新竹/順豐/海外/其它，純手填，不會反查任何系統），
+  兩張表最後可以合併匯出成一份xlsx（兩個分頁）。
+
+  這支是async函式，實際打A1 API的地方用run.io_bound()包起來，避免
+  卡住整個伺服器的事件迴圈。
+  """
+  today_tw = (datetime.utcnow() + timedelta(hours=8)).date()
+  state = {"date_from": today_tw.isoformat(), "date_to": today_tw.isoformat()}
+  picking_rows_holder = {"rows": []}
+  channel_inputs = {}
+
+  ui.label(f"{company_label}・每日出貨（依銷貨單建立日期彙總）").classes(
+      "text-xs text-zinc-500 mb-3"
+  )
+
+  date_row = ui.row().classes("w-full items-end gap-3 mb-4 flex-wrap")
+
+  results_container = ui.column().classes("w-full")
+
+  async def load_and_render():
+    picking_container.clear()
+    try:
+      d_from = datetime.strptime(state["date_from"], "%Y-%m-%d").date()
+      d_to = datetime.strptime(state["date_to"], "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+      with picking_container:
+        ui.label("日期格式錯誤，請重新選擇").classes("text-xs text-red-500")
+      return
+    if d_from > d_to:
+      with picking_container:
+        ui.label("「起」不能晚於「迄」，請重新選擇").classes("text-xs text-red-500")
+      return
+
+    with picking_container:
+      with ui.row().classes("items-center gap-2 p-4"):
+        ui.spinner(size="20px").classes("text-zinc-400")
+        ui.label("抓取中…").classes("text-xs text-zinc-500")
+
+    rows, error = await run.io_bound(
+        fetch_daily_shipping_items, api_key, api_password, d_from, d_to
+    )
+    picking_container.clear()
+    if error:
+      with picking_container:
+        ui.label(f"抓取失敗：{error}").classes("text-xs text-red-500")
+      return
+    picking_rows_holder["rows"] = rows or []
+    with picking_container:
+      if not rows:
+        ui.label("此區間沒有銷貨單資料").classes("text-xs text-zinc-400")
+      else:
+        ui.table(
+            columns=[
+                {"name": "品號", "label": "品號", "field": "品號", "align": "left", "sortable": True},
+                {"name": "品名", "label": "品名", "field": "品名", "align": "left", "sortable": True},
+                {"name": "數量", "label": "數量", "field": "數量", "align": "right", "sortable": True},
+            ],
+            rows=rows,
+            row_key="品號",
+            pagination={"rowsPerPage": 10, "sortBy": "數量", "descending": True},
+        ).classes("w-full").props(':rows-per-page-options="[10,30,50,0]"')
+
+  async def set_date_from(e):
+    state["date_from"] = e.value or ""
+    await load_and_render()
+
+  async def set_date_to(e):
+    state["date_to"] = e.value or ""
+    await load_and_render()
+
+  with date_row:
+    ui.input(
+        label="銷貨單建立日期 起", value=state["date_from"], on_change=set_date_from,
+    ).props('dense outlined type="date"').classes("w-44")
+    ui.input(
+        label="銷貨單建立日期 迄", value=state["date_to"], on_change=set_date_to,
+    ).props('dense outlined type="date"').classes("w-44")
+
+  with results_container:
+    with ui.card().classes(
+        "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)] rounded-lg mb-4"
+    ):
+      ui.label("揀貨表（依品號加總數量）").classes("text-sm font-bold text-zinc-700 mb-3")
+      picking_container = ui.column().classes("w-full")
+
+    with ui.card().classes(
+        "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)] rounded-lg"
+    ):
+      with ui.row().classes("w-full items-center justify-between mb-3"):
+        ui.label("通路分類數量（人員手動填寫，不會自動計算）").classes(
+            "text-sm font-bold text-zinc-700"
+        )
+
+        def handle_export():
+          try:
+            channel_rows = [
+                {"通路": ch, "數量": int(inp.value or 0)}
+                for ch, inp in channel_inputs.items()
+            ]
+            xlsx_bytes = multi_sheet_xlsx_bytes({
+                "揀貨表": picking_rows_holder["rows"],
+                "通路分類數量": channel_rows,
+            })
+            ui.download(
+                xlsx_bytes,
+                f"{company_label}每日出貨_{state['date_from']}_{state['date_to']}.xlsx",
+                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+          except Exception as e:
+            ui.notify(f"匯出失敗：{e}", color="negative")
+
+        ui.button("匯出 xlsx（揀貨表＋通路分類數量）", on_click=handle_export).classes(
+            "sync-btn px-3 py-1 text-xs rounded-lg"
+        )
+
+      with ui.row().classes("w-full gap-3 flex-wrap"):
+        for ch in DAILY_SHIPPING_CHANNELS:
+          with ui.column().classes("gap-1"):
+            ui.label(ch).classes("text-xs text-zinc-500")
+            channel_inputs[ch] = ui.input(value="0").props(
+                'dense outlined type="number"'
+            ).classes("w-24")
+
+  await load_and_render()
+
+
+def render_order_channels_tabs(company_name):
+  """「訂單出貨」分頁底下的通路子分頁（SHOPLINE官網／蝦皮／經銷／其它
+  等，依公司不同而不同）。一樣做成懶載入：只有實際點進某個通路，才會
+  去打那個通路的API，不會切到「訂單出貨」就把底下所有通路一次全部
+  打完。
+
+  注意：分頁列(ui.tabs)一定要在內容容器(channel_body)「之前」建立，
+  這樣分頁列在畫面排列順序上才會排在內容前面（天生在最上方）。順序
+  反過來的話，分頁列雖然視覺上看起來應該在上面，但因為content容器的
+  位置已經先佔走了，分頁列反而會被排到內容下方——這是之前修過的同一
+  種bug，這裡也要注意。
+  """
+  order_channels = ORDER_CHANNELS_BY_COMPANY.get(
+      company_name, DEFAULT_ORDER_CHANNELS
+  )
+
+  async def handle_channel_change(ch):
+    channel_body.clear()
+    with channel_body:
+      with ui.row().classes("w-full items-center gap-2 p-8 justify-center"):
+        ui.spinner(size="24px").classes("text-zinc-400")
+        ui.label("資料抓取中，請稍候…").classes("text-xs text-zinc-500")
+    await asyncio.sleep(0)
+
+    channel_body.clear()
+    shopline_creds = SHOPLINE_CHANNEL_CREDENTIALS.get((company_name, ch))
+    restock_target = SHOPLINE_RESTOCK_TARGET.get((company_name, ch), company_name)
+    with channel_body:
+      if shopline_creds:
+        await render_shopline_channel(
+            shopline_creds[0], shopline_creds[1], ch, restock_target
+        )
+      else:
+        render_section_placeholder(
+            f"訂單出貨－{ch}",
+            f"「{ch}」通路的訂單 API 尚未串接，敬請期待",
+        )
+
+  with ui.tabs(on_change=lambda e: handle_channel_change(e.value)).props(
+      "dense no-caps"
+  ).classes("w-full") as channel_tabs:
+    for ch in order_channels:
+      ui.tab(ch)
+
+  channel_body = ui.column().classes("w-full")
+  channel_tabs.set_value(order_channels[0])
+
+
 COMPANIES = ["興聖(股)公司", "海濤客食品工業(股)公司", "容鴻(股)公司", "芙萊柏(股)公司"]
 ACTIVE_COMPANY_LABEL = "海濤客食品工業(股)公司"
 
@@ -2486,7 +2948,7 @@ COMPANY_TAB_COLORS = {
 }
 
 # -------------------------------------------------------------------------
-# App 切換器（雲端進銷存／雲端電商訂單／雲端會計／銷售分析 四個獨立頁面）
+# App 切換器（雲端進銷存／雲端電商訂單／雲端會計／報表分析 四個獨立頁面）
 # 每個App是一個獨立的 @ui.page 路由，共用同一個Render服務、同一組
 # Basic Auth登入，不用重複登入。之後陸續把內容搬過去對應的App時，這份
 # 清單也要記得同步更新標籤名稱/路徑。
@@ -2495,7 +2957,7 @@ APP_SWITCHER_ITEMS = [
     ("雲端進銷存", "/"),
     ("雲端電商訂單", "/orders"),
     ("雲端會計", "/accounting"),
-    ("銷售分析", "/analytics"),
+    ("報表分析", "/analytics"),
 ]
 
 
@@ -2521,7 +2983,7 @@ def render_app_switcher(active_path):
 
 def inject_global_theme_css():
   """全站共用的字型/配色/元件樣式（暖石色底、襯線標題、柔和圓角+陰影）。
-  四個App頁面（進銷存／電商訂單／會計／銷售分析）都呼叫這支，確保視覺
+  四個App頁面（進銷存／電商訂單／會計／報表分析）都呼叫這支，確保視覺
   風格一致，不會有的頁面有質感、有的頁面看起來像沒套用到設計。
   """
   ui.add_head_html("""
@@ -2780,419 +3242,6 @@ def inventory_dashboard():
               "text-sm text-zinc-500"
           )
 
-  def render_section_placeholder(title, hint="此區尚未串接資料來源，敬請期待"):
-    """訂單出貨／每日出貨／調撥紀錄／退換貨記錄 共用的「還沒串API」佔位畫面。
-    等之後陸續串接各分公司/各通路的 API 時，把對應區塊換成真的資料表格即可，
-    版面（分頁結構）不用重搭。
-    """
-    with ui.card().classes(
-        "w-full p-10 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)]"
-        " rounded-lg text-center"
-    ):
-      ui.label(title).classes("text-sm font-bold text-zinc-700 mb-2")
-      ui.label(hint).classes("text-xs text-zinc-500")
-
-  async def render_shopline_channel(access_token, user_agent, channel_title, restock_target=None):
-    """SHOPLINE官網訂單通路的共用畫面（興聖官網(海濤客)／官網(JDH)／
-    芙萊柏官網-B'f 都呼叫這支，只是傳入的access_token/user_agent/標題不同）。
-    抓近3個月「待處理」+「已確認」訂單，畫面：
-      1. 篩選工具列（放在最上方，一進分頁就看得到）：狀態(全部/待處理/
-         已確認，各自帶筆數)、送貨方式下拉選單(全送貨方式+各送貨方式，
-         數字會依目前選的狀態即時重算)、商品關鍵字搜尋、匯出xlsx
-      2. 商品需求彙總表：依目前篩選條件即時算出的SKU加總結果，商品名稱
-         欄位可排序，右下角可切換每頁顯示筆數(10/30/50/全部)，不用一直
-         往下滑。所有篩選都是在「已經抓好的資料」裡做，不會重打API。
-    每次「切換到這個分頁」都會重新打一次API抓最新資料；分頁內也有「重新
-    整理」按鈕，不用離開分頁再切回來也能手動重抓一次。
-
-    restock_target：這個通路的商品要向誰請備貨/採購，會顯示在商品需求
-    彙總的標題裡（不同通路賣的商品可能來自不同工廠/公司，備貨對象不一定
-    跟通路本身掛在哪個公司頁籤一樣）。沒傳的話預設用channel_title。
-
-    這支是async函式，實際打API的地方都用 run.io_bound() 包起來，讓抓資料
-    這段「同步阻塞」的過程丟到背景執行緒跑，不會卡住整個伺服器的事件
-    迴圈──不然一個人切到這個分頁在等API回應時，全部人的畫面都會跟著
-    卡住沒反應。
-    """
-    restock_target = restock_target or channel_title
-    def fetch_data():
-      created_after = (
-          datetime.utcnow() - timedelta(days=SHOPLINE_LOOKBACK_DAYS)
-      ).strftime("%Y-%m-%d %H:%M:%S")
-      return fetch_shopline_orders(
-          access_token, user_agent, SHOPLINE_ORDER_STATUSES, created_after,
-      )
-
-    orders, error = await run.io_bound(fetch_data)
-    if error:
-      render_section_placeholder(f"訂單出貨－{channel_title}", f"抓取失敗：{error}")
-      return
-    if not orders:
-      render_section_placeholder(
-          f"訂單出貨－{channel_title}", "近3個月沒有待處理或已確認的訂單"
-      )
-      return
-
-    stats = compute_shopline_stats(orders)
-    last_updated = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
-    state = {
-        "status_filter": "all", "delivery_filter": "all", "keyword": "",
-        "date_from": "", "date_to": "",
-    }
-
-    # ---- 更新時間 + 手動重新整理按鈕 ----
-    refresh_row = ui.row().classes("w-full items-center gap-3 mb-2")
-
-    def render_refresh_row():
-      nonlocal last_updated
-      refresh_row.clear()
-      with refresh_row:
-        ui.label(f"資料更新時間：{last_updated}").classes("text-xs text-zinc-400")
-
-        async def handle_refresh():
-          nonlocal orders, stats, last_updated
-          new_orders, err = await run.io_bound(fetch_data)
-          if err:
-            ui.notify(f"重新整理失敗：{err}", color="negative")
-            return
-          orders = new_orders or []
-          stats = compute_shopline_stats(orders)
-          last_updated = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
-          render_refresh_row()
-          render_toolbar()
-          refresh_results()
-          ui.notify("已重新整理", color="positive")
-
-        ui.button("重新整理", icon="refresh", on_click=handle_refresh).props(
-            "dense no-caps unelevated"
-        ).classes("px-3 py-1 rounded-lg text-xs").style(
-            "background:#ffffff !important; color:#4b5563 !important;"
-            " border:1px solid #e6e1d4;"
-        )
-
-    render_refresh_row()
-
-    # ---- 篩選工具列：放在最上方（在說明文字跟結果表格之前）----
-    toolbar_container = ui.row().classes("w-full items-end gap-3 mb-1 flex-wrap")
-
-    def render_toolbar():
-      toolbar_container.clear()
-      with toolbar_container:
-        status_options = [
-            ("全部", "all"),
-            (f"待處理 ({stats['pending']})", "pending"),
-            (f"已確認 ({stats['confirmed']})", "confirmed"),
-        ]
-        with ui.row().classes("gap-2"):
-          for label, value in status_options:
-            is_active = value == state["status_filter"]
-            bg = "#5bc0be" if is_active else "#ffffff"
-            fg = "#ffffff" if is_active else "#4b5563"
-            border = "#5bc0be" if is_active else "#e6e1d4"
-            # 用行內 style 強制指定顏色，避免被 NiceGUI/Quasar 按鈕預設的
-            # 文字顏色蓋掉（Tailwind的class在這裡權重會輸給Quasar內建樣式，
-            # 導致文字顏色跟背景一樣、整個看起來像空白按鈕）。
-            ui.button(
-                label, on_click=lambda v=value: set_status_filter(v)
-            ).props("dense no-caps unelevated").classes(
-                "px-4 py-1 rounded-lg"
-            ).style(
-                f"background:{bg} !important; color:{fg} !important;"
-                f" border:1px solid {border};"
-            )
-
-        delivery_counts_now = compute_shopline_delivery_counts(
-            orders, state["status_filter"]
-        )
-        total_now = sum(delivery_counts_now.values())
-        # 選項名單固定用全部送貨方式（避免篩選後某個方式暫時是0筆就從
-        # 選單裡消失），但數字用目前狀態篩選後的筆數，兩者分開處理
-        delivery_select_options = {"all": f"全送貨方式 ({total_now})"}
-        for method in sorted(stats["delivery_counts"].keys()):
-          cnt = delivery_counts_now.get(method, 0)
-          delivery_select_options[method] = f"{method} ({cnt})"
-        ui.select(
-            options=delivery_select_options,
-            value=state["delivery_filter"],
-            on_change=set_delivery_filter,
-            label="送貨方式",
-        ).props("dense outlined").classes("w-48")
-
-        ui.input(
-            label="搜尋商品關鍵字",
-            value=state["keyword"],
-            on_change=set_keyword,
-        ).props("dense outlined clearable").classes("w-56")
-
-        ui.input(
-            label="建立日期 起",
-            value=state["date_from"],
-            on_change=set_date_from,
-        ).props('dense outlined clearable type="date"').classes("w-40")
-
-        ui.input(
-            label="建立日期 迄",
-            value=state["date_to"],
-            on_change=set_date_to,
-        ).props('dense outlined clearable type="date"').classes("w-40")
-
-    ui.label(
-        f"{channel_title}・近{SHOPLINE_LOOKBACK_DAYS}天訂單建立時間"
-    ).classes("text-xs text-zinc-500 mb-3")
-
-    results_container = ui.column().classes("w-full")
-
-    def refresh_results():
-      results_container.clear()
-      rows = compute_shopline_sku_rows(
-          orders, state["status_filter"], state["delivery_filter"], state["keyword"],
-          state["date_from"], state["date_to"],
-      )
-      with results_container:
-        with ui.card().classes(
-            "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)] rounded-lg"
-        ):
-          with ui.row().classes("w-full items-center justify-between mb-3"):
-            ui.label(
-                f"未出貨商品需求彙總（共 {len(rows)} 個品項，"
-                f"供向{restock_target}請備貨/採購用）"
-            ).classes("text-sm font-bold text-zinc-700")
-
-            def handle_export():
-              try:
-                xlsx_bytes = rows_to_xlsx_bytes(rows, sheet_name="商品需求彙總")
-                ui.download(
-                    xlsx_bytes,
-                    f"{channel_title}商品需求彙總.xlsx",
-                    media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-              except Exception as e:
-                ui.notify(f"匯出失敗：{e}", color="negative")
-
-            ui.button("匯出 xlsx", on_click=handle_export).classes(
-                "sync-btn px-3 py-1 text-xs rounded-lg"
-            )
-
-          if not rows:
-            ui.label("目前沒有符合篩選條件的品項").classes("text-xs text-zinc-400")
-          else:
-            # rows-per-page-options 用 Quasar 慣例：0 代表「全部」，
-            # 表格右下角會有內建的每頁筆數切換選單(10/30/50/全部)。
-            ui.table(
-                columns=[
-                    {"name": "SKU", "label": "SKU", "field": "SKU", "align": "left", "sortable": True},
-                    {"name": "商品", "label": "商品", "field": "商品", "align": "left", "sortable": True},
-                    {"name": "細項", "label": "細項", "field": "細項", "align": "left", "sortable": True},
-                    {"name": "需求數量", "label": "需求數量", "field": "需求數量", "align": "right", "sortable": True},
-                ],
-                rows=rows,
-                row_key="SKU",
-                pagination={"rowsPerPage": 10, "sortBy": "需求數量", "descending": True},
-            ).classes("w-full").props(':rows-per-page-options="[10,30,50,0]"')
-
-    def set_status_filter(v):
-      state["status_filter"] = v
-      render_toolbar()
-      refresh_results()
-
-    def set_delivery_filter(e):
-      state["delivery_filter"] = e.value
-      refresh_results()
-
-    def set_keyword(e):
-      state["keyword"] = e.value
-      refresh_results()
-
-    def set_date_from(e):
-      state["date_from"] = e.value or ""
-      refresh_results()
-
-    def set_date_to(e):
-      state["date_to"] = e.value or ""
-      refresh_results()
-
-    render_toolbar()
-    refresh_results()
-
-
-
-  # 訂單出貨底下的通路子分頁，之後每個通路會各自串不同的訂單來源API。
-  # 各分公司實際通路不完全一樣，用字典各自設定；沒特別列出的公司預設
-  # 用完整4通路。
-  ORDER_CHANNELS_BY_COMPANY = {
-      # 興聖沒有蝦皮通路，官網部分有兩個獨立SHOPLINE據點：海濤客品牌、JDH
-      "興聖(股)公司": ["官網(海濤客)", "官網(JDH)", "經銷", "其它"],
-      # 芙萊柏的官網通路標籤用他們自己的代稱
-      "芙萊柏(股)公司": ["官網-B'f", "蝦皮", "經銷", "其它"],
-  }
-  DEFAULT_ORDER_CHANNELS = ["SHOPLINE官網", "蝦皮", "經銷", "其它"]
-
-  # (公司, 通路標籤) -> 呼叫render_shopline_channel()要用的(access_token, user_agent)
-  SHOPLINE_CHANNEL_CREDENTIALS = {
-      ("興聖(股)公司", "官網(海濤客)"): (SHOPLINE_XINGSHENG_ACCESS_TOKEN, SHOPLINE_XINGSHENG_USER_AGENT),
-      ("興聖(股)公司", "官網(JDH)"): (SHOPLINE_XINGSHENG_JDH_ACCESS_TOKEN, SHOPLINE_XINGSHENG_JDH_USER_AGENT),
-      ("芙萊柏(股)公司", "官網-B'f"): (SHOPLINE_FULAIBO_ACCESS_TOKEN, SHOPLINE_FULAIBO_USER_AGENT),
-  }
-
-  # (公司, 通路標籤) -> 這個通路的商品需求彙總要向誰請備貨/採購（不同
-  # 通路賣的商品可能來自不同工廠/公司，備貨對象不一定跟頁籤本身的公司
-  # 一樣，例如興聖官網(JDH)是要跟容鴻請備貨）。沒列出的通路，預設用該
-  # 頁籤所屬的公司名稱。
-  SHOPLINE_RESTOCK_TARGET = {
-      ("興聖(股)公司", "官網(海濤客)"): "海濤客食品工廠",
-      ("興聖(股)公司", "官網(JDH)"): "容鴻(股)公司",
-  }
-
-  # 公司 -> 每日出貨要用的A1帳密(api_key, api_password)。目前只有興聖，
-  # 容鴻/芙萊柏之後拿到帳密再補進來即可，沒列出的公司會顯示佔位畫面。
-  DAILY_SHIPPING_CREDENTIALS = {
-      "興聖(股)公司": (A1_XINGSHENG_API_KEY, A1_XINGSHENG_API_PASSWORD),
-  }
-
-  # 公司 -> 採購分析要用的A1帳密(api_key, api_password)。目前是容鴻、
-  # 芙萊柏；興聖如果之後也要這個功能，可以直接沿用A1_XINGSHENG_API_KEY/
-  # PASSWORD，把這行也加進來即可。
-  PROCUREMENT_ANALYSIS_CREDENTIALS = {
-      "容鴻(股)公司": (A1_RONGHONG_API_KEY, A1_RONGHONG_API_PASSWORD),
-      "芙萊柏(股)公司": (A1_FULAIBO_API_KEY, A1_FULAIBO_API_PASSWORD),
-  }
-
-  # 公司名稱轉成安全的英文代碼，用來組CSS class名稱（中文當class名稱在
-  # 部分瀏覽器/選擇器語法下容易出錯，改用英文代碼比較保險）
-  COMPANY_SLUGS = {
-      "興聖(股)公司": "xingsheng",
-      "容鴻(股)公司": "ronghong",
-      "芙萊柏(股)公司": "fulaibo",
-  }
-
-  async def render_daily_shipping(api_key, api_password, company_label):
-    """分公司／每日出貨：抓鼎新A1銷貨單，依「銷貨單建立日期」區間彙總
-    品項數量＝揀貨表；下方另外提供一張「通路分類數量」讓人員手動填寫
-    （全家/7-11/黑貓/新竹/順豐/海外/其它，純手填，不會反查任何系統），
-    兩張表最後可以合併匯出成一份xlsx（兩個分頁）。
-
-    這支是async函式，實際打A1 API的地方用run.io_bound()包起來，避免
-    卡住整個伺服器的事件迴圈。
-    """
-    today_tw = (datetime.utcnow() + timedelta(hours=8)).date()
-    state = {"date_from": today_tw.isoformat(), "date_to": today_tw.isoformat()}
-    picking_rows_holder = {"rows": []}
-    channel_inputs = {}
-
-    ui.label(f"{company_label}・每日出貨（依銷貨單建立日期彙總）").classes(
-        "text-xs text-zinc-500 mb-3"
-    )
-
-    date_row = ui.row().classes("w-full items-end gap-3 mb-4 flex-wrap")
-
-    results_container = ui.column().classes("w-full")
-
-    async def load_and_render():
-      picking_container.clear()
-      try:
-        d_from = datetime.strptime(state["date_from"], "%Y-%m-%d").date()
-        d_to = datetime.strptime(state["date_to"], "%Y-%m-%d").date()
-      except (ValueError, TypeError):
-        with picking_container:
-          ui.label("日期格式錯誤，請重新選擇").classes("text-xs text-red-500")
-        return
-      if d_from > d_to:
-        with picking_container:
-          ui.label("「起」不能晚於「迄」，請重新選擇").classes("text-xs text-red-500")
-        return
-
-      with picking_container:
-        with ui.row().classes("items-center gap-2 p-4"):
-          ui.spinner(size="20px").classes("text-zinc-400")
-          ui.label("抓取中…").classes("text-xs text-zinc-500")
-
-      rows, error = await run.io_bound(
-          fetch_daily_shipping_items, api_key, api_password, d_from, d_to
-      )
-      picking_container.clear()
-      if error:
-        with picking_container:
-          ui.label(f"抓取失敗：{error}").classes("text-xs text-red-500")
-        return
-      picking_rows_holder["rows"] = rows or []
-      with picking_container:
-        if not rows:
-          ui.label("此區間沒有銷貨單資料").classes("text-xs text-zinc-400")
-        else:
-          ui.table(
-              columns=[
-                  {"name": "品號", "label": "品號", "field": "品號", "align": "left", "sortable": True},
-                  {"name": "品名", "label": "品名", "field": "品名", "align": "left", "sortable": True},
-                  {"name": "數量", "label": "數量", "field": "數量", "align": "right", "sortable": True},
-              ],
-              rows=rows,
-              row_key="品號",
-              pagination={"rowsPerPage": 10, "sortBy": "數量", "descending": True},
-          ).classes("w-full").props(':rows-per-page-options="[10,30,50,0]"')
-
-    async def set_date_from(e):
-      state["date_from"] = e.value or ""
-      await load_and_render()
-
-    async def set_date_to(e):
-      state["date_to"] = e.value or ""
-      await load_and_render()
-
-    with date_row:
-      ui.input(
-          label="銷貨單建立日期 起", value=state["date_from"], on_change=set_date_from,
-      ).props('dense outlined type="date"').classes("w-44")
-      ui.input(
-          label="銷貨單建立日期 迄", value=state["date_to"], on_change=set_date_to,
-      ).props('dense outlined type="date"').classes("w-44")
-
-    with results_container:
-      with ui.card().classes(
-          "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)] rounded-lg mb-4"
-      ):
-        ui.label("揀貨表（依品號加總數量）").classes("text-sm font-bold text-zinc-700 mb-3")
-        picking_container = ui.column().classes("w-full")
-
-      with ui.card().classes(
-          "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)] rounded-lg"
-      ):
-        with ui.row().classes("w-full items-center justify-between mb-3"):
-          ui.label("通路分類數量（人員手動填寫，不會自動計算）").classes(
-              "text-sm font-bold text-zinc-700"
-          )
-
-          def handle_export():
-            try:
-              channel_rows = [
-                  {"通路": ch, "數量": int(inp.value or 0)}
-                  for ch, inp in channel_inputs.items()
-              ]
-              xlsx_bytes = multi_sheet_xlsx_bytes({
-                  "揀貨表": picking_rows_holder["rows"],
-                  "通路分類數量": channel_rows,
-              })
-              ui.download(
-                  xlsx_bytes,
-                  f"{company_label}每日出貨_{state['date_from']}_{state['date_to']}.xlsx",
-                  media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-              )
-            except Exception as e:
-              ui.notify(f"匯出失敗：{e}", color="negative")
-
-          ui.button("匯出 xlsx（揀貨表＋通路分類數量）", on_click=handle_export).classes(
-              "sync-btn px-3 py-1 text-xs rounded-lg"
-          )
-
-        with ui.row().classes("w-full gap-3 flex-wrap"):
-          for ch in DAILY_SHIPPING_CHANNELS:
-            with ui.column().classes("gap-1"):
-              ui.label(ch).classes("text-xs text-zinc-500")
-              channel_inputs[ch] = ui.input(value="0").props(
-                  'dense outlined type="number"'
-              ).classes("w-24")
-
-    await load_and_render()
-
   async def render_procurement_analysis(api_key, api_password, company_label):
     """分公司／採購分析：建議採購量／庫存週轉／進貨明細(先佔位)／月產銷
     分析，共用一次A1資料抓取(fetch_procurement_analysis_data)。跟海濤客
@@ -3399,70 +3448,29 @@ def inventory_dashboard():
 
     render_tabs_content()
 
-  def render_order_channels_tabs(company_name):
-    """「訂單出貨」分頁底下的通路子分頁（SHOPLINE官網／蝦皮／經銷／其它
-    等，依公司不同而不同）。一樣做成懶載入：只有實際點進某個通路，才會
-    去打那個通路的API，不會切到「訂單出貨」就把底下所有通路一次全部
-    打完。
-
-    注意：分頁列(ui.tabs)一定要在內容容器(channel_body)「之前」建立，
-    這樣分頁列在畫面排列順序上才會排在內容前面（天生在最上方）。順序
-    反過來的話，分頁列雖然視覺上看起來應該在上面，但因為content容器的
-    位置已經先佔走了，分頁列反而會被排到內容下方——這是之前修過的同一
-    種bug，這裡也要注意。
-    """
-    order_channels = ORDER_CHANNELS_BY_COMPANY.get(
-        company_name, DEFAULT_ORDER_CHANNELS
-    )
-
-    async def handle_channel_change(ch):
-      channel_body.clear()
-      with channel_body:
-        with ui.row().classes("w-full items-center gap-2 p-8 justify-center"):
-          ui.spinner(size="24px").classes("text-zinc-400")
-          ui.label("資料抓取中，請稍候…").classes("text-xs text-zinc-500")
-      await asyncio.sleep(0)
-
-      channel_body.clear()
-      shopline_creds = SHOPLINE_CHANNEL_CREDENTIALS.get((company_name, ch))
-      restock_target = SHOPLINE_RESTOCK_TARGET.get((company_name, ch), company_name)
-      with channel_body:
-        if shopline_creds:
-          await render_shopline_channel(
-              shopline_creds[0], shopline_creds[1], ch, restock_target
-          )
-        else:
-          render_section_placeholder(
-              f"訂單出貨－{ch}",
-              f"「{ch}」通路的訂單 API 尚未串接，敬請期待",
-          )
-
-    with ui.tabs(on_change=lambda e: handle_channel_change(e.value)).props(
-        "dense no-caps"
-    ).classes("w-full") as channel_tabs:
-      for ch in order_channels:
-        ui.tab(ch)
-
-    channel_body = ui.column().classes("w-full")
-    channel_tabs.set_value(order_channels[0])
 
   def render_channel_company_page(company_name):
     """興聖(股)公司／容鴻(股)公司／芙萊柏(股)公司 共用的頁面骨架：
-    儀表板／訂單出貨(4通路)／每日出貨／調撥紀錄／退換貨記錄／採購分析。
+    儀表板／調撥紀錄／退換貨記錄／採購分析。
+
+    「訂單出貨」「每日出貨」已經搬到「雲端電商訂單」App（/orders路由）
+    去了，這裡不再顯示——共用的render_order_channels_tabs()/
+    render_daily_shipping()等函式已經提升到模組層級，兩邊都能呼叫，
+    內容邏輯本身沒有重複維護兩份。
 
     刻意做成「懶載入」：切換公司的當下只建立分頁導覽本身（很便宜），
-    實際會打API抓資料的內容（訂單出貨/每日出貨/採購分析）要等使用者
-    真的點進那個分頁才觸發。原本的寫法是用ui.tab_panels把所有分頁內容
-    一次全部建好，即使畫面上只顯示一個分頁，其他分頁的內容(含API呼叫)
-    背地裡早就全部執行完了——這代表「切換一次公司」會同時觸發好幾個
-    分頁各自的API呼叫，互相排隊等，才會覺得切換很鈍。
+    實際會打API抓資料的內容（採購分析）要等使用者真的點進那個分頁才
+    觸發。原本的寫法是用ui.tab_panels把所有分頁內容一次全部建好，即使
+    畫面上只顯示一個分頁，其他分頁的內容(含API呼叫)背地裡早就全部執行
+    完了——這代表「切換一次公司」會同時觸發好幾個分頁各自的API呼叫，
+    互相排隊等，才會覺得切換很鈍。
     """
     content_container.clear()
     accent = COMPANY_TAB_COLORS.get(company_name, {}).get("active_bg", "#5bc0be")
     slug = COMPANY_SLUGS.get(company_name, "default")
     tabs_class = f"section-tabs-{slug}"
 
-    SECTION_TABS = ["儀表板", "訂單出貨", "每日出貨", "調撥紀錄", "退換貨記錄", "採購分析"]
+    SECTION_TABS = ["儀表板", "調撥紀錄", "退換貨記錄", "採購分析"]
 
     with content_container:
       with ui.column().classes("w-full p-8 max-w-[1600px] mx-auto gap-4"):
@@ -3502,21 +3510,6 @@ def inventory_dashboard():
               render_section_placeholder(
                   "儀表板", "尚未串接此分公司的庫存／訂單資料，敬請期待"
               )
-          elif tab_label == "訂單出貨":
-            section_body.clear()
-            with section_body:
-              render_order_channels_tabs(company_name)
-          elif tab_label == "每日出貨":
-            section_body.clear()
-            daily_shipping_creds = DAILY_SHIPPING_CREDENTIALS.get(company_name)
-            if daily_shipping_creds:
-              with section_body:
-                await render_daily_shipping(
-                    daily_shipping_creds[0], daily_shipping_creds[1], company_name,
-                )
-            else:
-              with section_body:
-                render_section_placeholder("每日出貨")
           elif tab_label == "調撥紀錄":
             section_body.clear()
             with section_body:
@@ -6619,7 +6612,7 @@ def inventory_dashboard():
 
 
 # =============================================================================
-# 以下三個是新規劃的App骨架（雲端電商訂單／雲端會計／銷售分析），目前都
+# 以下三個是新規劃的App骨架（雲端電商訂單／雲端會計／報表分析），目前都
 # 只有「App切換器 + 公司切換器」的架子，公司分頁點下去先顯示佔位畫面。
 # 之後陸續把內容搬過來時，是把 render_company_switcher_placeholder() 內部
 # handle_company_change() 裡「顯示佔位畫面」那段，換成真正的頁面渲染函式，
@@ -6629,7 +6622,76 @@ def inventory_dashboard():
 def cloud_orders_dashboard():
   inject_global_theme_css()
   render_app_switcher("/orders")
-  render_company_switcher_placeholder("雲端電商訂單")
+  inject_company_tab_css()
+
+  ORDERS_APP_COMPANIES = ("興聖(股)公司", "容鴻(股)公司", "芙萊柏(股)公司")
+
+  def render_orders_company_content(company_name):
+    content_container.clear()
+    with content_container:
+      with ui.column().classes("w-full p-8 max-w-[1600px] mx-auto gap-4"):
+        if company_name not in ORDERS_APP_COMPANIES:
+          with ui.card().classes(
+              "w-full p-16 bg-white border border-[#e6e1d4]"
+              " shadow-[0_1px_3px_rgba(42,40,35,0.06)] rounded-lg text-center"
+          ):
+            ui.label(company_name).classes(
+                "text-lg font-bold text-zinc-900 mb-2"
+            )
+            ui.label(
+                "這間公司的訂單出貨/每日出貨目前還在「雲端進銷存」App"
+                "裡，請切到那邊查看，尚未搬過來這裡。"
+            ).classes("text-sm text-zinc-500")
+          return
+
+        ui.label(company_name).classes("text-lg font-bold text-zinc-900")
+
+        with ui.tabs(
+            on_change=lambda e: handle_orders_section_change(e.value)
+        ).props("dense no-caps").classes("w-full") as orders_section_tabs:
+          ui.tab("訂單出貨")
+          ui.tab("每日出貨")
+
+        orders_section_body = ui.column().classes("w-full")
+
+        async def handle_orders_section_change(tab_label):
+          orders_section_body.clear()
+          with orders_section_body:
+            with ui.row().classes(
+                "w-full items-center gap-2 p-8 justify-center"
+            ):
+              ui.spinner(size="24px").classes("text-zinc-400")
+              ui.label("資料抓取中，請稍候…").classes("text-xs text-zinc-500")
+          await asyncio.sleep(0)
+
+          orders_section_body.clear()
+          if tab_label == "訂單出貨":
+            with orders_section_body:
+              render_order_channels_tabs(company_name)
+          elif tab_label == "每日出貨":
+            daily_shipping_creds = DAILY_SHIPPING_CREDENTIALS.get(company_name)
+            with orders_section_body:
+              if daily_shipping_creds:
+                await render_daily_shipping(
+                    daily_shipping_creds[0], daily_shipping_creds[1], company_name,
+                )
+              else:
+                render_section_placeholder("每日出貨")
+
+        orders_section_tabs.set_value("訂單出貨")
+
+  with ui.row().classes(
+      "w-full flex flex-nowrap items-center bg-white border-b border-[#e6e1d4]"
+      " px-8 py-3 sticky top-[41px] z-40"
+  ):
+    with ui.tabs(
+        on_change=lambda e: render_orders_company_content(e.value)
+    ).props("dense no-caps").classes("flex-shrink-0") as orders_company_tabs:
+      for i, c in enumerate(COMPANIES):
+        ui.tab(c).classes(f"company-tab-{i}")
+
+  content_container = ui.column().classes("w-full")
+  orders_company_tabs.set_value("興聖(股)公司")
 
 
 @ui.page("/accounting")
@@ -6643,7 +6705,7 @@ def cloud_accounting_dashboard():
 def sales_analytics_dashboard():
   inject_global_theme_css()
   render_app_switcher("/analytics")
-  render_company_switcher_placeholder("銷售分析")
+  render_company_switcher_placeholder("報表分析")
 
 
 ui.run(port=8080, title="興聖集團 A1 智慧進銷存總管理系統", host="0.0.0.0")
