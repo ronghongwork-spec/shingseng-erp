@@ -2967,7 +2967,8 @@ def render_app_switcher(active_path):
   換頁，不是同一頁裡切換內容）。
   """
   with ui.row().classes(
-      "w-full items-center gap-1 bg-[#f7f5ef] border-b border-[#e6e1d4] px-8 py-2"
+      "w-full items-center gap-1 bg-[#f7f5ef] border-b border-[#e6e1d4]"
+      " px-8 py-2 sticky top-0 z-[60]"
   ):
     for label, path in APP_SWITCHER_ITEMS:
       is_active = path == active_path
