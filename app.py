@@ -562,6 +562,33 @@ RECEIVING_GOOGLE_SHEET_TAB = os.environ.get(
 CHANNEL_SALES_GOOGLE_SHEET_TAB = os.environ.get(
     "CHANNEL_SALES_GOOGLE_SHEET_TAB", "通路銷售明細"
 )
+# 工廠的生產排程行事曆（星期日～星期六 橫向表頭、下面逐週堆疊的手工
+# 排班表），格式是給人看的、不是給程式讀的乾淨表格（合併儲存格、顏色
+# 分類、自由文字），跟BOM/訂單資訊那種結構化表格不一樣，需要另外用
+# 專門的解析邏輯處理（見 parse_production_schedule_grid）。
+# 預設假設它是同一份試算表(GOOGLE_SHEET_ID)裡的另一個分頁；如果工廠是
+# 用完全獨立的另一份試算表，改設定 PRODUCTION_SCHEDULE_GOOGLE_SHEET_ID
+# 即可，不用改程式碼。
+PRODUCTION_SCHEDULE_GOOGLE_SHEET_ID = os.environ.get(
+    "PRODUCTION_SCHEDULE_GOOGLE_SHEET_ID", GOOGLE_SHEET_ID
+)
+PRODUCTION_SCHEDULE_GOOGLE_SHEET_TAB = os.environ.get(
+    "PRODUCTION_SCHEDULE_GOOGLE_SHEET_TAB", "生產排程"
+)
+WEEKDAY_LABELS = ["星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"]
+
+# 每日工作事項（給儀表板月曆用）：結構化欄位格式，一列一筆，工廠/內勤
+# 直接在Sheet裡新增列即可。「類型」是自由文字（出貨/包裝/盤點/會議…
+# 什麼都可以），畫面上會依實際出現的類型動態分組顯示，不是寫死只認
+# 「包裝」「其他事項」兩種。「訂單資訊」的預計出貨日還是會另外顯示在
+# 月曆上（獨立於這份Sheet），兩者不衝突、可以同時看到。
+DAILY_TASKS_GOOGLE_SHEET_TAB = os.environ.get(
+    "DAILY_TASKS_GOOGLE_SHEET_TAB", "每日工作事項(測試)"
+)
+DAILY_TASK_COL_DATE = "日期"
+DAILY_TASK_COL_TYPE = "類型"
+DAILY_TASK_COL_CONTENT = "內容"
+DAILY_TASK_COL_MEMO = "備註"
 
 
 def get_a1_token():
@@ -1635,7 +1662,117 @@ def _fetch_google_sheet_records(tab_name):
     return []
 
 
-def append_rows_to_google_sheet(tab_name, rows):
+def fetch_daily_tasks():
+  """讀取「每日工作事項」Sheet（結構化欄位：日期/類型/內容/備註，一列
+  一筆）。「類型」是自由文字，不限定固定選項。回傳 None 代表沒設定
+  Google Sheets；回傳 list 代表讀取到的任務(過濾掉日期解析失敗的列)。
+  """
+  records = _fetch_google_sheet_records(DAILY_TASKS_GOOGLE_SHEET_TAB)
+  if records is None:
+    return None
+  tasks = []
+  for row in records:
+    d = _parse_flexible_date(row.get(DAILY_TASK_COL_DATE))
+    if not d:
+      continue
+    tasks.append({
+        "日期": d,
+        "類型": str(row.get(DAILY_TASK_COL_TYPE) or "").strip() or "未分類",
+        "內容": str(row.get(DAILY_TASK_COL_CONTENT) or "").strip(),
+        "備註": str(row.get(DAILY_TASK_COL_MEMO) or "").strip(),
+    })
+  return tasks
+
+
+def fetch_production_schedule_grid():
+  """讀取工廠生產排程Sheet的完整原始格線（不是結構化表格，是給人看的
+  行事曆式排班表，用get_all_values()拿到每一格的原始文字，交給
+  parse_production_schedule_grid()解析）。
+  回傳 (values, error_message)；values是list[list[str]]（整份工作表的
+  原始格線）。
+  """
+  gc = _get_gspread_client()
+  if gc is None:
+    return None, "尚未設定 Google Sheets"
+  try:
+    sh = gc.open_by_key(PRODUCTION_SCHEDULE_GOOGLE_SHEET_ID)
+    ws = sh.worksheet(PRODUCTION_SCHEDULE_GOOGLE_SHEET_TAB)
+    return ws.get_all_values(), None
+  except Exception as e:
+    return None, str(e)
+
+
+def parse_production_schedule_grid(values):
+  """把生產排程Sheet的原始格線解析成「每週」資料。這份Sheet是給人看的
+  行事曆格式（星期日～星期六橫向表頭+合併儲存格+自由文字+顏色分類），
+  不是乾淨的結構化表格，這裡只抓「文字內容」，不管顏色，也不嘗試把自由
+  文字拆解成客戶/日期/動作等欄位（那樣做太容易因為工廠打字習慣不一致
+  而抓錯，這裡刻意只做「這天寫了哪幾行字」這種最單純、最不容易解析錯誤
+  的事）。
+
+  解析邏輯：找「整列裡有好幾格文字剛好等於星期日～星期六」的列，視為
+  一週的表頭列；表頭列的下一列是日期列；再往下的列，直到遇到下一個
+  表頭列為止，都是這一週的事件列。每一天的欄位範圍，是從表頭裡「這天」
+  的欄位，到「下一天」的欄位之前（因為合併儲存格通常是2欄寬，這樣可以
+  不用知道確切的合併範圍）。
+
+  回傳 weeks：[{"dates": [date或None x7], "events": [[str,...] x7]}, ...]
+  依照在Sheet裡出現的順序（通常是舊到新）。
+  """
+  weeks = []
+  n_rows = len(values)
+  row_idx = 0
+  max_cols = max((len(r) for r in values), default=0)
+
+  while row_idx < n_rows:
+    row = values[row_idx]
+    day_cols = []  # [(欄位index, 星期幾的index0~6), ...]
+    for col_idx, cell in enumerate(row):
+      cell_text = (cell or "").strip()
+      if cell_text in WEEKDAY_LABELS:
+        day_cols.append((col_idx, WEEKDAY_LABELS.index(cell_text)))
+
+    if len(day_cols) < 5:
+      # 沒抓到夠多星期標籤，不是表頭列，跳到下一列繼續找
+      row_idx += 1
+      continue
+
+    day_cols.sort(key=lambda x: x[0])
+    boundaries = [c for c, _ in day_cols] + [max_cols + 1]
+
+    date_row = values[row_idx + 1] if row_idx + 1 < n_rows else []
+    dates = [None] * 7
+    for i, (col_idx, day_pos) in enumerate(day_cols):
+      date_text = (date_row[col_idx] if col_idx < len(date_row) else "").strip()
+      dates[day_pos] = _parse_flexible_date(date_text)
+
+    events = [[] for _ in range(7)]
+    scan_row = row_idx + 2
+    while scan_row < n_rows:
+      r = values[scan_row]
+      is_next_header = sum(
+          1 for c in r if (c or "").strip() in WEEKDAY_LABELS
+      ) >= 5
+      if is_next_header:
+        break
+      for i, (col_idx, day_pos) in enumerate(day_cols):
+        start, end = col_idx, boundaries[i + 1]
+        texts = [
+            (r[c] or "").strip()
+            for c in range(start, min(end, len(r)))
+            if c < len(r) and (r[c] or "").strip()
+        ]
+        if texts:
+          events[day_pos].append("、".join(texts))
+      scan_row += 1
+
+    weeks.append({"dates": dates, "events": events})
+    row_idx = scan_row
+
+  return weeks
+
+
+
   """把 rows（list[dict]，key要對到Sheet的欄位標題）依照該分頁目前的
   欄位順序，逐列附加到分頁最後面。用來讓「手動建立訂單」等功能可以把
   新資料直接寫回Sheet，跟既有的訂單資訊共用同一份，不用另外維護一份
@@ -3925,6 +4062,180 @@ def inventory_dashboard():
           with ui.tab_panel(tab_dashboard):
             with ui.card().classes(
                 "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)]"
+                " rounded-lg mb-4"
+            ):
+              ui.label("每日工作行事曆").classes(
+                  "text-lg font-bold text-zinc-900 tracking-wide mb-2"
+              )
+              ui.label(
+                  "出貨直接讀「訂單資訊」的預計出貨日；其他工作事項讀"
+                  "「每日工作事項」Sheet，依「類型」欄位實際填的文字動態"
+                  "分組（出貨/包裝/盤點/會議…都可以）。點格子看當天詳細內容。"
+              ).classes("text-xs text-zinc-500 mb-3")
+
+              today_for_cal = datetime.now().date()
+              calendar_state = {"year": today_for_cal.year, "month": today_for_cal.month}
+
+              with ui.dialog() as day_detail_dialog, ui.card().classes(
+                  "min-w-[360px] max-w-[90vw] p-5"
+              ):
+                day_detail_body = ui.column().classes("w-full gap-2")
+
+              def open_day_detail(d, orders_by_date, tasks_by_date):
+                day_detail_body.clear()
+                with day_detail_body:
+                  ui.label(d.isoformat()).classes(
+                      "text-base font-bold text-zinc-900"
+                  )
+                  day_orders = orders_by_date.get(d, [])
+                  day_tasks = tasks_by_date.get(d, [])
+
+                  ui.label(f"出貨（訂單資訊，共 {len(day_orders)} 筆）").classes(
+                      "text-xs font-bold text-zinc-700 mt-2"
+                  )
+                  if not day_orders:
+                    ui.label("（無）").classes("text-xs text-zinc-400")
+                  for o in day_orders:
+                    ui.label(
+                        f"{o.get('訂單編號','')}｜{o.get('品名','')}"
+                        f" x{o.get('預計出貨數量','')}"
+                    ).classes("text-xs text-zinc-600")
+
+                  # 依「類型」欄位實際出現的文字動態分組（不限定固定選項），
+                  # 保留原本的填寫順序，同類型的排在一起。
+                  types_in_order = []
+                  by_type = defaultdict(list)
+                  for t in day_tasks:
+                    if t["類型"] not in by_type:
+                      types_in_order.append(t["類型"])
+                    by_type[t["類型"]].append(t)
+
+                  if not types_in_order:
+                    ui.label("工作事項（每日工作事項Sheet）").classes(
+                        "text-xs font-bold text-zinc-700 mt-2"
+                    )
+                    ui.label("（無）").classes("text-xs text-zinc-400")
+                  for type_label in types_in_order:
+                    items = by_type[type_label]
+                    ui.label(f"{type_label}（{len(items)}）").classes(
+                        "text-xs font-bold text-zinc-700 mt-2"
+                    )
+                    for t in items:
+                      ui.label(t["內容"]).classes(
+                          "text-xs text-zinc-600"
+                      ).style("white-space: pre-line")
+                      if t["備註"]:
+                        ui.label(f"備註：{t['備註']}").classes(
+                            "text-xs text-zinc-400"
+                        ).style("white-space: pre-line")
+                day_detail_dialog.open()
+
+              calendar_grid_container = ui.column().classes("w-full")
+
+              def change_month(delta):
+                m = calendar_state["month"] + delta
+                y = calendar_state["year"]
+                if m < 1:
+                  m, y = 12, y - 1
+                elif m > 12:
+                  m, y = 1, y + 1
+                calendar_state["month"] = m
+                calendar_state["year"] = y
+                render_calendar_grid()
+
+              def render_calendar_grid():
+                calendar_grid_container.clear()
+                import calendar as cal_module
+
+                year, month = calendar_state["year"], calendar_state["month"]
+
+                orders_raw = app_state.get("orders", [])
+                orders_by_date = defaultdict(list)
+                for o in orders_raw:
+                  d = o.get("預計出貨日")
+                  if d:
+                    orders_by_date[d].append(o)
+
+                tasks_raw = fetch_daily_tasks()
+                tasks_by_date = defaultdict(list)
+                tasks_not_configured = tasks_raw is None
+                if tasks_raw:
+                  for t in tasks_raw:
+                    tasks_by_date[t["日期"]].append(t)
+
+                with calendar_grid_container:
+                  if tasks_not_configured:
+                    ui.label(
+                        "尚未設定「每日工作事項」Google Sheets 分頁，工作"
+                        "事項暫時不會顯示，出貨資料仍正常運作"
+                    ).classes("text-xs text-amber-700 mb-2")
+
+                  with ui.row().classes("w-full items-center justify-between mb-3"):
+                    ui.button(
+                        "← 上個月", on_click=lambda: change_month(-1),
+                    ).props("dense no-caps unelevated").classes(
+                        "px-3 py-1 text-xs rounded-lg"
+                    ).style(
+                        "background:#ffffff; color:#4b5563; border:1px solid #e6e1d4;"
+                    )
+                    ui.label(f"{year} 年 {month} 月").classes(
+                        "text-sm font-bold text-zinc-700"
+                    )
+                    ui.button(
+                        "下個月 →", on_click=lambda: change_month(1),
+                    ).props("dense no-caps unelevated").classes(
+                        "px-3 py-1 text-xs rounded-lg"
+                    ).style(
+                        "background:#ffffff; color:#4b5563; border:1px solid #e6e1d4;"
+                    )
+
+                  first_weekday, days_in_month = cal_module.monthrange(year, month)
+                  # monthrange的first_weekday是0=星期一，轉成「星期日=0」的偏移
+                  leading_blanks = (first_weekday + 1) % 7
+
+                  with ui.grid(columns=7).classes("w-full gap-1"):
+                    for wd in WEEKDAY_LABELS:
+                      ui.label(wd).classes(
+                          "text-xs font-bold text-zinc-500 text-center"
+                      )
+                    for _ in range(leading_blanks):
+                      ui.label("")
+                    for day_num in range(1, days_in_month + 1):
+                      d = datetime(year, month, day_num).date()
+                      day_orders = orders_by_date.get(d, [])
+                      day_tasks = tasks_by_date.get(d, [])
+                      is_today = d == today_for_cal
+
+                      with ui.column().classes(
+                          "gap-0.5 p-2 rounded-lg cursor-pointer min-h-[72px] "
+                          + (
+                              "bg-[#e8f6f5] border border-[#5bc0be]"
+                              if is_today
+                              else "bg-[#f7f5ef] border border-[#e6e1d4]"
+                          )
+                      ).on(
+                          "click",
+                          lambda e, d=d, ob=orders_by_date, tb=tasks_by_date:
+                              open_day_detail(d, ob, tb),
+                      ):
+                        ui.label(str(day_num)).classes(
+                            "text-xs font-bold text-zinc-700"
+                        )
+                        if day_orders:
+                          ui.label(f"出貨 {len(day_orders)}").classes(
+                              "text-[10px] text-blue-700"
+                          )
+                        if day_tasks:
+                          # 格子裡只顯示總數，不逐類型列出(避免格子太擠)，
+                          # 詳細分類點進去看detail dialog即可。
+                          ui.label(f"事項 {len(day_tasks)}").classes(
+                              "text-[10px] text-purple-700"
+                          )
+
+              render_calendar_grid()
+
+            with ui.card().classes(
+                "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)]"
                 " rounded-lg"
             ):
               dashboard_source_label = ui.label().classes(
@@ -5968,6 +6279,114 @@ def inventory_dashboard():
           # 4. 生產與包裝排程
           # ==================================================
           with ui.tab_panel(tab_production):
+            with ui.card().classes(
+                "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)]"
+                " rounded-lg mb-4"
+            ):
+              ui.label("工廠生產排程行事曆").classes(
+                  "text-lg font-bold text-zinc-900 tracking-wide mb-2"
+              )
+              ui.label(
+                  "直接鏡射工廠維護的 Google Sheet 行事曆內容（只顯示文字，"
+                  "不解讀顏色/意義），工廠照原本習慣填寫即可，不用改格式。"
+              ).classes("text-xs text-zinc-500 mb-3")
+
+              production_schedule_state = {"weeks": None, "index": 0, "error": None}
+
+              def load_production_schedule():
+                values, error = fetch_production_schedule_grid()
+                if error:
+                  production_schedule_state["error"] = error
+                  production_schedule_state["weeks"] = None
+                  return
+                weeks = parse_production_schedule_grid(values or [])
+                production_schedule_state["weeks"] = weeks
+                production_schedule_state["error"] = None
+                today = datetime.now().date()
+                best_idx, best_diff = 0, None
+                for i, w in enumerate(weeks):
+                  valid_dates = [d for d in w["dates"] if d]
+                  if not valid_dates:
+                    continue
+                  diff = abs((min(valid_dates) - today).days)
+                  if best_diff is None or diff < best_diff:
+                    best_diff, best_idx = diff, i
+                production_schedule_state["index"] = best_idx
+
+              def navigate_schedule_week(delta):
+                weeks = production_schedule_state["weeks"] or []
+                if not weeks:
+                  return
+                new_idx = production_schedule_state["index"] + delta
+                production_schedule_state["index"] = max(0, min(new_idx, len(weeks) - 1))
+                render_production_schedule_view()
+
+              def render_production_schedule_view():
+                schedule_view_container.clear()
+                with schedule_view_container:
+                  if production_schedule_state["error"]:
+                    render_section_placeholder(
+                        "生產排程行事曆", f"讀取失敗：{production_schedule_state['error']}"
+                    )
+                    return
+                  weeks = production_schedule_state["weeks"]
+                  if not weeks:
+                    render_section_placeholder(
+                        "生產排程行事曆",
+                        "尚未設定 Google Sheets，或找不到符合格式的週次資料"
+                        "（需要有一列剛好是星期日～星期六）",
+                    )
+                    return
+
+                  idx = production_schedule_state["index"]
+                  week = weeks[idx]
+                  valid_dates = [d for d in week["dates"] if d]
+                  date_range_label = (
+                      f"{valid_dates[0].isoformat()} ～ {valid_dates[-1].isoformat()}"
+                      if valid_dates else "（無法辨識日期）"
+                  )
+
+                  with ui.row().classes("w-full items-center justify-between mb-3"):
+                    ui.button(
+                        "← 上一週", on_click=lambda: navigate_schedule_week(-1),
+                    ).props("dense no-caps unelevated").classes(
+                        "px-3 py-1 text-xs rounded-lg"
+                    ).style(
+                        "background:#ffffff; color:#4b5563; border:1px solid #e6e1d4;"
+                    )
+                    ui.label(date_range_label).classes(
+                        "text-sm font-bold text-zinc-700"
+                    )
+                    ui.button(
+                        "下一週 →", on_click=lambda: navigate_schedule_week(1),
+                    ).props("dense no-caps unelevated").classes(
+                        "px-3 py-1 text-xs rounded-lg"
+                    ).style(
+                        "background:#ffffff; color:#4b5563; border:1px solid #e6e1d4;"
+                    )
+
+                  with ui.row().classes("w-full gap-2 items-stretch"):
+                    for i, label in enumerate(WEEKDAY_LABELS):
+                      d = week["dates"][i]
+                      with ui.column().classes(
+                          "flex-1 gap-1 p-2 bg-[#f7f5ef] border border-[#e6e1d4]"
+                          " rounded-lg min-h-[140px]"
+                      ):
+                        ui.label(label).classes("text-xs font-bold text-zinc-700")
+                        ui.label(d.isoformat() if d else "-").classes(
+                            "text-xs text-zinc-400 mb-1"
+                        )
+                        if not week["events"][i]:
+                          ui.label("（無資料）").classes("text-xs text-zinc-300")
+                        for ev in week["events"][i]:
+                          ui.label(ev).classes(
+                              "text-xs text-zinc-600 leading-snug"
+                          )
+
+              schedule_view_container = ui.column().classes("w-full")
+              load_production_schedule()
+              render_production_schedule_view()
+
             with ui.card().classes(
                 "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)]"
                 " rounded-lg"
