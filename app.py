@@ -1688,7 +1688,7 @@ def fetch_daily_tasks(tab_name):
   return tasks
 
 
-def render_monthly_task_calendar(company_name, orders_source=None):
+def render_monthly_task_calendar(company_name, orders_source=None, refs=None, refs_key="update_calendar"):
   """通用每月工作行事曆：company_name決定要讀COMPANY_TASKS_SHEET_TAB裡
   哪一個分頁的每日工作事項（進貨/其它事項/出貨...依實際填的「類型」
   文字動態分組顯示）。orders_source是可選的訂單清單（例如海濤客的
@@ -1696,6 +1696,11 @@ def render_monthly_task_calendar(company_name, orders_source=None):
   （依「預計出貨日」分組）；沒給的話（例如興聖/容鴻/芙萊柏目前沒有
   這份訂單資料來源）就只顯示Sheet裡的工作事項分類，不會有獨立的
   「出貨」區塊。
+
+  refs／refs_key：可選，如果有傳入refs字典，會把這份行事曆的「重新整理」
+  函式登記進去（refs[refs_key] = 重新整理函式），這樣外部的「同步」
+  按鈕按下去之後，才能連帶把月曆一起重畫成最新資料，不然月曆雖然每次
+  自己開啟時都會抓最新資料，但按其他地方的同步按鈕不會主動通知它重畫。
   """
   with ui.card().classes(
       "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)]"
@@ -1878,6 +1883,8 @@ def render_monthly_task_calendar(company_name, orders_source=None):
                 )
 
     render_calendar_grid()
+    if refs is not None:
+      refs[refs_key] = render_calendar_grid
 
 
 def fetch_production_schedule_grid():
@@ -4230,6 +4237,7 @@ def inventory_dashboard():
             "update_packing_schedule",
             "update_turnover_list",
             "update_receivings_list",
+            "update_calendar",
         ):
           if ref_key in refs:
             refs[ref_key]()
@@ -4276,6 +4284,7 @@ def inventory_dashboard():
             "update_packing_schedule",
             "update_turnover_list",
             "update_receivings_list",
+            "update_calendar",
         ):
           if ref_key in refs:
             refs[ref_key]()
@@ -4317,7 +4326,7 @@ def inventory_dashboard():
           # ==================================================
           with ui.tab_panel(tab_dashboard):
             render_monthly_task_calendar(
-                "海濤客食品工業(股)公司", orders_source=app_state.get("orders", []),
+                "海濤客食品工業(股)公司", refs=refs, refs_key="update_calendar",
             )
 
             with ui.card().classes(
@@ -5429,19 +5438,16 @@ def inventory_dashboard():
                   render_manual_created_list()
 
               with ui.tab_panel(tab_unshipped_query):
-                  orders_reminder_container = ui.column().classes("w-full gap-2 mb-4")
+                  ui.label(
+                      "資料來源：「海濤客」Sheet 裡「類型」欄位為「出貨」的"
+                      "列（跟每日工作行事曆同一份資料）。內容是自由文字，"
+                      "不是結構化的品號/數量，所以這裡只能用關鍵字搜尋。"
+                  ).classes("text-xs text-zinc-500 mb-3")
 
                   with ui.row().classes("items-center gap-3 flex-wrap mb-3"):
                     orders_search_input = ui.input(
-                        placeholder="輸入品號、品名或訂單編號..."
+                        placeholder="搜尋內容或備註關鍵字..."
                     ).classes("w-64 text-xs")
-                    orders_status_select = ui.select(
-                        options=["全部狀態", "未出貨", "備貨中", "已出貨"],
-                        value="全部狀態",
-                    ).classes(
-                        "bg-[#f7f6f2] text-zinc-900 rounded-lg px-3 py-1"
-                        " text-xs font-bold border border-[#e6e1d4]"
-                    )
 
                   orders_stats_label = ui.label().classes(
                       "text-xs text-zinc-500 mb-3"
@@ -5450,84 +5456,57 @@ def inventory_dashboard():
 
                   def update_orders_list():
                     orders_table_container.clear()
-                    orders = app_state.get("orders", [])
-                    configured = app_state.get("orders_configured", False)
+                    tab_name = COMPANY_TASKS_SHEET_TAB["海濤客食品工業(股)公司"]
+                    tasks = fetch_daily_tasks(tab_name)
 
-                    if not configured:
-                      orders_reminder_container.clear()
+                    if tasks is None:
                       orders_stats_label.text = ""
                       with orders_table_container:
                         ui.label(
-                            "尚未設定 Google Sheets，請見「系統設定」的設定"
-                            "說明。"
+                            f"尚未設定 Google Sheets「{tab_name}」分頁。"
                         ).classes("text-xs text-zinc-400")
                       return
 
-                    items_map = app_state.get("items_map", {})
-                    bom_map = app_state.get("bom_map", {})
-                    df = app_state["df"].copy()
-                    settings = app_state["settings"]
-                    if not df.empty:
-                      stock_by_item = df.groupby("品號", as_index=False)[
-                          "庫存數量"
-                      ].sum()
-                      stock_lookup = dict(
-                          zip(stock_by_item["品號"], stock_by_item["庫存數量"])
-                      )
-                    else:
-                      stock_lookup = {}
-                    announcements = compute_dashboard_announcements(
-                        orders, items_map, bom_map, stock_lookup, settings,
-                        horizon_days=14,
-                    )
-                    _render_announcements(
-                        orders_reminder_container, announcements, ["shipping"]
-                    )
-
-                    rows = list(orders)
+                    rows = [t for t in tasks if t["類型"] == "出貨"]
                     keyword = (orders_search_input.value or "").strip().lower()
                     if keyword:
                       rows = [
                           r for r in rows
-                          if keyword in str(r["品號"]).lower()
-                          or keyword in str(r.get("品名", "")).lower()
-                          or keyword in str(r.get("訂單編號", "")).lower()
+                          if keyword in r["內容"].lower()
+                          or keyword in r["備註"].lower()
                       ]
-                    if orders_status_select.value != "全部狀態":
-                      rows = [r for r in rows if r["狀態"] == orders_status_select.value]
 
-                    rows = sorted(rows, key=lambda r: r["預計出貨日"])
+                    rows = sorted(rows, key=lambda r: r["日期"])
                     display_rows = [
-                        {**r, "預計出貨日": r["預計出貨日"].isoformat()}
+                        {
+                            "日期": r["日期"].isoformat(),
+                            "內容": r["內容"],
+                            "備註": r["備註"],
+                        }
                         for r in rows
                     ]
 
-                    total_qty = sum(r["預計出貨數量"] for r in rows)
-                    orders_stats_label.text = (
-                        f"共 {len(rows)} 筆訂單｜預計出貨總量 {total_qty:g}"
-                    )
+                    orders_stats_label.text = f"共 {len(rows)} 筆出貨資料"
 
                     with orders_table_container:
                       if not rows:
-                        ui.label("目前沒有符合條件的訂單資料").classes(
+                        ui.label("目前沒有符合條件的出貨資料").classes(
                             "text-xs text-zinc-400"
                         )
                       else:
                         ui.table(
                             columns=[
-                                {"name": "訂單編號", "label": "訂單編號", "field": "訂單編號", "align": "left"},
-                                {"name": "品號", "label": "品號", "field": "品號", "align": "left"},
-                                {"name": "品名", "label": "品名", "field": "品名", "align": "left"},
-                                {"name": "預計出貨日", "label": "預計出貨日", "field": "預計出貨日"},
-                                {"name": "預計出貨數量", "label": "預計出貨數量", "field": "預計出貨數量"},
-                                {"name": "狀態", "label": "狀態", "field": "狀態"},
+                                {"name": "日期", "label": "日期", "field": "日期", "align": "left", "sortable": True},
+                                {"name": "內容", "label": "內容", "field": "內容", "align": "left"},
                                 {"name": "備註", "label": "備註", "field": "備註", "align": "left"},
                             ],
-                            rows=display_rows,
-                        ).classes("w-full")
+                            rows=display_rows, row_key="日期",
+                            pagination={"rowsPerPage": 15, "sortBy": "日期", "descending": False},
+                        ).classes("w-full").props(
+                            ':rows-per-page-options="[15,30,50,0]"'
+                        ).props('wrap-cells')
 
                   orders_search_input.on_value_change(lambda e: update_orders_list())
-                  orders_status_select.on_value_change(lambda e: update_orders_list())
                   update_orders_list()
                   refs["update_orders_list"] = update_orders_list
 
