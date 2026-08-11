@@ -3518,6 +3518,11 @@ def render_app_switcher(active_path):
   """四個App之間的切換器，放在畫面最上方。用ui.link做頁面跳轉（不是
   NiceGUI的tab_panels切換，因為這是四個「不同網址」的獨立頁面，要真的
   換頁，不是同一頁裡切換內容）。
+
+  右側會留一個空的容器（extra_slot）並回傳給呼叫端，讓個別頁面可以把
+  自己專屬的按鈕（例如雲端進銷存的「同步」按鈕）放進來，統一顯示在
+  最上面這排、跟App切換器同一列，不用each頁面各自重新做一次sticky
+  header。沒有頁面要用的話，這個容器就是空的，不影響版面。
   """
   with ui.row().classes(
       "w-full items-center gap-1 bg-[#f7f5ef] border-b border-[#e6e1d4]"
@@ -3533,6 +3538,8 @@ def render_app_switcher(active_path):
               else "text-zinc-600 hover:bg-[#ece6d6]"
           )
       )
+    extra_slot = ui.row().classes("items-center gap-2 ml-auto")
+  return extra_slot
 
 
 def inject_global_theme_css():
@@ -3770,7 +3777,7 @@ def home_dashboard():
 @ui.page("/inventory")
 def inventory_dashboard():
   inject_global_theme_css()
-  render_app_switcher("/inventory")
+  top_right_slot = render_app_switcher("/inventory")
 
   # -----------------------------------------------------------------------
   # 右上角分公司切換
@@ -3789,6 +3796,7 @@ def inventory_dashboard():
   inject_company_tab_css()
 
   def handle_company_change(e):
+    top_right_slot.clear()
     selected = e.value
     if selected == ACTIVE_COMPANY_LABEL:
       render_hai_tao_ke_page()
@@ -4226,6 +4234,63 @@ def inventory_dashboard():
           if ref_key in refs:
             refs[ref_key]()
 
+      def handle_sheets_sync():
+        """只重新讀取 Google Sheets（BOM／訂單資訊／每日工作事項會在月曆
+        自己每次渲染時讀，不用這裡管；這裡處理的是快取在app_state裡、
+        不會自動更新的部分：BOM／訂單資訊／銷售歷史／進貨明細／通路銷售
+        明細），不會去打A1的庫存API，比「同步A1最新庫存」快很多，適合
+        只是想確認Sheet裡新增的資料有沒有反映到畫面時使用。
+        """
+        sync_time = datetime.now()
+        try:
+          app_state["bom_map"], app_state["bom_source"] = load_bom_data()
+          app_state["orders"], app_state["orders_configured"] = (
+              load_orders_from_google_sheet()
+          )
+          if not str(app_state.get("sales_history_source", "")).startswith("鼎新 A1"):
+            sheet_rows, sheet_configured = load_sales_history_from_google_sheet()
+            app_state["sales_history"] = sheet_rows
+            app_state["sales_history_configured"] = sheet_configured
+            app_state["sales_history_source"] = (
+                "Google Sheets" if sheet_configured else "尚未設定"
+            )
+          app_state["receivings"], app_state["receivings_configured"] = (
+              load_receivings_from_google_sheet()
+          )
+          app_state["channel_sales"], app_state["channel_sales_configured"] = (
+              load_channel_sales_from_google_sheet()
+          )
+          status = "成功"
+        except Exception as e:
+          status = f"失敗：{e}"
+
+        ui.notify(
+            f"Google Sheets 同步{status}（{sync_time.strftime('%H:%M:%S')}）",
+            color="positive" if status == "成功" else "negative",
+        )
+        for ref_key in (
+            "update_combo_list",
+            "update_dashboard",
+            "update_procurement_list",
+            "update_orders_list",
+            "update_packing_schedule",
+            "update_turnover_list",
+            "update_receivings_list",
+        ):
+          if ref_key in refs:
+            refs[ref_key]()
+
+      top_right_slot.clear()
+      with top_right_slot:
+        ui.button("同步 A1 最新庫存", on_click=handle_sync).classes(
+            "sync-btn px-3 py-1 text-xs rounded-lg"
+        )
+        ui.button("同步 Google Sheets", on_click=handle_sheets_sync).classes(
+            "px-3 py-1 text-xs rounded-lg"
+        ).style(
+            "background:#ffffff; color:#4b5563; border:1px solid #e6e1d4;"
+        )
+
       with ui.column().classes("w-full p-8 max-w-[1600px] mx-auto"):
         with ui.row().classes("w-full items-center justify-between mb-4"):
           with ui.row().classes("items-center gap-3"):
@@ -4235,9 +4300,6 @@ def inventory_dashboard():
             ui.label(ACTIVE_COMPANY_LABEL).classes(
                 "text-2xl font-black text-zinc-900 tracking-wide"
             )
-          ui.button("同步 A1 最新庫存", on_click=handle_sync).classes(
-              "sync-btn px-4 py-2 text-xs rounded-lg"
-          )
 
         with ui.tabs().classes("w-full") as page_tabs:
           tab_dashboard = ui.tab("儀表板")
