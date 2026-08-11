@@ -2600,44 +2600,80 @@ async def render_shopline_product_changes(company_name):
       for e in errors:
         ui.label(f"抓取失敗：{e}").classes("text-xs text-red-700")
 
-  with ui.card().classes(
-      "w-full p-6 bg-white border border-[#e6e1d4]"
-      " shadow-[0_1px_3px_rgba(42,40,35,0.06)] rounded-lg"
-  ):
-    with ui.row().classes("w-full items-center justify-between mb-3"):
-      ui.label(f"共 {len(all_rows)} 筆商品異動").classes(
-          "text-sm font-bold text-zinc-700"
-      )
+  status_filter_state = {"value": "全部"}
+  results_container = ui.column().classes("w-full")
 
-      def handle_export():
-        try:
-          xlsx_bytes = rows_to_xlsx_bytes(all_rows, sheet_name="商品異動")
-          ui.download(
-              xlsx_bytes, f"{company_name}商品異動.xlsx",
-              media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-          )
-        except Exception as e:
-          ui.notify(f"匯出失敗：{e}", color="negative")
+  def render_status_filter_buttons():
+    filter_row.clear()
+    with filter_row:
+      for label in ["全部", "上架", "下架"]:
+        is_active = label == status_filter_state["value"]
+        bg = "#5bc0be" if is_active else "#ffffff"
+        fg = "#ffffff" if is_active else "#4b5563"
+        border = "#5bc0be" if is_active else "#e6e1d4"
+        ui.button(
+            label, on_click=lambda v=label: set_status_filter(v)
+        ).props("dense no-caps unelevated").classes(
+            "px-4 py-1 rounded-lg"
+        ).style(
+            f"background:{bg} !important; color:{fg} !important;"
+            f" border:1px solid {border};"
+        )
 
-      ui.button("匯出 xlsx", on_click=handle_export).classes(
-          "sync-btn px-3 py-1 text-xs rounded-lg"
-      )
+  def set_status_filter(v):
+    status_filter_state["value"] = v
+    render_status_filter_buttons()
+    render_results()
 
-    if not all_rows:
-      ui.label("近30天沒有商品異動").classes("text-xs text-zinc-400")
+  def render_results():
+    results_container.clear()
+    if status_filter_state["value"] == "全部":
+      filtered_rows = all_rows
     else:
-      ui.table(
-          columns=[
-              {"name": c, "label": c, "field": c,
-               "align": "left" if c != "最後更新時間" else "left", "sortable": True}
-              for c in ["來源", "SKU", "商品", "狀態", "最後更新時間"]
-          ],
-          rows=all_rows, row_key="SKU",
-          pagination={"rowsPerPage": 15, "sortBy": "最後更新時間", "descending": True},
-      ).classes("w-full").props(':rows-per-page-options="[15,30,50,0]"')
+      filtered_rows = [r for r in all_rows if r["狀態"] == status_filter_state["value"]]
+
+    with results_container:
+      with ui.card().classes(
+          "w-full p-6 bg-white border border-[#e6e1d4]"
+          " shadow-[0_1px_3px_rgba(42,40,35,0.06)] rounded-lg"
+      ):
+        with ui.row().classes("w-full items-center justify-between mb-3"):
+          ui.label(f"共 {len(filtered_rows)} 筆商品異動").classes(
+              "text-sm font-bold text-zinc-700"
+          )
+
+          def handle_export():
+            try:
+              xlsx_bytes = rows_to_xlsx_bytes(filtered_rows, sheet_name="商品異動")
+              ui.download(
+                  xlsx_bytes, f"{company_name}商品異動.xlsx",
+                  media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+              )
+            except Exception as e:
+              ui.notify(f"匯出失敗：{e}", color="negative")
+
+          ui.button("匯出 xlsx", on_click=handle_export).classes(
+              "sync-btn px-3 py-1 text-xs rounded-lg"
+          )
+
+        if not filtered_rows:
+          ui.label("沒有符合篩選條件的商品異動").classes("text-xs text-zinc-400")
+        else:
+          ui.table(
+              columns=[
+                  {"name": c, "label": c, "field": c, "align": "left", "sortable": True}
+                  for c in ["來源", "SKU", "商品", "狀態", "最後更新時間"]
+              ],
+              rows=filtered_rows, row_key="SKU",
+              pagination={"rowsPerPage": 15, "sortBy": "最後更新時間", "descending": True},
+          ).classes("w-full").props(':rows-per-page-options="[15,30,50,0]"')
+
+  filter_row = ui.row().classes("gap-2 mb-3")
+  render_status_filter_buttons()
+  render_results()
 
 
-
+async def render_shopline_channel(access_token, user_agent, channel_title, restock_target=None):
   """SHOPLINE官網訂單通路的共用畫面（興聖官網(海濤客)／官網(JDH)／
   芙萊柏官網-B'f 都呼叫這支，只是傳入的access_token/user_agent/標題不同）。
   抓近3個月「待處理」+「已確認」訂單，畫面：
@@ -3242,6 +3278,9 @@ def render_company_switcher_placeholder(app_label):
       "w-full flex flex-nowrap items-center bg-white border-b border-[#e6e1d4]"
       " px-8 py-3 sticky top-[41px] z-40"
   ):
+    ui.label(f"興聖集團｜{app_label}").classes(
+        "text-base font-black tracking-wider flex-shrink-0 mr-4"
+    )
     with ui.tabs(on_change=handle_company_change).props(
         "dense no-caps"
     ).classes("flex-shrink-0") as company_tabs:
@@ -3406,7 +3445,7 @@ def inventory_dashboard():
       " border-b border-[#e6e1d4] px-8 py-4 sticky top-[41px] z-50"
   ):
     with ui.row().classes("items-center gap-3 flex-shrink-0"):
-      ui.label("興聖集團｜A1 智慧進銷存總管理系統").classes(
+      ui.label("興聖集團｜雲端進銷存").classes(
           "text-base font-black tracking-wider"
       )
       # Logo 放置位置：把檔案存成 static/logo.png（跟 app.py 同層的
@@ -7060,6 +7099,9 @@ def cloud_orders_dashboard():
       "w-full flex flex-nowrap items-center bg-white border-b border-[#e6e1d4]"
       " px-8 py-3 sticky top-[41px] z-40"
   ):
+    ui.label("興聖集團｜雲端電商訂單").classes(
+        "text-base font-black tracking-wider flex-shrink-0 mr-4"
+    )
     with ui.tabs(
         on_change=lambda e: render_orders_company_content(e.value)
     ).props("dense no-caps").classes("flex-shrink-0") as orders_company_tabs:
