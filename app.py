@@ -2600,61 +2600,31 @@ async def render_shopline_product_changes(company_name):
       for e in errors:
         ui.label(f"抓取失敗：{e}").classes("text-xs text-red-700")
 
-  status_filter_state = {"value": "全部"}
+  status_filter_state = {"value": "全部", "date_from": "", "date_to": ""}
   results_container = ui.column().classes("w-full")
-
-  def render_status_filter_buttons():
-    filter_row.clear()
-    with filter_row:
-      for label in ["全部", "上架", "下架"]:
-        is_active = label == status_filter_state["value"]
-        bg = "#5bc0be" if is_active else "#ffffff"
-        fg = "#ffffff" if is_active else "#4b5563"
-        border = "#5bc0be" if is_active else "#e6e1d4"
-        ui.button(
-            label, on_click=lambda v=label: set_status_filter(v)
-        ).props("dense no-caps unelevated").classes(
-            "px-4 py-1 rounded-lg"
-        ).style(
-            f"background:{bg} !important; color:{fg} !important;"
-            f" border:1px solid {border};"
-        )
-
-  def set_status_filter(v):
-    status_filter_state["value"] = v
-    render_status_filter_buttons()
-    render_results()
 
   def render_results():
     results_container.clear()
     if status_filter_state["value"] == "全部":
-      filtered_rows = all_rows
+      filtered_rows = list(all_rows)
     else:
       filtered_rows = [r for r in all_rows if r["狀態"] == status_filter_state["value"]]
+
+    date_from = status_filter_state["date_from"]
+    date_to = status_filter_state["date_to"]
+    if date_from:
+      filtered_rows = [r for r in filtered_rows if r["最後更新時間"][:10] >= date_from]
+    if date_to:
+      filtered_rows = [r for r in filtered_rows if r["最後更新時間"][:10] <= date_to]
 
     with results_container:
       with ui.card().classes(
           "w-full p-6 bg-white border border-[#e6e1d4]"
           " shadow-[0_1px_3px_rgba(42,40,35,0.06)] rounded-lg"
       ):
-        with ui.row().classes("w-full items-center justify-between mb-3"):
-          ui.label(f"共 {len(filtered_rows)} 筆商品異動").classes(
-              "text-sm font-bold text-zinc-700"
-          )
-
-          def handle_export():
-            try:
-              xlsx_bytes = rows_to_xlsx_bytes(filtered_rows, sheet_name="商品異動")
-              ui.download(
-                  xlsx_bytes, f"{company_name}商品異動.xlsx",
-                  media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-              )
-            except Exception as e:
-              ui.notify(f"匯出失敗：{e}", color="negative")
-
-          ui.button("匯出 xlsx", on_click=handle_export).classes(
-              "sync-btn px-3 py-1 text-xs rounded-lg"
-          )
+        ui.label(f"共 {len(filtered_rows)} 筆商品異動").classes(
+            "text-sm font-bold text-zinc-700 mb-3"
+        )
 
         if not filtered_rows:
           ui.label("沒有符合篩選條件的商品異動").classes("text-xs text-zinc-400")
@@ -2668,8 +2638,62 @@ async def render_shopline_product_changes(company_name):
               pagination={"rowsPerPage": 15, "sortBy": "最後更新時間", "descending": True},
           ).classes("w-full").props(':rows-per-page-options="[15,30,50,0]"')
 
-  filter_row = ui.row().classes("gap-2 mb-3")
-  render_status_filter_buttons()
+    return filtered_rows
+
+  def set_status_filter(v):
+    status_filter_state["value"] = v
+    render_toolbar()
+    render_results()
+
+  def set_date_from(e):
+    status_filter_state["date_from"] = e.value or ""
+    render_results()
+
+  def set_date_to(e):
+    status_filter_state["date_to"] = e.value or ""
+    render_results()
+
+  def handle_export():
+    try:
+      filtered_rows = render_results()
+      xlsx_bytes = rows_to_xlsx_bytes(filtered_rows, sheet_name="商品異動")
+      ui.download(
+          xlsx_bytes, f"{company_name}商品異動.xlsx",
+          media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      )
+    except Exception as e:
+      ui.notify(f"匯出失敗：{e}", color="negative")
+
+  def render_toolbar():
+    toolbar_row.clear()
+    with toolbar_row:
+      for label in ["全部", "上架", "下架"]:
+        is_active = label == status_filter_state["value"]
+        bg = "#5bc0be" if is_active else "#ffffff"
+        fg = "#ffffff" if is_active else "#4b5563"
+        border = "#5bc0be" if is_active else "#e6e1d4"
+        ui.button(
+            label, on_click=lambda v=label: set_status_filter(v)
+        ).props("dense no-caps unelevated").classes(
+            "px-4 py-1 rounded-lg"
+        ).style(
+            f"background:{bg} !important; color:{fg} !important;"
+            f" border:1px solid {border};"
+        )
+      ui.input(
+          label="日期 起", value=status_filter_state["date_from"],
+          on_change=set_date_from,
+      ).props('dense outlined type="date"').classes("w-40")
+      ui.input(
+          label="日期 迄", value=status_filter_state["date_to"],
+          on_change=set_date_to,
+      ).props('dense outlined type="date"').classes("w-40")
+      ui.button("匯出 xlsx", on_click=handle_export).classes(
+          "sync-btn px-3 py-1 text-xs rounded-lg"
+      )
+
+  toolbar_row = ui.row().classes("items-end gap-3 flex-wrap mb-3")
+  render_toolbar()
   render_results()
 
 
