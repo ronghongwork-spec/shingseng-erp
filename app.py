@@ -2601,7 +2601,6 @@ async def render_shopline_product_changes(company_name):
         ui.label(f"抓取失敗：{e}").classes("text-xs text-red-700")
 
   status_filter_state = {"value": "全部", "date_from": "", "date_to": ""}
-  results_container = ui.column().classes("w-full")
 
   def render_results():
     results_container.clear()
@@ -2693,6 +2692,7 @@ async def render_shopline_product_changes(company_name):
       )
 
   toolbar_row = ui.row().classes("items-end gap-3 flex-wrap mb-3")
+  results_container = ui.column().classes("w-full")
   render_toolbar()
   render_results()
 
