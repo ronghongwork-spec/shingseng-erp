@@ -2491,7 +2491,153 @@ def render_section_placeholder(title, hint="此區尚未串接資料來源，敬
     ui.label(title).classes("text-sm font-bold text-zinc-700 mb-2")
     ui.label(hint).classes("text-xs text-zinc-500")
 
-async def render_shopline_channel(access_token, user_agent, channel_title, restock_target=None):
+def fetch_shopline_product_changes(access_token, user_agent, since_date):
+  """SHOPLINE Search Products API：抓「自 since_date 以來有異動」的商品
+  （不限狀態變更，任何欄位有改都算——包括價格調整、上下架等），依
+  updated_at 篩選。since_date是date物件。
+  回傳 (rows, error_message)；rows是 [{"SKU","商品","狀態","最後更新時間"}, ...]，
+  依最後更新時間新到舊排序。
+  """
+  if not access_token or not user_agent:
+    return None, "尚未設定 access_token / user_agent"
+  try:
+    since_str = since_date.strftime("%Y-%m-%d 00:00:00")
+    rows = []
+    page = 1
+    while True:
+      resp = requests.get(
+          f"{SHOPLINE_API_DOMAIN}/v1/products/search",
+          params={
+              "updated_at": f"gte:{since_str}",
+              "sort_type": "created_at",
+              "sort_by": "desc",
+              "per_page": 50,
+              "page": page,
+          },
+          headers={
+              "accept": "application/json",
+              "authorization": f"Bearer {access_token}",
+              "User-Agent": user_agent,
+          },
+          timeout=REQUEST_TIMEOUT,
+      )
+      resp.raise_for_status()
+      body = resp.json()
+      items = body.get("items", []) or []
+      for p in items:
+        title = (p.get("title_translations") or {}).get("zh-hant") or (
+            p.get("title_translations") or {}
+        ).get("en", "")
+        rows.append({
+            "SKU": p.get("sku") or "",
+            "商品": title,
+            "狀態": {
+                "active": "上架", "draft": "下架",
+                "removed": "已刪除", "hidden": "隱藏",
+            }.get(p.get("status"), p.get("status") or ""),
+            "最後更新時間": (p.get("updated_at") or "")[:16].replace("T", " "),
+        })
+      pagination = body.get("pagination", {}) or {}
+      total_pages = pagination.get("total_pages", 1) or 1
+      if page >= total_pages:
+        break
+      page += 1
+    rows.sort(key=lambda r: r["最後更新時間"], reverse=True)
+    return rows, None
+  except Exception as e:
+    return None, str(e)
+
+
+async def render_shopline_product_changes(company_name):
+  """雲端電商訂單／商品異動：抓近1個月（以今天往回推）所有異動過的商品
+  （不限狀態變更，價格調整等任何更新都算），該公司底下有幾個SHOPLINE
+  據點就都抓，合併成一份清單、標明來源分頁。這支是async函式，實際打API
+  的地方用run.io_bound()包起來，避免卡住整個伺服器的事件迴圈。
+  """
+  stores = [
+      (channel, creds)
+      for (comp, channel), creds in SHOPLINE_CHANNEL_CREDENTIALS.items()
+      if comp == company_name
+  ]
+  if not stores:
+    render_section_placeholder(
+        "商品異動", "此分公司尚未串接 SHOPLINE API，敬請期待"
+    )
+    return
+
+  since_date = (datetime.utcnow() + timedelta(hours=8)).date() - timedelta(days=30)
+
+  with ui.row().classes("w-full items-center gap-2 p-8 justify-center"):
+    ui.spinner(size="24px").classes("text-zinc-400")
+    ui.label("資料抓取中，請稍候…").classes("text-xs text-zinc-500")
+  await asyncio.sleep(0)
+
+  all_rows = []
+  errors = []
+  for channel, (access_token, user_agent) in stores:
+    rows, error = await run.io_bound(
+        fetch_shopline_product_changes, access_token, user_agent, since_date
+    )
+    if error:
+      errors.append(f"{channel}：{error}")
+      continue
+    for r in rows or []:
+      r_with_source = dict(r)
+      r_with_source["來源"] = channel
+      all_rows.append(r_with_source)
+
+  all_rows.sort(key=lambda r: r["最後更新時間"], reverse=True)
+
+  ui.label(
+      f"近30天商品異動（{since_date.isoformat()} 起，含價格調整、上下架"
+      "等任何商品資料更新）"
+  ).classes("text-xs text-zinc-500 mb-3")
+
+  if errors:
+    with ui.card().classes(
+        "w-full p-3 mb-3 bg-[#fdecea] border border-[#f5c2c0] rounded-lg"
+    ):
+      for e in errors:
+        ui.label(f"抓取失敗：{e}").classes("text-xs text-red-700")
+
+  with ui.card().classes(
+      "w-full p-6 bg-white border border-[#e6e1d4]"
+      " shadow-[0_1px_3px_rgba(42,40,35,0.06)] rounded-lg"
+  ):
+    with ui.row().classes("w-full items-center justify-between mb-3"):
+      ui.label(f"共 {len(all_rows)} 筆商品異動").classes(
+          "text-sm font-bold text-zinc-700"
+      )
+
+      def handle_export():
+        try:
+          xlsx_bytes = rows_to_xlsx_bytes(all_rows, sheet_name="商品異動")
+          ui.download(
+              xlsx_bytes, f"{company_name}商品異動.xlsx",
+              media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          )
+        except Exception as e:
+          ui.notify(f"匯出失敗：{e}", color="negative")
+
+      ui.button("匯出 xlsx", on_click=handle_export).classes(
+          "sync-btn px-3 py-1 text-xs rounded-lg"
+      )
+
+    if not all_rows:
+      ui.label("近30天沒有商品異動").classes("text-xs text-zinc-400")
+    else:
+      ui.table(
+          columns=[
+              {"name": c, "label": c, "field": c,
+               "align": "left" if c != "最後更新時間" else "left", "sortable": True}
+              for c in ["來源", "SKU", "商品", "狀態", "最後更新時間"]
+          ],
+          rows=all_rows, row_key="SKU",
+          pagination={"rowsPerPage": 15, "sortBy": "最後更新時間", "descending": True},
+      ).classes("w-full").props(':rows-per-page-options="[15,30,50,0]"')
+
+
+
   """SHOPLINE官網訂單通路的共用畫面（興聖官網(海濤客)／官網(JDH)／
   芙萊柏官網-B'f 都呼叫這支，只是傳入的access_token/user_agent/標題不同）。
   抓近3個月「待處理」+「已確認」訂單，畫面：
@@ -6877,6 +7023,7 @@ def cloud_orders_dashboard():
         ).props("dense no-caps").classes("w-full") as orders_section_tabs:
           ui.tab("訂單出貨")
           ui.tab("每日出貨")
+          ui.tab("商品異動")
 
         orders_section_body = ui.column().classes("w-full")
 
@@ -6903,6 +7050,9 @@ def cloud_orders_dashboard():
                 )
               else:
                 render_section_placeholder("每日出貨")
+          elif tab_label == "商品異動":
+            with orders_section_body:
+              await render_shopline_product_changes(company_name)
 
         orders_section_tabs.set_value("訂單出貨")
 
