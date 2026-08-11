@@ -577,14 +577,17 @@ PRODUCTION_SCHEDULE_GOOGLE_SHEET_TAB = os.environ.get(
 )
 WEEKDAY_LABELS = ["星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"]
 
-# 每日工作事項（給儀表板月曆用）：結構化欄位格式，一列一筆，工廠/內勤
-# 直接在Sheet裡新增列即可。「類型」是自由文字（出貨/包裝/盤點/會議…
-# 什麼都可以），畫面上會依實際出現的類型動態分組顯示，不是寫死只認
-# 「包裝」「其他事項」兩種。「訂單資訊」的預計出貨日還是會另外顯示在
-# 月曆上（獨立於這份Sheet），兩者不衝突、可以同時看到。
-DAILY_TASKS_GOOGLE_SHEET_TAB = os.environ.get(
-    "DAILY_TASKS_GOOGLE_SHEET_TAB", "每日工作事項(測試)"
-)
+# 每日工作事項（進貨／其它事項／出貨等，給儀表板月曆／各公司頁面用）：
+# 結構化欄位格式，一列一筆，四間分公司各自一個分頁、放在同一份試算表
+# 裡（跟訂單資訊/BOM表共用GOOGLE_SHEET_ID，不用另外設定Sheet ID）。
+# 「類型」是自由文字（進貨/其它事項/出貨/包裝/盤點…什麼都可以），畫面
+# 上會依實際出現的類型動態分組顯示，不是寫死限定選項。
+COMPANY_TASKS_SHEET_TAB = {
+    "興聖(股)公司": os.environ.get("TASKS_SHEET_TAB_XINGSHENG", "興聖"),
+    "海濤客食品工業(股)公司": os.environ.get("TASKS_SHEET_TAB_HAITAO", "海濤客"),
+    "容鴻(股)公司": os.environ.get("TASKS_SHEET_TAB_RONGHONG", "容鴻"),
+    "芙萊柏(股)公司": os.environ.get("TASKS_SHEET_TAB_FULAIBO", "芙萊柏"),
+}
 DAILY_TASK_COL_DATE = "日期"
 DAILY_TASK_COL_TYPE = "類型"
 DAILY_TASK_COL_CONTENT = "內容"
@@ -1662,12 +1665,13 @@ def _fetch_google_sheet_records(tab_name):
     return []
 
 
-def fetch_daily_tasks():
-  """讀取「每日工作事項」Sheet（結構化欄位：日期/類型/內容/備註，一列
-  一筆）。「類型」是自由文字，不限定固定選項。回傳 None 代表沒設定
+def fetch_daily_tasks(tab_name):
+  """讀取指定公司的「每日工作事項」分頁（結構化欄位：日期/類型/內容/
+  備註，一列一筆）。「類型」是自由文字，不限定固定選項。四間分公司各自
+  一個分頁，都呼叫這支、只是傳入的tab_name不同。回傳 None 代表沒設定
   Google Sheets；回傳 list 代表讀取到的任務(過濾掉日期解析失敗的列)。
   """
-  records = _fetch_google_sheet_records(DAILY_TASKS_GOOGLE_SHEET_TAB)
+  records = _fetch_google_sheet_records(tab_name)
   if records is None:
     return None
   tasks = []
@@ -1682,6 +1686,198 @@ def fetch_daily_tasks():
         "備註": str(row.get(DAILY_TASK_COL_MEMO) or "").strip(),
     })
   return tasks
+
+
+def render_monthly_task_calendar(company_name, orders_source=None):
+  """通用每月工作行事曆：company_name決定要讀COMPANY_TASKS_SHEET_TAB裡
+  哪一個分頁的每日工作事項（進貨/其它事項/出貨...依實際填的「類型」
+  文字動態分組顯示）。orders_source是可選的訂單清單（例如海濤客的
+  app_state.get("orders")），有給的話行事曆會多顯示一塊「出貨」區塊
+  （依「預計出貨日」分組）；沒給的話（例如興聖/容鴻/芙萊柏目前沒有
+  這份訂單資料來源）就只顯示Sheet裡的工作事項分類，不會有獨立的
+  「出貨」區塊。
+  """
+  with ui.card().classes(
+      "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)]"
+      " rounded-lg mb-4"
+  ):
+    ui.label("每日工作行事曆").classes(
+        "text-lg font-bold text-zinc-900 tracking-wide mb-2"
+    )
+    ui.label(
+        (
+            "出貨直接讀「訂單資訊」的預計出貨日；其他工作事項讀"
+            if orders_source is not None else "工作事項讀"
+        )
+        + f"「{COMPANY_TASKS_SHEET_TAB.get(company_name, company_name)}」"
+        "Sheet，依「類型」欄位實際填的文字動態分組（進貨/包裝/盤點/會議…"
+        "都可以）。點格子看當天詳細內容。"
+    ).classes("text-xs text-zinc-500 mb-3")
+
+    today_for_cal = datetime.now().date()
+    calendar_state = {"year": today_for_cal.year, "month": today_for_cal.month}
+
+    with ui.dialog() as day_detail_dialog, ui.card().classes(
+        "min-w-[360px] max-w-[90vw] p-5"
+    ):
+      day_detail_body = ui.column().classes("w-full gap-2")
+
+    def open_day_detail(d, orders_by_date, tasks_by_date):
+      day_detail_body.clear()
+      with day_detail_body:
+        ui.label(d.isoformat()).classes(
+            "text-base font-bold text-zinc-900"
+        )
+        day_orders = orders_by_date.get(d, [])
+        day_tasks = tasks_by_date.get(d, [])
+
+        if orders_source is not None:
+          ui.label(f"出貨（訂單資訊，共 {len(day_orders)} 筆）").classes(
+              "text-xs font-bold text-zinc-700 mt-2"
+          )
+          if not day_orders:
+            ui.label("（無）").classes("text-xs text-zinc-400")
+          for o in day_orders:
+            ui.label(
+                f"{o.get('訂單編號','')}｜{o.get('品名','')}"
+                f" x{o.get('預計出貨數量','')}"
+            ).classes("text-xs text-zinc-600")
+
+        # 依「類型」欄位實際出現的文字動態分組（不限定固定選項），
+        # 保留原本的填寫順序，同類型的排在一起。
+        types_in_order = []
+        by_type = defaultdict(list)
+        for t in day_tasks:
+          if t["類型"] not in by_type:
+            types_in_order.append(t["類型"])
+          by_type[t["類型"]].append(t)
+
+        if not types_in_order:
+          ui.label("工作事項（每日工作事項Sheet）").classes(
+              "text-xs font-bold text-zinc-700 mt-2"
+          )
+          ui.label("（無）").classes("text-xs text-zinc-400")
+        for type_label in types_in_order:
+          items = by_type[type_label]
+          ui.label(f"{type_label}（{len(items)}）").classes(
+              "text-xs font-bold text-zinc-700 mt-2"
+          )
+          for t in items:
+            ui.label(t["內容"]).classes(
+                "text-xs text-zinc-600"
+            ).style("white-space: pre-line")
+            if t["備註"]:
+              ui.label(f"備註：{t['備註']}").classes(
+                  "text-xs text-zinc-400"
+              ).style("white-space: pre-line")
+      day_detail_dialog.open()
+
+    calendar_grid_container = ui.column().classes("w-full")
+
+    def change_month(delta):
+      m = calendar_state["month"] + delta
+      y = calendar_state["year"]
+      if m < 1:
+        m, y = 12, y - 1
+      elif m > 12:
+        m, y = 1, y + 1
+      calendar_state["month"] = m
+      calendar_state["year"] = y
+      render_calendar_grid()
+
+    def render_calendar_grid():
+      calendar_grid_container.clear()
+      import calendar as cal_module
+
+      year, month = calendar_state["year"], calendar_state["month"]
+
+      orders_raw = orders_source or []
+      orders_by_date = defaultdict(list)
+      for o in orders_raw:
+        d = o.get("預計出貨日")
+        if d:
+          orders_by_date[d].append(o)
+
+      tasks_raw = fetch_daily_tasks(
+          COMPANY_TASKS_SHEET_TAB.get(company_name, company_name)
+      )
+      tasks_by_date = defaultdict(list)
+      tasks_not_configured = tasks_raw is None
+      if tasks_raw:
+        for t in tasks_raw:
+          tasks_by_date[t["日期"]].append(t)
+
+      with calendar_grid_container:
+        if tasks_not_configured:
+          ui.label(
+              f"尚未設定「{COMPANY_TASKS_SHEET_TAB.get(company_name, company_name)}」"
+              "分頁（Google Sheets），工作事項暫時不會顯示"
+              + ("，出貨資料仍正常運作" if orders_source is not None else "")
+          ).classes("text-xs text-amber-700 mb-2")
+
+        with ui.row().classes("w-full items-center justify-between mb-3"):
+          ui.button(
+              "← 上個月", on_click=lambda: change_month(-1),
+          ).props("dense no-caps unelevated").classes(
+              "px-3 py-1 text-xs rounded-lg"
+          ).style(
+              "background:#ffffff; color:#4b5563; border:1px solid #e6e1d4;"
+          )
+          ui.label(f"{year} 年 {month} 月").classes(
+              "text-sm font-bold text-zinc-700"
+          )
+          ui.button(
+              "下個月 →", on_click=lambda: change_month(1),
+          ).props("dense no-caps unelevated").classes(
+              "px-3 py-1 text-xs rounded-lg"
+          ).style(
+              "background:#ffffff; color:#4b5563; border:1px solid #e6e1d4;"
+          )
+
+        first_weekday, days_in_month = cal_module.monthrange(year, month)
+        # monthrange的first_weekday是0=星期一，轉成「星期日=0」的偏移
+        leading_blanks = (first_weekday + 1) % 7
+
+        with ui.grid(columns=7).classes("w-full gap-1"):
+          for wd in WEEKDAY_LABELS:
+            ui.label(wd).classes(
+                "text-xs font-bold text-zinc-500 text-center"
+            )
+          for _ in range(leading_blanks):
+            ui.label("")
+          for day_num in range(1, days_in_month + 1):
+            d = datetime(year, month, day_num).date()
+            day_orders = orders_by_date.get(d, [])
+            day_tasks = tasks_by_date.get(d, [])
+            is_today = d == today_for_cal
+
+            with ui.column().classes(
+                "gap-0.5 p-2 rounded-lg cursor-pointer min-h-[72px] "
+                + (
+                    "bg-[#e8f6f5] border border-[#5bc0be]"
+                    if is_today
+                    else "bg-[#f7f5ef] border border-[#e6e1d4]"
+                )
+            ).on(
+                "click",
+                lambda e, d=d, ob=orders_by_date, tb=tasks_by_date:
+                    open_day_detail(d, ob, tb),
+            ):
+              ui.label(str(day_num)).classes(
+                  "text-xs font-bold text-zinc-700"
+              )
+              if day_orders:
+                ui.label(f"出貨 {len(day_orders)}").classes(
+                    "text-[10px] text-blue-700"
+                )
+              if day_tasks:
+                # 格子裡只顯示總數，不逐類型列出(避免格子太擠)，
+                # 詳細分類點進去看detail dialog即可。
+                ui.label(f"事項 {len(day_tasks)}").classes(
+                    "text-[10px] text-purple-700"
+                )
+
+    render_calendar_grid()
 
 
 def fetch_production_schedule_grid():
@@ -3905,9 +4101,7 @@ def inventory_dashboard():
           if tab_label == "儀表板":
             section_body.clear()
             with section_body:
-              render_section_placeholder(
-                  "儀表板", "尚未串接此分公司的庫存／訂單資料，敬請期待"
-              )
+              render_monthly_task_calendar(company_name)
           elif tab_label == "商品資訊":
             section_body.clear()
             with section_body:
@@ -4060,179 +4254,9 @@ def inventory_dashboard():
           # 1. 儀表板與即時預警中心
           # ==================================================
           with ui.tab_panel(tab_dashboard):
-            with ui.card().classes(
-                "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)]"
-                " rounded-lg mb-4"
-            ):
-              ui.label("每日工作行事曆").classes(
-                  "text-lg font-bold text-zinc-900 tracking-wide mb-2"
-              )
-              ui.label(
-                  "出貨直接讀「訂單資訊」的預計出貨日；其他工作事項讀"
-                  "「每日工作事項」Sheet，依「類型」欄位實際填的文字動態"
-                  "分組（出貨/包裝/盤點/會議…都可以）。點格子看當天詳細內容。"
-              ).classes("text-xs text-zinc-500 mb-3")
-
-              today_for_cal = datetime.now().date()
-              calendar_state = {"year": today_for_cal.year, "month": today_for_cal.month}
-
-              with ui.dialog() as day_detail_dialog, ui.card().classes(
-                  "min-w-[360px] max-w-[90vw] p-5"
-              ):
-                day_detail_body = ui.column().classes("w-full gap-2")
-
-              def open_day_detail(d, orders_by_date, tasks_by_date):
-                day_detail_body.clear()
-                with day_detail_body:
-                  ui.label(d.isoformat()).classes(
-                      "text-base font-bold text-zinc-900"
-                  )
-                  day_orders = orders_by_date.get(d, [])
-                  day_tasks = tasks_by_date.get(d, [])
-
-                  ui.label(f"出貨（訂單資訊，共 {len(day_orders)} 筆）").classes(
-                      "text-xs font-bold text-zinc-700 mt-2"
-                  )
-                  if not day_orders:
-                    ui.label("（無）").classes("text-xs text-zinc-400")
-                  for o in day_orders:
-                    ui.label(
-                        f"{o.get('訂單編號','')}｜{o.get('品名','')}"
-                        f" x{o.get('預計出貨數量','')}"
-                    ).classes("text-xs text-zinc-600")
-
-                  # 依「類型」欄位實際出現的文字動態分組（不限定固定選項），
-                  # 保留原本的填寫順序，同類型的排在一起。
-                  types_in_order = []
-                  by_type = defaultdict(list)
-                  for t in day_tasks:
-                    if t["類型"] not in by_type:
-                      types_in_order.append(t["類型"])
-                    by_type[t["類型"]].append(t)
-
-                  if not types_in_order:
-                    ui.label("工作事項（每日工作事項Sheet）").classes(
-                        "text-xs font-bold text-zinc-700 mt-2"
-                    )
-                    ui.label("（無）").classes("text-xs text-zinc-400")
-                  for type_label in types_in_order:
-                    items = by_type[type_label]
-                    ui.label(f"{type_label}（{len(items)}）").classes(
-                        "text-xs font-bold text-zinc-700 mt-2"
-                    )
-                    for t in items:
-                      ui.label(t["內容"]).classes(
-                          "text-xs text-zinc-600"
-                      ).style("white-space: pre-line")
-                      if t["備註"]:
-                        ui.label(f"備註：{t['備註']}").classes(
-                            "text-xs text-zinc-400"
-                        ).style("white-space: pre-line")
-                day_detail_dialog.open()
-
-              calendar_grid_container = ui.column().classes("w-full")
-
-              def change_month(delta):
-                m = calendar_state["month"] + delta
-                y = calendar_state["year"]
-                if m < 1:
-                  m, y = 12, y - 1
-                elif m > 12:
-                  m, y = 1, y + 1
-                calendar_state["month"] = m
-                calendar_state["year"] = y
-                render_calendar_grid()
-
-              def render_calendar_grid():
-                calendar_grid_container.clear()
-                import calendar as cal_module
-
-                year, month = calendar_state["year"], calendar_state["month"]
-
-                orders_raw = app_state.get("orders", [])
-                orders_by_date = defaultdict(list)
-                for o in orders_raw:
-                  d = o.get("預計出貨日")
-                  if d:
-                    orders_by_date[d].append(o)
-
-                tasks_raw = fetch_daily_tasks()
-                tasks_by_date = defaultdict(list)
-                tasks_not_configured = tasks_raw is None
-                if tasks_raw:
-                  for t in tasks_raw:
-                    tasks_by_date[t["日期"]].append(t)
-
-                with calendar_grid_container:
-                  if tasks_not_configured:
-                    ui.label(
-                        "尚未設定「每日工作事項」Google Sheets 分頁，工作"
-                        "事項暫時不會顯示，出貨資料仍正常運作"
-                    ).classes("text-xs text-amber-700 mb-2")
-
-                  with ui.row().classes("w-full items-center justify-between mb-3"):
-                    ui.button(
-                        "← 上個月", on_click=lambda: change_month(-1),
-                    ).props("dense no-caps unelevated").classes(
-                        "px-3 py-1 text-xs rounded-lg"
-                    ).style(
-                        "background:#ffffff; color:#4b5563; border:1px solid #e6e1d4;"
-                    )
-                    ui.label(f"{year} 年 {month} 月").classes(
-                        "text-sm font-bold text-zinc-700"
-                    )
-                    ui.button(
-                        "下個月 →", on_click=lambda: change_month(1),
-                    ).props("dense no-caps unelevated").classes(
-                        "px-3 py-1 text-xs rounded-lg"
-                    ).style(
-                        "background:#ffffff; color:#4b5563; border:1px solid #e6e1d4;"
-                    )
-
-                  first_weekday, days_in_month = cal_module.monthrange(year, month)
-                  # monthrange的first_weekday是0=星期一，轉成「星期日=0」的偏移
-                  leading_blanks = (first_weekday + 1) % 7
-
-                  with ui.grid(columns=7).classes("w-full gap-1"):
-                    for wd in WEEKDAY_LABELS:
-                      ui.label(wd).classes(
-                          "text-xs font-bold text-zinc-500 text-center"
-                      )
-                    for _ in range(leading_blanks):
-                      ui.label("")
-                    for day_num in range(1, days_in_month + 1):
-                      d = datetime(year, month, day_num).date()
-                      day_orders = orders_by_date.get(d, [])
-                      day_tasks = tasks_by_date.get(d, [])
-                      is_today = d == today_for_cal
-
-                      with ui.column().classes(
-                          "gap-0.5 p-2 rounded-lg cursor-pointer min-h-[72px] "
-                          + (
-                              "bg-[#e8f6f5] border border-[#5bc0be]"
-                              if is_today
-                              else "bg-[#f7f5ef] border border-[#e6e1d4]"
-                          )
-                      ).on(
-                          "click",
-                          lambda e, d=d, ob=orders_by_date, tb=tasks_by_date:
-                              open_day_detail(d, ob, tb),
-                      ):
-                        ui.label(str(day_num)).classes(
-                            "text-xs font-bold text-zinc-700"
-                        )
-                        if day_orders:
-                          ui.label(f"出貨 {len(day_orders)}").classes(
-                              "text-[10px] text-blue-700"
-                          )
-                        if day_tasks:
-                          # 格子裡只顯示總數，不逐類型列出(避免格子太擠)，
-                          # 詳細分類點進去看detail dialog即可。
-                          ui.label(f"事項 {len(day_tasks)}").classes(
-                              "text-[10px] text-purple-700"
-                          )
-
-              render_calendar_grid()
+            render_monthly_task_calendar(
+                "海濤客食品工業(股)公司", orders_source=app_state.get("orders", []),
+            )
 
             with ui.card().classes(
                 "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)]"
