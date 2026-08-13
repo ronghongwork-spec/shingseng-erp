@@ -1773,6 +1773,38 @@ def _fetch_google_sheet_records(tab_name, sheet_id=None):
     return []
 
 
+def _fetch_google_sheet_records_verbose(tab_name, sheet_id=None):
+  """跟 _fetch_google_sheet_records 邏輯一樣，但明確回傳三種狀態，給
+  「不想只靠使用者去查Render Logs、要直接把錯誤原因顯示在畫面上」的
+  呼叫端使用（目前給「產銷會議總覽」用）。回傳 (records, error_message)：
+    - 沒設定憑證／這份資料自己的Sheet ID：(None, "not_configured")
+    - 有設定，但打開試算表／分頁失敗（權限不足、分頁名稱打錯等）：
+      (None, "<實際錯誤訊息文字>")
+    - 成功（就算讀到0列也算成功）：(records_list, None)
+  一定會印一行log，不管哪種結果，方便對照Render Logs。
+  """
+  sheet_id = sheet_id if sheet_id is not None else GOOGLE_SHEET_ID
+  if not GOOGLE_SHEETS_CREDENTIALS_JSON or not sheet_id:
+    print(
+        f"[Google Sheet「{tab_name}」] 尚未設定 GOOGLE_SHEETS_CREDENTIALS_JSON"
+        " 或對應的 Sheet ID，跳過讀取"
+    )
+    return None, "not_configured"
+  gc = _get_gspread_client(sheet_id)
+  if gc is None:
+    print(f"[Google Sheet「{tab_name}」] 憑證/Sheet ID檢查未通過，跳過讀取")
+    return None, "not_configured"
+  try:
+    sh = gc.open_by_key(sheet_id)
+    ws = sh.worksheet(tab_name)
+    records = ws.get_all_records()
+    print(f"[Google Sheet「{tab_name}」] 讀取成功，共 {len(records)} 列")
+    return records, None
+  except Exception as e:
+    print(f"[Google Sheet「{tab_name}」] 讀取失敗：{e}")
+    return None, str(e)
+
+
 def fetch_daily_tasks(tab_name):
   """讀取指定公司的「每日工作事項」分頁（結構化欄位：日期/類型/內容/
   備註，一列一筆）。「類型」是自由文字，不限定固定選項。四間分公司各自
@@ -2256,20 +2288,31 @@ def _parse_monthly_sales_review_records(records):
 
 
 def load_monthly_sales_review_from_google_sheet():
-  """讀取「產銷會議總覽」分頁。回傳 (rows, configured)。
+  """讀取「產銷會議總覽」分頁。回傳 (rows, configured, error, raw_count)。
   這份是獨立試算表，用MONTHLY_SALES_REVIEW_GOOGLE_SHEET_ID（不是
   GOOGLE_SHEET_ID），沒設定的話視為「尚未設定」，不會誤開到BOM那份
   試算表裡去找同名分頁。
+
+  error：None代表沒有錯誤（可能是真的讀成功、也可能是根本沒設定，兩者
+  都用configured區分）；"not_configured"代表沒設定憑證/Sheet ID；其他
+  字串代表實際讀取時發生的錯誤訊息（權限不足、分頁名稱找不到等），這種
+  情況configured仍是False，但error帶著具體原因，畫面上可以直接顯示，
+  不用使用者自己去查Render Logs。
+  raw_count：Sheet原始列數（篩「品名」之前），用來分辨「表格根本是空
+  的／連不上」還是「連上了、有資料，但沒有一列填品名」這兩種情況。
   """
-  records = _fetch_google_sheet_records(
+  records, error = _fetch_google_sheet_records_verbose(
       MONTHLY_SALES_REVIEW_GOOGLE_SHEET_TAB,
       sheet_id=MONTHLY_SALES_REVIEW_GOOGLE_SHEET_ID,
   )
   if records is None:
-    return [], False
+    return [], False, error, 0
   rows = _parse_monthly_sales_review_records(records)
-  print(f"產銷會議總覽讀取完成：共 {len(rows)} 筆品項")
-  return rows, True
+  print(
+      f"產銷會議總覽讀取完成：Sheet原始 {len(records)} 列，"
+      f"其中有填品名的 {len(rows)} 筆"
+  )
+  return rows, True, None, len(records)
 
 
 # ---- 訂單資訊（Google Sheet，手動覆蓋更新／後續可改自動抓取） ----
@@ -7547,7 +7590,8 @@ def inventory_dashboard():
                     ).classes("text-xs text-teal-800")
 
                   msr_state = {
-                      "rows": [], "configured": False,
+                      "rows": [], "configured": False, "error": None,
+                      "raw_count": 0,
                       "month": None, "item_name": "", "channel": None,
                   }
 
@@ -7579,13 +7623,30 @@ def inventory_dashboard():
                     has_filter = bool(month or keyword or channel_label)
                     with msr_results_container:
                       if not msr_state["configured"]:
+                        if msr_state["error"] == "not_configured":
+                          ui.label(
+                              f"尚未設定「{MONTHLY_SALES_REVIEW_GOOGLE_SHEET_TAB}」"
+                              "Google Sheet分頁：GOOGLE_SHEETS_CREDENTIALS_"
+                              "JSON 或 MONTHLY_SALES_REVIEW_GOOGLE_SHEET_ID"
+                              "沒讀到值（這份是獨立試算表，不是共用"
+                              "GOOGLE_SHEET_ID，要另外設定自己的Sheet ID）。"
+                          ).classes("text-xs text-red-600")
+                        else:
+                          ui.label(
+                              f"讀取「{MONTHLY_SALES_REVIEW_GOOGLE_SHEET_TAB}」"
+                              f"分頁失敗：{msr_state['error']}"
+                              "（常見原因：服務帳號沒被加進這份試算表的共用"
+                              "名單、或分頁名稱打錯／不存在）"
+                          ).classes("text-xs text-red-600")
+                        return
+                      if msr_state["raw_count"] and not msr_state["rows"]:
                         ui.label(
-                            f"尚未設定「{MONTHLY_SALES_REVIEW_GOOGLE_SHEET_TAB}」"
-                            "Google Sheet分頁，請確認GOOGLE_SHEETS_"
-                            "CREDENTIALS_JSON／MONTHLY_SALES_REVIEW_GOOGLE_"
-                            "SHEET_ID是否已設定（這份是獨立試算表，不是共用"
-                            "GOOGLE_SHEET_ID），以及分頁名稱是否正確。"
-                        ).classes("text-xs text-red-600")
+                            f"有連上Google Sheet（讀到 {msr_state['raw_count']} "
+                            "列），但沒有任何一列的「品名」欄位有填內容，"
+                            "請確認標題列第一列是不是剛好叫「品名」（不能"
+                            "有多餘空白/全形字），以及底下的列有沒有真的填"
+                            "品名。"
+                        ).classes("text-xs text-amber-700")
                         return
                       if not has_filter:
                         ui.label(
@@ -7665,18 +7726,24 @@ def inventory_dashboard():
                       ).classes("w-full").props(':rows-per-page-options="[10,20,50,0]"')
 
                   def msr_load(force_refresh=False):
-                    rows, configured = load_monthly_sales_review_from_google_sheet()
+                    rows, configured, error, raw_count = (
+                        load_monthly_sales_review_from_google_sheet()
+                    )
                     msr_state["rows"] = rows
                     msr_state["configured"] = configured
+                    msr_state["error"] = error
+                    msr_state["raw_count"] = raw_count
                     months = sorted({r["月份"] for r in rows if r["月份"]}, reverse=True)
                     msr_month_select.options = months
                     if msr_state["month"] not in months:
                       msr_state["month"] = None
                       msr_month_select.value = None
-                    msr_summary_label.text = (
-                        f"共 {len(rows)} 筆品項"
-                        if configured else "尚未設定 Google Sheet"
-                    )
+                    if configured:
+                      msr_summary_label.text = f"共 {len(rows)} 筆品項"
+                    elif error == "not_configured":
+                      msr_summary_label.text = "尚未設定 Google Sheet"
+                    else:
+                      msr_summary_label.text = "讀取失敗（詳見下方訊息）"
                     if force_refresh:
                       ui.notify("已重新整理", color="positive")
                     msr_render_results()
