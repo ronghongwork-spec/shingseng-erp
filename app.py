@@ -599,6 +599,11 @@ RECEIVING_GOOGLE_SHEET_TAB = os.environ.get(
 CHANNEL_SALES_GOOGLE_SHEET_TAB = os.environ.get(
     "CHANNEL_SALES_GOOGLE_SHEET_TAB", "通路銷售明細"
 )
+# 海濤客SKU→A1品號對照表（SHOPLINE等外部通路的SKU跟A1品號是兩邊各自
+# 獨立編的，靠這份表直接查，取代原本用商品名稱關鍵字用猜的方式）。
+HAITAOKE_SKU_MAP_GOOGLE_SHEET_TAB = os.environ.get(
+    "HAITAOKE_SKU_MAP_GOOGLE_SHEET_TAB", "海濤客品號對應"
+)
 # 工廠的生產排程行事曆（星期日～星期六 橫向表頭、下面逐週堆疊的手工
 # 排班表），格式是給人看的、不是給程式讀的乾淨表格（合併儲存格、顏色
 # 分類、自由文字），跟BOM/訂單資訊那種結構化表格不一樣，需要另外用
@@ -2062,6 +2067,47 @@ def load_bom_data():
   if sheet_result is not None:
     return sheet_result, "Google Sheets"
   return load_bom_from_excel(BOM_EXCEL_PATH), "本機 Excel（尚未設定 Google Sheets）"
+
+
+# ---- 海濤客品號對應（Google Sheet，SKU→A1品號 對照表） ----
+# 取代原本 match_product_name_to_item_id() 用商品名稱關鍵字猜配對的做法：
+# SHOPLINE等外部通路的SKU欄位直接查這份表就能對到A1品號，準確度比猜名稱
+# 高很多。分頁欄位對應興聖集團目前維護的「海濤客品號對應」試算表：
+# SKU／品號／品名。
+SKU_MAP_COL_SKU = "SKU"
+SKU_MAP_COL_ITEM_ID = "品號"
+SKU_MAP_COL_ITEM_NAME = "品名"
+
+
+def _parse_haitaoke_sku_map_records(records):
+  """把「海濤客品號對應」分頁的列轉成 {SKU: 品號} 字典。
+
+  - 沒填SKU的列直接跳過（沒有key可以查，跳過符合使用者要求）。
+  - 品號沒填的列也跳過（查得到SKU但對不到品號，等於沒對應）。
+  - 同一個SKU如果在表裡出現兩次，以最後一筆為準（後面覆蓋前面）。
+  """
+  sku_map = {}
+  for row in records:
+    sku = str(row.get(SKU_MAP_COL_SKU, "") or "").strip()
+    item_id = str(row.get(SKU_MAP_COL_ITEM_ID, "") or "").strip()
+    if not sku or not item_id:
+      continue
+    sku_map[sku] = item_id
+  return sku_map
+
+
+def load_haitaoke_sku_map_from_google_sheet():
+  """讀取「海濤客品號對應」分頁。回傳 (sku_map, configured)。
+
+  configured=False 代表 Google Sheets 根本沒設定（呼叫端應顯示「尚未
+  設定」而不是「查無資料」，兩種情況給使用者的訊息不一樣）。
+  """
+  records = _fetch_google_sheet_records(HAITAOKE_SKU_MAP_GOOGLE_SHEET_TAB)
+  if records is None:
+    return {}, False
+  sku_map = _parse_haitaoke_sku_map_records(records)
+  print(f"海濤客品號對應讀取完成：共 {len(sku_map)} 筆 SKU→品號 對照")
+  return sku_map, True
 
 
 # ---- 訂單資訊（Google Sheet，手動覆蓋更新／後續可改自動抓取） ----
@@ -4856,27 +4902,31 @@ def inventory_dashboard():
                     demand_rows = compute_shopline_sku_rows(
                         orders_raw, status_filter="pending"
                     )
-                    # SHOPLINE的SKU跟A1的品號是兩邊各自獨立編的、對不起來，
-                    # 改用「品名關鍵字」猜配對（見match_product_name_to_item_id
-                    # 的說明：這是用猜的，不保證100%準，長期建議改用SKU
-                    # 對照表取代）。同一個A1品號如果被猜配到好幾個SHOPLINE
-                    # 品項，需求數量會加總在一起。
-                    #
-                    # 兩個額外限制：
-                    # 1. A1候選品項只在「(海濤客)_成品11」「(海濤客)_組合品61」
-                    #    這兩個分類裡找（ALLOWED_CATEGORIES，跟鳳仁倉庫存
-                    #    基準共用同一份設定），因為官網只賣這兩類商品，其他
-                    #    分類(原料等)不可能是官網訂單對應到的品項，先篩掉
-                    #    可以避免誤配到不相關的分類。
+                    # 改用「海濤客品號對應」Google Sheet分頁的SKU→品號對照表
+                    # 查詢，取代原本用商品名稱關鍵字猜配對
+                    # （match_product_name_to_item_id）的做法——SHOPLINE的
+                    # SKU欄位直接查表，準確度比猜名稱高很多。
+                    sku_map, sku_map_configured = (
+                        load_haitaoke_sku_map_from_google_sheet()
+                    )
+                    if not sku_map_configured:
+                      shopline_demand_state["by_sku"] = {}
+                      shopline_demand_state["error"] = (
+                          f"尚未設定「{HAITAOKE_SKU_MAP_GOOGLE_SHEET_TAB}」"
+                          "Google Sheet分頁，無法將SHOPLINE的SKU對應到A1品號"
+                      )
+                      print(f"[庫存查詢-官網需求] {shopline_demand_state['error']}")
+                      return
+
+                    # 兩個額外限制（跟原本一致）：
+                    # 1. 查到的品號要在「(海濤客)_成品11」「(海濤客)_組合品61」
+                    #    這兩個分類裡才算數（ALLOWED_CATEGORIES，跟鳳仁倉
+                    #    庫存基準共用同一份設定），因為官網只賣這兩類商品，
+                    #    對照表萬一填錯品號，這裡可以避免誤扣到不相關分類
+                    #    （例如原料）的庫存。
                     # 2. SHOPLINE商品名稱裡如果有「組合」兩個字，直接跳過
-                    #    不比對、不計入需求（不確定拆分方式，用猜的容易配
-                    #    錯，寧可不計也不要誤判）。
+                    #    不計入需求（不確定拆分方式，寧可不計也不要誤判）。
                     items_map = app_state.get("items_map", {})
-                    candidate_items_map = {
-                        item_id: info
-                        for item_id, info in items_map.items()
-                        if info.get("CategoryName") in ALLOWED_CATEGORIES
-                    }
 
                     by_item_id = defaultdict(float)
                     unmatched = []
@@ -4885,13 +4935,20 @@ def inventory_dashboard():
                       if "組合" in r["商品"]:
                         skipped_combo.append(r["商品"])
                         continue
-                      item_id = match_product_name_to_item_id(
-                          r["商品"], candidate_items_map
+                      sku = (r.get("SKU") or "").strip()
+                      # 沒填SKU（含SHOPLINE本身查無SKU時補的預設值
+                      # "(無SKU)"）或SKU不在對照表裡，直接略過不計入需求。
+                      item_id = (
+                          sku_map.get(sku)
+                          if sku and sku != "(無SKU)" else None
                       )
-                      if item_id:
+                      if item_id and (
+                          items_map.get(item_id, {}).get("CategoryName")
+                          in ALLOWED_CATEGORIES
+                      ):
                         by_item_id[item_id] += r["需求數量"]
                       else:
-                        unmatched.append(r["商品"])
+                        unmatched.append(f"{r['商品']}（SKU:{sku or '無'}）")
                     shopline_demand_state["by_sku"] = dict(by_item_id)
                     shopline_demand_state["unmatched"] = unmatched
                     shopline_demand_state["skipped_combo"] = skipped_combo
@@ -4900,9 +4957,9 @@ def inventory_dashboard():
                     print(
                         f"[庫存查詢-官網需求] 抓到 {len(orders_raw)} 筆訂單，"
                         f"待處理品項彙總 {len(demand_rows)} 筆，其中"
-                        f"{len(skipped_combo)} 筆含「組合」已跳過，用品名"
-                        f"關鍵字（僅限成品/組合品61分類）猜配到"
-                        f" {len(by_item_id)} 個A1品號，猜不到的有"
+                        f"{len(skipped_combo)} 筆含「組合」已跳過，用SKU"
+                        f"對照表（僅限成品/組合品61分類）對到"
+                        f" {len(by_item_id)} 個A1品號，對不到的有"
                         f" {len(unmatched)} 筆：{unmatched[:10]}"
                     )
 
@@ -4987,10 +5044,11 @@ def inventory_dashboard():
                           ):
                             ui.label(
                                 f"有 {len(shopline_demand_state['unmatched'])} 個"
-                                "SHOPLINE商品用品名關鍵字猜不到對應的A1品號"
-                                "（可能是命名差異太大，或不在成品/組合品61"
-                                "分類裡），這些商品的需求不會算進「需補"
-                                "數量」：\n"
+                                "SHOPLINE商品的SKU在「"
+                                f"{HAITAOKE_SKU_MAP_GOOGLE_SHEET_TAB}」對照表"
+                                "裡查不到對應的A1品號（可能是SKU沒填在對照表"
+                                "裡，或對到的品號不在成品/組合品61分類裡），"
+                                "這些商品的需求不會算進「需補數量」：\n"
                                 + "、".join(shopline_demand_state["unmatched"][:15])
                                 + ("...等" if len(shopline_demand_state["unmatched"]) > 15 else "")
                             ).classes("text-xs text-amber-700").style(
@@ -7718,20 +7776,28 @@ def inventory_dashboard():
                           "通路銷售明細", CHANNEL_SALES_GOOGLE_SHEET_TAB,
                           "Google Sheets" if app_state.get("channel_sales_configured") else "尚未設定",
                       ),
+                      (
+                          "海濤客品號對應", HAITAOKE_SKU_MAP_GOOGLE_SHEET_TAB,
+                          "Google Sheets（開啟庫存查詢分頁時即時查詢，"
+                          "不隨開機同步）" if sheets_configured else "尚未設定",
+                      ),
                   ):
                     ui.label(
                         f"分頁「{tab_name}」（{label}）目前來源：{source_state}"
                     ).classes("text-xs text-zinc-600")
                 ui.label(
                     "設定方式：環境變數 GOOGLE_SHEETS_CREDENTIALS_JSON（服務"
-                    "帳號金鑰 JSON 內容）、GOOGLE_SHEET_ID（五份資料共用同一"
+                    "帳號金鑰 JSON 內容）、GOOGLE_SHEET_ID（六份資料共用同一"
                     "個 Sheet ID，只是分頁不同）。分頁名稱可用"
                     "BOM_GOOGLE_SHEET_TAB／ORDERS_GOOGLE_SHEET_TAB／"
                     "SALES_HISTORY_GOOGLE_SHEET_TAB／"
                     "RECEIVING_GOOGLE_SHEET_TAB／"
-                    "CHANNEL_SALES_GOOGLE_SHEET_TAB 自訂，預設分別是"
+                    "CHANNEL_SALES_GOOGLE_SHEET_TAB／"
+                    "HAITAOKE_SKU_MAP_GOOGLE_SHEET_TAB 自訂，預設分別是"
                     "「BOM表」「訂單資訊」「銷售歷史」「進貨明細」"
-                    "「通路銷售明細」。"
+                    "「通路銷售明細」「海濤客品號對應」。「海濤客品號對應」"
+                    "分頁的欄位標題需為「SKU」「品號」「品名」（品名純供"
+                    "參考，比對只用SKU／品號），沒填SKU或品號的列會被忽略。"
                 ).classes("text-xs text-zinc-500 mt-2")
 
               # ---------------- 6.3：參數設定 ----------------
