@@ -660,6 +660,12 @@ MONTHLY_SALES_REVIEW_GOOGLE_SHEET_ID = os.environ.get(
 MONTHLY_SALES_REVIEW_GOOGLE_SHEET_TAB = os.environ.get(
     "MONTHLY_SALES_REVIEW_GOOGLE_SHEET_TAB", "產銷會議總覽"
 )
+# 這個分頁上面有合併儲存格的大標題（第1列）＋說明句（第2列），真正的
+# 欄位標題（月份/系列/品名...）在第3列，所以預設用head=3；如果你調整
+# 過版面、標題列跑到別的位置，改這個環境變數即可，不用改程式碼。
+MONTHLY_SALES_REVIEW_HEADER_ROW = int(os.environ.get(
+    "MONTHLY_SALES_REVIEW_HEADER_ROW", "3"
+))
 # 工廠的生產排程行事曆（星期日～星期六 橫向表頭、下面逐週堆疊的手工
 # 排班表），格式是給人看的、不是給程式讀的乾淨表格（合併儲存格、顏色
 # 分類、自由文字），跟BOM/訂單資訊那種結構化表格不一樣，需要另外用
@@ -1773,15 +1779,22 @@ def _fetch_google_sheet_records(tab_name, sheet_id=None):
     return []
 
 
-def _fetch_google_sheet_records_verbose(tab_name, sheet_id=None):
+def _fetch_google_sheet_records_verbose(tab_name, sheet_id=None, header_row=1):
   """跟 _fetch_google_sheet_records 邏輯一樣，但明確回傳三種狀態，給
   「不想只靠使用者去查Render Logs、要直接把錯誤原因顯示在畫面上」的
   呼叫端使用（目前給「產銷會議總覽」用）。回傳 (records, error_message)：
     - 沒設定憑證／這份資料自己的Sheet ID：(None, "not_configured")
-    - 有設定，但打開試算表／分頁失敗（權限不足、分頁名稱打錯等）：
-      (None, "<實際錯誤訊息文字>")
+    - 有設定，但打開試算表／分頁失敗（權限不足、分頁名稱打錯、標題列
+      有合併儲存格/空白重複等）：(None, "<實際錯誤訊息文字>")
     - 成功（就算讀到0列也算成功）：(records_list, None)
   一定會印一行log，不管哪種結果，方便對照Render Logs。
+
+  header_row：欄位標題實際在第幾列（1-indexed），預設第1列。有些分頁
+  上面會有合併儲存格的大標題／說明文字（例如「產銷會議總覽」上面兩列
+  是標題跟說明句，第3列才是真正的欄位標題），這種情況要傳對應的列號，
+  不然gspread預設把第1列當標題，會因為合併儲存格變成一堆空白值，噴出
+  「the header row in the worksheet contains duplicates: ['']」這種
+  錯誤。
   """
   sheet_id = sheet_id if sheet_id is not None else GOOGLE_SHEET_ID
   if not GOOGLE_SHEETS_CREDENTIALS_JSON or not sheet_id:
@@ -1797,7 +1810,7 @@ def _fetch_google_sheet_records_verbose(tab_name, sheet_id=None):
   try:
     sh = gc.open_by_key(sheet_id)
     ws = sh.worksheet(tab_name)
-    records = ws.get_all_records()
+    records = ws.get_all_records(head=header_row)
     print(f"[Google Sheet「{tab_name}」] 讀取成功，共 {len(records)} 列")
     return records, None
   except Exception as e:
@@ -2304,6 +2317,7 @@ def load_monthly_sales_review_from_google_sheet():
   records, error = _fetch_google_sheet_records_verbose(
       MONTHLY_SALES_REVIEW_GOOGLE_SHEET_TAB,
       sheet_id=MONTHLY_SALES_REVIEW_GOOGLE_SHEET_ID,
+      header_row=MONTHLY_SALES_REVIEW_HEADER_ROW,
   )
   if records is None:
     return [], False, error, 0
