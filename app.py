@@ -650,6 +650,16 @@ CHANNEL_SALES_GOOGLE_SHEET_TAB = os.environ.get(
 HAITAOKE_SKU_MAP_GOOGLE_SHEET_TAB = os.environ.get(
     "HAITAOKE_SKU_MAP_GOOGLE_SHEET_TAB", "海濤客品號對應"
 )
+# 產銷會議總覽（月產銷分析用）。這份是「另一份獨立的試算表」（不是跟
+# BOM/訂單資訊共用那份），所以要另外設定自己的Sheet ID，不會預設共用
+# GOOGLE_SHEET_ID——沒設定MONTHLY_SALES_REVIEW_GOOGLE_SHEET_ID的話，
+# 會被視為「尚未設定」，不會誤讀到其他資料的試算表裡。
+MONTHLY_SALES_REVIEW_GOOGLE_SHEET_ID = os.environ.get(
+    "MONTHLY_SALES_REVIEW_GOOGLE_SHEET_ID", ""
+)
+MONTHLY_SALES_REVIEW_GOOGLE_SHEET_TAB = os.environ.get(
+    "MONTHLY_SALES_REVIEW_GOOGLE_SHEET_TAB", "產銷會議總覽"
+)
 # 工廠的生產排程行事曆（星期日～星期六 橫向表頭、下面逐週堆疊的手工
 # 排班表），格式是給人看的、不是給程式讀的乾淨表格（合併儲存格、顏色
 # 分類、自由文字），跟BOM/訂單資訊那種結構化表格不一樣，需要另外用
@@ -1701,11 +1711,15 @@ def load_bom_from_excel(path):
   return bom_map
 
 
-def _get_gspread_client():
+def _get_gspread_client(sheet_id=None):
   """建立可讀寫的 gspread client（共用給讀取跟寫入用）。
-  回傳 None 代表沒有設定 Google Sheets 憑證。
+  回傳 None 代表沒有設定 Google Sheets 憑證，或指定的sheet_id沒設定。
+  sheet_id：要檢查哪個Sheet ID有沒有設定，預設檢查GOOGLE_SHEET_ID
+  （大部分資料共用這份試算表）；如果是像「產銷會議總覽」這種放在
+  「另一份獨立試算表」的資料，呼叫時傳自己的Sheet ID常數進來檢查。
   """
-  if not GOOGLE_SHEETS_CREDENTIALS_JSON or not GOOGLE_SHEET_ID:
+  sheet_id = sheet_id if sheet_id is not None else GOOGLE_SHEET_ID
+  if not GOOGLE_SHEETS_CREDENTIALS_JSON or not sheet_id:
     return None
   import gspread
   from google.oauth2.service_account import Credentials
@@ -1721,12 +1735,16 @@ def _get_gspread_client():
   return gspread.authorize(creds)
 
 
-def _fetch_google_sheet_records(tab_name):
+def _fetch_google_sheet_records(tab_name, sheet_id=None):
   """共用的 Google Sheet 讀取邏輯（BOM／訂單資訊／銷售歷史都靠這支）。
 
   回傳 None 代表「沒有設定 Google Sheets」（呼叫端應退回其他備援來源）；
   回傳空 list 代表「有設定，但讀取失敗，或該分頁本來就沒有資料」。
   這兩種情況要分開，才不會把「沒設定」誤判成「設定了但是空的」。
+
+  sheet_id：預設讀 GOOGLE_SHEET_ID（大部分資料共用這份試算表）；如果
+  這份資料放在「另一份獨立試算表」（例如產銷會議總覽），傳自己的Sheet
+  ID常數進來，不要用預設值，避免打開錯的試算表。
 
   設定步驟：
   1. Google Cloud Console 建立服務帳號，下載 JSON 金鑰
@@ -1734,18 +1752,20 @@ def _fetch_google_sheet_records(tab_name):
   3. 把該服務帳號的 email（金鑰 JSON 裡的 client_email）加入 Google
      Sheet 的「共用」名單，權限「編輯者」（不是唯讀，因為手動建立訂單
      功能需要寫回這份Sheet）
-  4. 設定 GOOGLE_SHEET_ID（Sheet 網址中 /d/ 與 /edit 中間那串）
+  4. 設定 GOOGLE_SHEET_ID（Sheet 網址中 /d/ 與 /edit 中間那串）；如果
+     是獨立試算表的資料，改設定該資料專屬的 Sheet ID 環境變數
   5. 分頁名稱要跟 BOM_GOOGLE_SHEET_TAB／ORDERS_GOOGLE_SHEET_TAB／
      SALES_HISTORY_GOOGLE_SHEET_TAB 一致，欄位標題要跟本檔案裡的
      BOM_COL_* / ORDER_COL_* / SALES_COL_* 常數完全一致
   6. requirements.txt 需要加上 gspread、google-auth
   """
-  gc = _get_gspread_client()
+  sheet_id = sheet_id if sheet_id is not None else GOOGLE_SHEET_ID
+  gc = _get_gspread_client(sheet_id)
   if gc is None:
     return None
 
   try:
-    sh = gc.open_by_key(GOOGLE_SHEET_ID)
+    sh = gc.open_by_key(sheet_id)
     ws = sh.worksheet(tab_name)
     return ws.get_all_records()
   except Exception as e:
@@ -2154,6 +2174,102 @@ def load_haitaoke_sku_map_from_google_sheet():
   sku_map = _parse_haitaoke_sku_map_records(records)
   print(f"海濤客品號對應讀取完成：共 {len(sku_map)} 筆 SKU→品號 對照")
   return sku_map, True
+
+
+# ---- 產銷會議總覽（Google Sheet，取代原本內建計算的「月產銷分析」）----
+# 這份表由人工／其他流程在Google Sheet維護（工廠預估量、各通路預估量、
+# 平均每日銷量、可支撐天數、狀態提醒都是表格裡本來就算好的值），這裡
+# 純粹讀取＋篩選，不做任何預估計算。唯一例外是「現有成品庫存」欄位，
+# 依照需求改成即時抓取海濤客鳳仁倉的A1庫存（比表格裡的數字更即時），
+# 其餘欄位一律照表格原始值顯示。MONTHLY_SALES_REVIEW_GOOGLE_SHEET_ID／
+# MONTHLY_SALES_REVIEW_GOOGLE_SHEET_TAB 定義在檔案前面（跟其他Google
+# Sheet設定放一起）。
+
+# 表格欄位標題（要跟Google Sheet的標題列逐字一致，見附圖）
+MSR_COL_MONTH = "月份"
+MSR_COL_SERIES = "系列"
+MSR_COL_ITEM_NAME = "品名"
+MSR_COL_FACTORY_QTY = "工廠本月預估量"
+MSR_COL_ALL_CHANNEL_QTY = "全通路預估量"
+MSR_COL_GAP = "供需差異"
+MSR_COL_AVG_DAILY_SALES = "全通路平均每日銷量"
+MSR_COL_CURRENT_STOCK = "現有成品庫存"
+MSR_COL_SUPPORT_DAYS = "可支撐天數"
+MSR_COL_EST_REVENUE = "預估當月總銷售額"
+MSR_COL_STATUS = "狀態提醒"
+MSR_COL_NOTE = "會議備註"
+
+# 通路篩選下拉選單：(顯示名稱, 對應的Google Sheet欄位標題)。選了某個
+# 通路，只列出「該通路欄位有填預估量」的品項（空白／不販售／"-"都算
+# 沒填，不會被篩出來）。
+MSR_CHANNEL_FILTER_OPTIONS = [
+    ("官網/蝦皮", "官網/蝦皮預估量"),
+    ("經銷/KOL/團購", "經銷/KOL/團購預估量"),
+    ("門市/百貨/快閃", "門市/百貨/快閃預估量"),
+    ("小琉球", "小琉球預估量"),
+    ("海外", "海外預估量"),
+]
+# 附圖裡的欄位標題用的是全形斜線「／」還是半形「/」不容易從截圖百分之百
+# 確認，讀取時「官網/蝦皮預估量」跟「官網／蝦皮預估量」都會嘗試對應，
+# 避免因為全形/半形不一致就整欄讀不到（見_msr_lookup_channel_value）。
+
+
+def _msr_cell_has_value(v):
+  """判斷這個通路預估量儲存格「算不算有填」：空白、None、"-"、"－"、
+  "不販售"、"不販賣" 都算沒填。"""
+  if v is None:
+    return False
+  s = str(v).strip()
+  return s not in ("", "-", "－", "不販售", "不販賣")
+
+
+def _msr_lookup_channel_value(row, sheet_col_name):
+  """通路欄位值查詢，全形/半形斜線都嘗試，找不到回傳None。"""
+  if sheet_col_name in row:
+    return row.get(sheet_col_name)
+  alt = sheet_col_name.replace("／", "/") if "／" in sheet_col_name else sheet_col_name.replace("/", "／")
+  return row.get(alt)
+
+
+def _parse_monthly_sales_review_records(records):
+  """把「產銷會議總覽」分頁的列轉成畫面要用的dict list，只保留有填
+  「品名」的列（沒品名的列多半是空白列或合計列，不列入篩選結果）。
+  所有欄位照表格原始文字保留（不做數字轉型），因為只是顯示用，不參與
+  這裡的計算。
+  """
+  rows = []
+  for row in records:
+    item_name = str(row.get(MSR_COL_ITEM_NAME, "") or "").strip()
+    if not item_name:
+      continue
+    rows.append({
+        "月份": str(row.get(MSR_COL_MONTH, "") or "").strip(),
+        "系列": str(row.get(MSR_COL_SERIES, "") or "").strip(),
+        "品名": item_name,
+        "全通路預估量": row.get(MSR_COL_ALL_CHANNEL_QTY, ""),
+        "全通路平均每日銷量": row.get(MSR_COL_AVG_DAILY_SALES, ""),
+        "可支撐天數": row.get(MSR_COL_SUPPORT_DAYS, ""),
+        "狀態提醒": row.get(MSR_COL_STATUS, ""),
+        "_raw": row,
+    })
+  return rows
+
+
+def load_monthly_sales_review_from_google_sheet():
+  """讀取「產銷會議總覽」分頁。回傳 (rows, configured)。
+  這份是獨立試算表，用MONTHLY_SALES_REVIEW_GOOGLE_SHEET_ID（不是
+  GOOGLE_SHEET_ID），沒設定的話視為「尚未設定」，不會誤開到BOM那份
+  試算表裡去找同名分頁。
+  """
+  records = _fetch_google_sheet_records(
+      MONTHLY_SALES_REVIEW_GOOGLE_SHEET_TAB,
+      sheet_id=MONTHLY_SALES_REVIEW_GOOGLE_SHEET_ID,
+  )
+  if records is None:
+    return [], False
+  rows = _parse_monthly_sales_review_records(records)
+  print(f"產銷會議總覽讀取完成：共 {len(rows)} 筆品項")
+  return rows, True
 
 
 # ---- 訂單資訊（Google Sheet，手動覆蓋更新／後續可改自動抓取） ----
@@ -7421,344 +7537,189 @@ def inventory_dashboard():
                       "w-full p-3 mb-4 bg-[#e8f6f5] border border-[#bfe6e3]"
                   ):
                     ui.label(
-                        "分析範圍只看「成品」跟「組合品」兩個分類（原料/物料/費用"
-                        "類不是賣給客戶的品項，不計入）——不只是畫面篩選，連基準"
-                        "銷量、去年比例回推這些底層計算都只用這個範圍，匯出的 "
-                        "xlsx 也只會有這個範圍。按「計算」時會自動向 A1 抓取"
-                        "「近3個月」與「去年同月」的真實銷售資料（不需要先去 5.3 "
-                        "點、也不用整年硬抓，只拿這兩段還是需要幾秒到十幾秒，"
-                        "不想自動抓可以在下方關掉）。邏輯：基準預估銷量 = (去年同期銷量 + "
-                        "近3個月平均銷量) ÷ 2；若有填目標營業額，會等比例"
-                        "校正每個品項的預估量，讓總營收貼近目標；建議採購"
-                        "時間 = 目標月份第一天 − 採購前置天數（抓 BOM 表"
-                        "設定，沒有則用系統預設值）。"
+                        "資料來源改為Google Sheet「產銷會議總覽」分頁（人工／"
+                        "會議維護，這裡不做任何預估計算），下方三個篩選都是"
+                        "選填，只要填一個就會帶出資料；同時填多個是「同時"
+                        "符合」。「現有成品庫存」抓的是即時的海濤客鳳仁倉A1"
+                        "庫存（依「品名」比對加總），跟表格裡原本的數字可能"
+                        "不完全一樣；「可支撐天數」「狀態提醒」則直接顯示"
+                        "表格裡的原始值。"
                     ).classes("text-xs text-teal-800")
 
-                  with ui.row().classes("items-center gap-3 flex-wrap mb-2"):
-                    forecast_month_select = ui.select(
-                        options=generate_month_options(6),
-                        value=generate_month_options(6)[0],
-                        label="預估月份",
-                    ).classes(
-                        "bg-[#f7f6f2] text-zinc-900 rounded-lg px-3 py-1"
-                        " text-xs font-bold border border-[#e6e1d4] w-32"
-                    )
-                    forecast_revenue_input = ui.number(
-                        label="目標營業額（選填，不填則用基準預估量）",
-                        min=0,
-                        step=1000,
-                    ).classes("w-64")
-                    forecast_last_year_revenue_input = ui.number(
-                        label="去年目標營業額（選填，品號對不上時用比例回推）",
-                        min=0,
-                        step=1000,
-                    ).classes("w-72")
-                    forecast_auto_fetch_checkbox = ui.checkbox(
-                        "自動從 A1 抓最新銷售資料（建議開啟）",
-                        value=True,
-                    ).classes("text-xs")
-                    forecast_calc_button = ui.button("計算").classes(
-                        "sync-btn px-4 py-2 text-xs rounded-lg"
-                    )
+                  msr_state = {
+                      "rows": [], "configured": False,
+                      "month": None, "item_name": "", "channel": None,
+                  }
 
-                  forecast_fetch_status_label = ui.label().classes(
-                      "text-xs text-zinc-500 mb-1"
+                  msr_summary_label = ui.label("").classes(
+                      "text-xs text-zinc-400 mb-2"
                   )
-                  ui.label(
-                      "若去年的品號編碼跟今年不一樣，系統會完全比對不到"
-                      "「去年同期銷量」（一律顯示為 0）。這時可以填「去年"
-                      "目標營業額」，系統會用「近3個月」的營收佔比當權重，"
-                      "把這個數字依同樣比例分攤回各品項、換算回數量，當作"
-                      "去年同期的替代估計值——這是推算，不是實際數字，總表"
-                      "會用「去年銷量來源」欄位標明。"
-                  ).classes("text-xs text-zinc-500 mb-3")
+                  msr_results_container = ui.column().classes("w-full")
 
-                  ui.label("通路占比分配（選填，用於拆分下方「分通路表」）").classes(
-                      "text-sm font-bold text-zinc-700 mb-2"
-                  )
-                  with ui.row().classes(
-                      "w-full p-3 mb-2 bg-[#fff8e6] border border-[#f0dca0]"
-                  ):
-                    ui.label(
-                        "不是逐品項拆通路（目前沒有這麼細的資料），而是把下方"
-                        "「總表」算出來的預估總量/總成本/總營收，依你填的"
-                        "占比直接等比例分攤到各通路，簡單好懂。不需要剛好等於"
-                        "100%，但建議盡量接近，不然各通路加起來會跟總表對不起來。"
-                    ).classes("text-xs text-amber-800")
+                  def msr_lookup_stock(item_name):
+                    """依品名去食品廠鳳仁倉庫存裡找，精確比對「品名」欄位，
+                    同品名的多筆列（不同批號等）加總。找不到回傳None（畫面
+                    上顯示「查無庫存」，不要顯示0，避免誤以為庫存是0）。"""
+                    df = app_state.get("df")
+                    if df is None or df.empty:
+                      return None
+                    matched = df[
+                        (df["倉庫名稱"] == "食品廠鳳仁倉") & (df["品名"] == item_name)
+                    ]
+                    if matched.empty:
+                      return None
+                    return matched["庫存數量"].sum()
 
-                  channel_pct_inputs = {}
-                  with ui.row().classes("w-full gap-3 flex-wrap mb-2"):
-                    for channel in PRODUCTION_SALES_CHANNELS:
-                      with ui.column().classes("gap-0"):
-                        ui.label(channel).classes("text-xs text-zinc-600")
-                        channel_pct_inputs[channel] = ui.number(
-                            value=0, min=0, max=100, step=1,
-                        ).classes("w-20")
+                  def msr_render_results():
+                    msr_results_container.clear()
+                    month = msr_state["month"]
+                    keyword = (msr_state["item_name"] or "").strip()
+                    channel_label = msr_state["channel"]
 
-                  channel_pct_total_label = ui.label().classes(
-                      "text-xs text-zinc-500 mb-4"
-                  )
+                    has_filter = bool(month or keyword or channel_label)
+                    with msr_results_container:
+                      if not msr_state["configured"]:
+                        ui.label(
+                            f"尚未設定「{MONTHLY_SALES_REVIEW_GOOGLE_SHEET_TAB}」"
+                            "Google Sheet分頁，請確認GOOGLE_SHEETS_"
+                            "CREDENTIALS_JSON／MONTHLY_SALES_REVIEW_GOOGLE_"
+                            "SHEET_ID是否已設定（這份是獨立試算表，不是共用"
+                            "GOOGLE_SHEET_ID），以及分頁名稱是否正確。"
+                        ).classes("text-xs text-red-600")
+                        return
+                      if not has_filter:
+                        ui.label(
+                            "請至少選擇一個篩選條件（月份／品名／通路），"
+                            "才會帶出資料。"
+                        ).classes("text-xs text-zinc-400")
+                        return
 
-                  def update_channel_pct_total():
-                    total = sum(
-                        (inp.value or 0) for inp in channel_pct_inputs.values()
-                    )
-                    channel_pct_total_label.text = f"目前合計：{total:g}%"
-                    channel_pct_total_label.classes(
-                        replace="text-xs mb-4 "
-                        + ("text-teal-700" if abs(total - 100) < 0.01 else "text-amber-700")
-                    )
+                      channel_col = None
+                      if channel_label:
+                        channel_col = dict(MSR_CHANNEL_FILTER_OPTIONS).get(channel_label)
 
-                  for inp in channel_pct_inputs.values():
-                    inp.on_value_change(lambda e: update_channel_pct_total())
-                  update_channel_pct_total()
+                      filtered = []
+                      for r in msr_state["rows"]:
+                        if month and r["月份"] != month:
+                          continue
+                        if keyword and keyword not in r["品名"]:
+                          continue
+                        if channel_col and not _msr_cell_has_value(
+                            _msr_lookup_channel_value(r["_raw"], channel_col)
+                        ):
+                          continue
+                        filtered.append(r)
 
-                  forecast_summary_row = ui.row().classes("w-full gap-4 mb-4 flex-wrap")
-                  forecast_note_label = ui.label().classes(
-                      "text-xs text-zinc-500 mb-3"
-                  )
-                  forecast_export_row = ui.row().classes("w-full mb-2")
-
-                  ui.label("總表（逐品項）").classes(
-                      "text-sm font-bold text-zinc-700 mb-2"
-                  )
-                  forecast_category_row = ui.row().classes("w-full gap-2 mb-3 flex-wrap")
-                  forecast_table_container = ui.column().classes("w-full mb-6")
-
-                  ui.label("分通路表（依占比等比例分攤）").classes(
-                      "text-sm font-bold text-zinc-700 mb-2"
-                  )
-                  forecast_channel_table_container = ui.column().classes("w-full")
-
-                  # 用來在按分類按鈕時重新篩選，不用重新整包計算一次
-                  forecast_state = {"result": None, "active_category": "全部（成品＋組合品）", "channel_rows": []}
-
-                  FORECAST_COLUMNS = [
-                      {"name": "品號", "label": "品號", "field": "品號", "align": "left"},
-                      {"name": "品名", "label": "品名", "field": "品名", "align": "left"},
-                      {"name": "商品分類", "label": "商品分類", "field": "商品分類", "align": "left"},
-                      {"name": "去年同期銷量", "label": "去年同期銷量", "field": "去年同期銷量"},
-                      {"name": "去年銷量來源", "label": "去年銷量來源", "field": "去年銷量來源", "align": "left"},
-                      {"name": "近3月平均銷量", "label": "近3月平均銷量", "field": "近3月平均銷量"},
-                      {"name": "目標採購量", "label": "目標採購量", "field": "目標採購量"},
-                      {"name": "單位成本", "label": "單位成本", "field": "單位成本"},
-                      {"name": "預估總成本", "label": "預估總成本", "field": "預估總成本"},
-                      {"name": "建議採購時間", "label": "建議採購時間", "field": "建議採購時間"},
-                  ]
-                  CHANNEL_COLUMNS = [
-                      {"name": "通路", "label": "通路", "field": "通路", "align": "left"},
-                      {"name": "佔比(%)", "label": "佔比(%)", "field": "佔比(%)"},
-                      {"name": "目標營業額", "label": "目標營業額", "field": "目標營業額"},
-                      {"name": "目標採購量", "label": "目標採購量", "field": "目標採購量"},
-                      {"name": "預估總成本", "label": "預估總成本", "field": "預估總成本"},
-                      {"name": "預估總營收", "label": "預估總營收", "field": "預估總營收"},
-                  ]
-
-                  def render_forecast_table():
-                    forecast_table_container.clear()
-                    result = forecast_state["result"]
-                    if result is None:
-                      return
-                    rows = result["rows"]
-                    active = forecast_state["active_category"]
-                    if active == "成品":
-                      rows = [
-                          r for r in rows
-                          if "成品" in (r["商品分類"] or "")
-                      ]
-                    elif active == "組合品":
-                      rows = [
-                          r for r in rows
-                          if "組合品" in (r["商品分類"] or "")
-                      ]
-                    # active == "全部（成品＋組合品）" 時不額外篩選，因為
-                    # result["rows"] 本來就已經只含這兩類（見計算階段的
-                    # is_finished_or_combo_category 篩選）
-                    with forecast_table_container:
-                      if not rows:
-                        ui.label("這個分類目前沒有預估資料").classes(
+                      if not filtered:
+                        ui.label("沒有符合篩選條件的品項").classes(
                             "text-xs text-zinc-400"
                         )
-                      else:
-                        ui.table(
-                            columns=FORECAST_COLUMNS, rows=rows, pagination=10,
-                        ).classes("w-full")
+                        return
 
-                  FORECAST_CATEGORY_OPTIONS = ["全部（成品＋組合品）", "成品", "組合品"]
+                      display_rows = []
+                      for r in filtered:
+                        stock = msr_lookup_stock(r["品名"])
+                        display_rows.append({
+                            "品名": r["品名"],
+                            "全通路預估量": r["全通路預估量"],
+                            "全通路平均每日銷量": r["全通路平均每日銷量"],
+                            "現有成品庫存(鳳仁倉即時)": (
+                                "查無庫存" if stock is None else f"{stock:,.0f}"
+                            ),
+                            "可支撐天數": r["可支撐天數"],
+                            "狀態提醒": r["狀態提醒"],
+                        })
 
-                  def render_forecast_category_buttons():
-                    forecast_category_row.clear()
-                    result = forecast_state["result"]
-                    if result is None:
-                      return
-
-                    def make_handler(cat):
-                      def handler():
-                        forecast_state["active_category"] = cat
-                        render_forecast_category_buttons()
-                        render_forecast_table()
-                      return handler
-
-                    with forecast_category_row:
-                      for cat in FORECAST_CATEGORY_OPTIONS:
-                        is_active = cat == forecast_state["active_category"]
-                        ui.button(cat, on_click=make_handler(cat)).classes(
-                            "px-3 py-1 text-xs rounded-lg "
-                            + (
-                                "sync-btn"
-                                if is_active
-                                else "bg-[#f7f6f2] text-zinc-700 border border-[#e6e1d4]"
-                            )
-                        )
-
-                  def render_channel_table():
-                    forecast_channel_table_container.clear()
-                    rows = forecast_state["channel_rows"]
-                    with forecast_channel_table_container:
-                      if not rows:
-                        ui.label(
-                            "尚未填寫通路佔比，或尚未按「計算」"
-                        ).classes("text-xs text-zinc-400")
-                      else:
-                        ui.table(
-                            columns=CHANNEL_COLUMNS, rows=rows, pagination=10,
-                        ).classes("w-full")
-
-                  def handle_calc_forecast():
-                    forecast_summary_row.clear()
-                    forecast_export_row.clear()
-                    forecast_state["result"] = None
-                    forecast_state["active_category"] = "全部（成品＋組合品）"
-                    forecast_state["channel_rows"] = []
-
-                    target_month = forecast_month_select.value
-
-                    if forecast_auto_fetch_checkbox.value:
-                      token = get_a1_token()
-                      if token:
-                        forecast_fetch_status_label.text = (
-                            "正在向 A1 抓取近3個月與去年同月銷售資料，"
-                            "需要幾秒到十幾秒…"
-                        )
+                      def handle_export_msr():
                         try:
-                          fetched_rows = fetch_sales_history_for_forecast(
-                              token, target_month
+                          xlsx_bytes = rows_to_xlsx_bytes(
+                              display_rows, sheet_name="產銷會議總覽"
                           )
-                        except Exception as e:
-                          fetched_rows = []
-                          ui.notify(f"自動抓取失敗，改用現有資料：{e}", color="warning")
-                        if fetched_rows:
-                          app_state["sales_history"] = fetched_rows
-                          app_state["sales_history_configured"] = True
-                          app_state["sales_history_source"] = (
-                              "鼎新 A1（GetSales/GetSaleReturns，5.5 自動抓取）"
-                          )
-                          forecast_fetch_status_label.text = (
-                              f"已從 A1 抓取 {len(fetched_rows)} 筆銷售歷史彙總資料"
-                          )
-                        else:
-                          forecast_fetch_status_label.text = (
-                              "A1 沒有查到資料，改用目前已有的銷售歷史"
-                          )
-                      else:
-                        forecast_fetch_status_label.text = (
-                            "無法登入 A1，改用目前已有的銷售歷史"
-                        )
-                    else:
-                      forecast_fetch_status_label.text = "使用目前已有的銷售歷史（未勾選自動抓取）"
-
-                    sales_history = app_state.get("sales_history", [])
-                    if not app_state.get("sales_history_configured", False):
-                      forecast_note_label.text = (
-                          "尚未有銷售歷史資料來源，請先到 5.3 設定 Google "
-                          "Sheets 或打開上方「自動從 A1 抓取」。"
-                      )
-                      forecast_category_row.clear()
-                      forecast_table_container.clear()
-                      render_channel_table()
-                      return
-
-                    items_map = app_state.get("items_map", {})
-                    bom_map = app_state.get("bom_map", {})
-                    target_revenue = forecast_revenue_input.value or 0
-                    last_year_target_revenue = forecast_last_year_revenue_input.value or 0
-
-                    result = compute_monthly_production_sales_forecast(
-                        sales_history, items_map, bom_map, target_month,
-                        target_revenue, app_state["settings"],
-                        last_year_target_revenue=last_year_target_revenue,
-                    )
-                    forecast_state["result"] = result
-
-                    forecast_note_label.text = (
-                        f"參考去年同期（{result['last_year_ym']}）＋近3個月"
-                        f"（{'、'.join(reversed(result['recent_months']))}）"
-                        f"平均｜共 {len(result['rows'])} 項有預估值的品項"
-                        + (
-                            f"｜營收校正倍數：{result['scale_factor']}"
-                            if target_revenue else "｜未填目標營業額，使用基準預估量"
-                        )
-                        + (
-                            "｜去年同期已用比例推算補齊"
-                            if last_year_target_revenue else ""
-                        )
-                    )
-
-                    with forecast_summary_row:
-                      summary_cards = [
-                          ("目標採購總量", f"{result['total_est_qty']:,.0f}"),
-                          ("預估總成本", f"NT$ {result['total_est_cost']:,.0f}"),
-                          ("預估總營收（核對用）", f"NT$ {result['total_est_revenue']:,.0f}"),
-                          (
-                              "建議最早開始採購日",
-                              result["earliest_order_date"] or "－",
-                          ),
-                      ]
-                      for label, value in summary_cards:
-                        with ui.column().classes(
-                            "bg-[#f7f6f2] border border-[#e6e1d4] p-4"
-                            " min-w-[200px] flex-1"
-                        ):
-                          ui.label(label).classes("text-xs text-zinc-500 mb-1")
-                          ui.label(value).classes(
-                              "text-xl font-black text-zinc-900"
-                          )
-
-                    channel_pcts = {
-                        ch: (inp.value or 0)
-                        for ch, inp in channel_pct_inputs.items()
-                    }
-                    channel_rows, total_pct = compute_channel_breakdown(
-                        result, channel_pcts, target_revenue
-                    )
-                    forecast_state["channel_rows"] = channel_rows
-
-                    if result["rows"]:
-                      def handle_export_forecast():
-                        try:
-                          xlsx_bytes = multi_sheet_xlsx_bytes({
-                              f"{target_month}總表": result["rows"],
-                              f"{target_month}分通路表": channel_rows,
-                          })
                           ui.download(
                               xlsx_bytes,
-                              f"月產銷分析_{target_month}.xlsx",
+                              "月產銷分析.xlsx",
                               media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                           )
                         except Exception as e:
                           ui.notify(f"匯出失敗：{e}", color="negative")
 
-                      with forecast_export_row:
-                        ui.button(
-                            "匯出 xlsx（總表＋分通路表）",
-                            on_click=handle_export_forecast,
-                        ).classes("sync-btn px-3 py-1 text-xs rounded-lg")
+                      with ui.row().classes("w-full items-center justify-between mb-2"):
+                        ui.label(f"共 {len(display_rows)} 項").classes(
+                            "text-xs text-zinc-500"
+                        )
+                        ui.button("匯出 xlsx", on_click=handle_export_msr).classes(
+                            "sync-btn px-3 py-1 text-xs rounded-lg"
+                        )
 
-                    render_forecast_category_buttons()
-                    render_forecast_table()
-                    render_channel_table()
+                      ui.table(
+                          columns=[
+                              {"name": "品名", "label": "品名", "field": "品名", "align": "left", "sortable": True},
+                              {"name": "全通路預估量", "label": "全通路預估量", "field": "全通路預估量", "align": "right", "sortable": True},
+                              {"name": "全通路平均每日銷量", "label": "全通路平均每日銷量", "field": "全通路平均每日銷量", "align": "right", "sortable": True},
+                              {"name": "現有成品庫存(鳳仁倉即時)", "label": "現有成品庫存(鳳仁倉即時)", "field": "現有成品庫存(鳳仁倉即時)", "align": "right", "sortable": True},
+                              {"name": "可支撐天數", "label": "可支撐天數", "field": "可支撐天數", "align": "right", "sortable": True},
+                              {"name": "狀態提醒", "label": "狀態提醒", "field": "狀態提醒", "align": "left", "sortable": True},
+                          ],
+                          rows=display_rows,
+                          pagination={"rowsPerPage": 20, "sortBy": "品名", "descending": False},
+                      ).classes("w-full").props(':rows-per-page-options="[10,20,50,0]"')
 
-                  forecast_calc_button.on_click(handle_calc_forecast)
+                  def msr_load(force_refresh=False):
+                    rows, configured = load_monthly_sales_review_from_google_sheet()
+                    msr_state["rows"] = rows
+                    msr_state["configured"] = configured
+                    months = sorted({r["月份"] for r in rows if r["月份"]}, reverse=True)
+                    msr_month_select.options = months
+                    if msr_state["month"] not in months:
+                      msr_state["month"] = None
+                      msr_month_select.value = None
+                    msr_summary_label.text = (
+                        f"共 {len(rows)} 筆品項"
+                        if configured else "尚未設定 Google Sheet"
+                    )
+                    if force_refresh:
+                      ui.notify("已重新整理", color="positive")
+                    msr_render_results()
+
+                  with ui.row().classes("items-center gap-3 flex-wrap mb-3"):
+                    def msr_set_month(e):
+                      msr_state["month"] = e.value
+                      msr_render_results()
+
+                    msr_month_select = ui.select(
+                        options=[], value=None, label="月份（選填）",
+                        on_change=msr_set_month,
+                    ).props("dense outlined clearable").classes("w-40")
+
+                    def msr_set_item_name(e):
+                      msr_state["item_name"] = e.value or ""
+                      msr_render_results()
+
+                    ui.input(
+                        label="品名（選填，關鍵字）", on_change=msr_set_item_name,
+                    ).props("dense outlined clearable").classes("w-56")
+
+                    def msr_set_channel(e):
+                      msr_state["channel"] = e.value
+                      msr_render_results()
+
+                    ui.select(
+                        options=[label for label, _ in MSR_CHANNEL_FILTER_OPTIONS],
+                        value=None, label="全通路預估量－通路（選填）",
+                        on_change=msr_set_channel,
+                    ).props("dense outlined clearable").classes("w-56")
+
+                    ui.button(
+                        "重新整理", icon="refresh",
+                        on_click=lambda: msr_load(force_refresh=True),
+                    ).props("dense no-caps unelevated").classes(
+                        "px-3 py-1 rounded-lg text-xs"
+                    ).style(
+                        "background:#ffffff !important; color:#4b5563 !important;"
+                        " border:1px solid #e6e1d4;"
+                    )
+
+                  msr_load()
 
 
           # ==================================================
@@ -7858,14 +7819,23 @@ def inventory_dashboard():
                           "Google Sheets（開啟庫存查詢分頁時即時查詢，"
                           "不隨開機同步）" if sheets_configured else "尚未設定",
                       ),
+                      (
+                          "產銷會議總覽", MONTHLY_SALES_REVIEW_GOOGLE_SHEET_TAB,
+                          "Google Sheets（獨立試算表，開啟月產銷分析分頁"
+                          "時即時查詢，不隨開機同步）"
+                          if (GOOGLE_SHEETS_CREDENTIALS_JSON and MONTHLY_SALES_REVIEW_GOOGLE_SHEET_ID)
+                          else "尚未設定",
+                      ),
                   ):
                     ui.label(
                         f"分頁「{tab_name}」（{label}）目前來源：{source_state}"
                     ).classes("text-xs text-zinc-600")
                 ui.label(
                     "設定方式：環境變數 GOOGLE_SHEETS_CREDENTIALS_JSON（服務"
-                    "帳號金鑰 JSON 內容）、GOOGLE_SHEET_ID（六份資料共用同一"
-                    "個 Sheet ID，只是分頁不同）。分頁名稱可用"
+                    "帳號金鑰 JSON 內容，同一組憑證共用）、GOOGLE_SHEET_ID"
+                    "（BOM表／訂單資訊／銷售歷史／進貨明細／通路銷售明細／"
+                    "海濤客品號對應 六份資料共用同一個Sheet ID，只是分頁"
+                    "不同）。分頁名稱可用"
                     "BOM_GOOGLE_SHEET_TAB／ORDERS_GOOGLE_SHEET_TAB／"
                     "SALES_HISTORY_GOOGLE_SHEET_TAB／"
                     "RECEIVING_GOOGLE_SHEET_TAB／"
@@ -7875,6 +7845,15 @@ def inventory_dashboard():
                     "「通路銷售明細」「海濤客品號對應」。「海濤客品號對應」"
                     "分頁的欄位標題需為「SKU」「品號」「品名」（品名純供"
                     "參考，比對只用SKU／品號），沒填SKU或品號的列會被忽略。"
+                    "「產銷會議總覽」是另一份獨立的試算表，要另外設定"
+                    "MONTHLY_SALES_REVIEW_GOOGLE_SHEET_ID（那份試算表網址"
+                    "中 /d/ 與 /edit 中間那串）＋把同一個服務帳號email加入"
+                    "該試算表的共用名單，分頁名稱預設「產銷會議總覽」（可用"
+                    "MONTHLY_SALES_REVIEW_GOOGLE_SHEET_TAB改名），欄位標題"
+                    "需與附圖一致（月份／系列／品名／全通路預估量／官網/"
+                    "蝦皮預估量／經銷/KOL/團購預估量／門市/百貨/快閃預估量／"
+                    "小琉球預估量／海外預估量／全通路平均每日銷量／可支撐"
+                    "天數／狀態提醒等），沒填「品名」的列會被忽略。"
                 ).classes("text-xs text-zinc-500 mt-2")
 
               # ---------------- 6.3：參數設定 ----------------
