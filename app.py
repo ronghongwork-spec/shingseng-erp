@@ -2208,17 +2208,27 @@ def _parse_haitaoke_sku_map_records(records):
 
 
 def load_haitaoke_sku_map_from_google_sheet():
-  """讀取「海濤客品號對應」分頁。回傳 (sku_map, configured)。
+  """讀取「海濤客品號對應」分頁。回傳 (sku_map, configured, error, raw_count)。
 
-  configured=False 代表 Google Sheets 根本沒設定（呼叫端應顯示「尚未
-  設定」而不是「查無資料」，兩種情況給使用者的訊息不一樣）。
+  configured=False 代表 Google Sheets 根本沒設定，或讀取時發生錯誤（見
+  error欄位的具體原因），呼叫端應顯示error而不是單純當成「查無資料」；
+  這兩種情況（沒設定 vs 讀取錯誤 vs 讀成功但0筆）分開回傳，避免像先前
+  「產銷會議總覽」那樣，把「讀取失敗」誤判成「有設定但剛好是空的」，
+  導致畫面安靜地顯示0、看不出真正的原因。
+  raw_count：Sheet原始列數（篩SKU/品號之前），用來分辨「表格根本連不
+  上/是空的」還是「連上了、有資料，但沒有一列同時填SKU和品號」。
   """
-  records = _fetch_google_sheet_records(HAITAOKE_SKU_MAP_GOOGLE_SHEET_TAB)
+  records, error = _fetch_google_sheet_records_verbose(
+      HAITAOKE_SKU_MAP_GOOGLE_SHEET_TAB
+  )
   if records is None:
-    return {}, False
+    return {}, False, error, 0
   sku_map = _parse_haitaoke_sku_map_records(records)
-  print(f"海濤客品號對應讀取完成：共 {len(sku_map)} 筆 SKU→品號 對照")
-  return sku_map, True
+  print(
+      f"海濤客品號對應讀取完成：Sheet原始 {len(records)} 列，"
+      f"其中SKU/品號都有填的 {len(sku_map)} 筆"
+  )
+  return sku_map, True, None, len(records)
 
 
 # ---- 產銷會議總覽（Google Sheet，取代原本內建計算的「月產銷分析」）----
@@ -5156,14 +5166,33 @@ def inventory_dashboard():
                     # 查詢，取代原本用商品名稱關鍵字猜配對
                     # （match_product_name_to_item_id）的做法——SHOPLINE的
                     # SKU欄位直接查表，準確度比猜名稱高很多。
-                    sku_map, sku_map_configured = (
+                    sku_map, sku_map_configured, sku_map_error, sku_map_raw_count = (
                         load_haitaoke_sku_map_from_google_sheet()
                     )
                     if not sku_map_configured:
                       shopline_demand_state["by_sku"] = {}
+                      if sku_map_error == "not_configured":
+                        shopline_demand_state["error"] = (
+                            f"尚未設定「{HAITAOKE_SKU_MAP_GOOGLE_SHEET_TAB}」"
+                            "Google Sheet分頁，無法將SHOPLINE的SKU對應到A1品號"
+                        )
+                      else:
+                        shopline_demand_state["error"] = (
+                            f"讀取「{HAITAOKE_SKU_MAP_GOOGLE_SHEET_TAB}」分頁"
+                            f"失敗：{sku_map_error}（常見原因：分頁名稱打錯、"
+                            "服務帳號沒有這份試算表的存取權限、或標題列有"
+                            "合併儲存格/重複空白）"
+                        )
+                      print(f"[庫存查詢-官網需求] {shopline_demand_state['error']}")
+                      return
+                    if sku_map_raw_count and not sku_map:
+                      shopline_demand_state["by_sku"] = {}
                       shopline_demand_state["error"] = (
-                          f"尚未設定「{HAITAOKE_SKU_MAP_GOOGLE_SHEET_TAB}」"
-                          "Google Sheet分頁，無法將SHOPLINE的SKU對應到A1品號"
+                          f"「{HAITAOKE_SKU_MAP_GOOGLE_SHEET_TAB}」分頁讀到"
+                          f" {sku_map_raw_count} 列，但沒有一列同時填了"
+                          f"「{SKU_MAP_COL_SKU}」和「{SKU_MAP_COL_ITEM_ID}」"
+                          "兩欄，請確認標題列文字是否完全一致（不能有多餘"
+                          "空白／全形字）。"
                       )
                       print(f"[庫存查詢-官網需求] {shopline_demand_state['error']}")
                       return
