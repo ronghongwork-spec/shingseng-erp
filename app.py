@@ -3520,6 +3520,33 @@ HOME_APP_CARDS = [
     ("報表分析", "/analytics", "銷售趨勢、排行、通路比較等分析（規劃中）"),
 ]
 
+# 首頁「功能導覽」用的詳細目錄：(App名稱, App路徑, [(功能名稱, 說明), ...])。
+# 只能連到「App」這一層（因為分頁切換是同一頁裡的tab，不是獨立網址），
+# 進去之後要點哪個分頁，寫在說明文字裡。新增/搬移功能時記得回來更新
+# 這份清單，不然功能導覽會跟實際頁面對不起來。
+FEATURE_DIRECTORY = [
+    ("雲端進銷存", "/inventory", [
+        ("儀表板", "海濤客：每日工作行事曆＋提醒／公告中心；興聖／容鴻／芙萊柏：每月工作行事曆（進貨／其它事項）"),
+        ("商品資訊", "海濤客：庫存查詢／商品組合(BOM)／批號效期；容鴻／芙萊柏：庫存查詢（尚未開通API）"),
+        ("訂單出貨（海濤客）", "建立訂單／未出訂單查詢／銷貨單／採購單／進貨單，皆可直接上傳寫入 A1"),
+        ("生產排程（海濤客）", "工廠生產排程行事曆（鏡射Google Sheet）＋依BOM展開的生產／包裝建議"),
+        ("採購分析", "建議採購量／庫存週轉／進貨明細／月產銷分析（海濤客／興聖／容鴻／芙萊柏，視API開通狀況）"),
+        ("調撥紀錄／退換貨記錄", "興聖／容鴻／芙萊柏（尚未開通）"),
+        ("系統設定", "海濤客：安全庫存天數、Google Sheets 設定說明等"),
+    ]),
+    ("雲端電商訂單", "/orders", [
+        ("訂單出貨", "興聖／容鴻／芙萊柏 各通路（SHOPLINE官網／經銷／其它）商品需求彙總"),
+        ("每日出貨", "依銷貨單建立日期彙總揀貨表＋通路分類數量"),
+        ("商品異動", "近30天 SHOPLINE 商品異動（含上下架、價格調整），可篩選狀態／日期"),
+    ]),
+    ("雲端會計", "/accounting", [
+        ("（規劃中）", "尚未開放任何功能"),
+    ]),
+    ("報表分析", "/analytics", [
+        ("（規劃中）", "尚未開放任何功能"),
+    ]),
+]
+
 
 def render_app_switcher(active_path):
   """四個App之間的切換器，放在畫面最上方。用ui.link做頁面跳轉（不是
@@ -3779,6 +3806,38 @@ def home_dashboard():
             ui.label(description).classes(
                 "text-xs text-zinc-500 leading-relaxed"
             )
+
+    # ---- 功能導覽：需要什麼功能可以去哪個連結 ----
+    with ui.column().classes("w-full mt-8 gap-3"):
+      ui.label("功能導覽").classes(
+          "text-lg font-bold text-zinc-900"
+      )
+      ui.label(
+          "找不到某個功能在哪裡？對照下面的清單，點「前往」會跳到對應"
+          "的App，進去之後再點清單裡寫的分頁名稱即可。"
+      ).classes("text-xs text-zinc-500 mb-2")
+
+      for app_label, app_path, features in FEATURE_DIRECTORY:
+        with ui.card().classes(
+            "w-full p-5 bg-white border border-[#e6e1d4]"
+            " shadow-[0_1px_3px_rgba(42,40,35,0.06)] rounded-lg"
+        ):
+          with ui.row().classes("w-full items-center justify-between mb-2"):
+            ui.label(app_label).classes(
+                "text-sm font-bold text-zinc-900"
+            )
+            ui.link("前往 →", app_path).classes(
+                "text-xs no-underline px-3 py-1 rounded-lg"
+                " bg-[#2a2823] text-white"
+            )
+          for feature_name, feature_desc in features:
+            with ui.row().classes("w-full gap-2 items-start py-1"):
+              ui.label(feature_name).classes(
+                  "text-xs font-bold text-zinc-700 w-40 flex-shrink-0"
+              )
+              ui.label(feature_desc).classes(
+                  "text-xs text-zinc-500 leading-relaxed"
+              )
 
 
 @ui.page("/inventory")
@@ -4227,7 +4286,7 @@ def inventory_dashboard():
             color="positive",
         )
         for ref_key in (
-            "update_inventory_table",
+            "update_shopline_demand",
             "update_products_grid",
             "update_combo_list",
             "update_dashboard",
@@ -4713,6 +4772,36 @@ def inventory_dashboard():
                         "sync-btn px-3 py-1 text-xs rounded-lg"
                     )
 
+                  # ---- 興聖官網(海濤客)待處理需求：用來算「需補數量」----
+                  # 只抓一次快取起來，不要放進update_inventory_table()裡，
+                  # 不然使用者每打一個篩選關鍵字都會重打一次SHOPLINE API，
+                  # 既慢又浪費。只有初次進分頁跟按「同步」按鈕時才重抓。
+                  shopline_demand_state = {"by_sku": {}}
+
+                  def load_shopline_demand():
+                    creds = SHOPLINE_CHANNEL_CREDENTIALS.get(
+                        ("興聖(股)公司", "官網(海濤客)")
+                    )
+                    if not creds:
+                      shopline_demand_state["by_sku"] = {}
+                      return
+                    access_token, user_agent = creds
+                    created_after = (
+                        datetime.utcnow() - timedelta(days=SHOPLINE_LOOKBACK_DAYS)
+                    ).strftime("%Y-%m-%d %H:%M:%S")
+                    orders_raw, error = fetch_shopline_orders(
+                        access_token, user_agent, SHOPLINE_ORDER_STATUSES, created_after,
+                    )
+                    if error or not orders_raw:
+                      shopline_demand_state["by_sku"] = {}
+                      return
+                    demand_rows = compute_shopline_sku_rows(
+                        orders_raw, status_filter="pending"
+                    )
+                    shopline_demand_state["by_sku"] = {
+                        r["SKU"]: r["需求數量"] for r in demand_rows
+                    }
+
                   table_container = ui.column().classes("w-full")
 
                   def update_inventory_table():
@@ -4752,8 +4841,20 @@ def inventory_dashboard():
 
                     with table_container:
                       display_rows = df.to_dict("records")
+                      demand_by_sku = shopline_demand_state["by_sku"]
                       for r in display_rows:
-                        r["庫存數量"] = ceil_qty(r.get("庫存數量"))
+                        stock_qty = ceil_qty(r.get("庫存數量"))
+                        r["庫存數量"] = stock_qty
+                        official_demand = demand_by_sku.get(r.get("品號"), 0)
+                        r["(官網海濤客)需求"] = ceil_qty(official_demand)
+                        r["(蝦皮海濤客)需求"] = "－"  # 尚未串接，先預留欄位
+                        # 需補數量＝庫存數量－官網海濤客需求－蝦皮海濤客需求
+                        # （蝦皮尚未串接，先當0算）；足夠的話不顯示負數，
+                        # 改顯示「庫存尚夠」，避免看起來像庫存短缺。
+                        shortfall = stock_qty - official_demand
+                        r["需補數量"] = (
+                            "庫存尚夠" if shortfall >= 0 else ceil_qty(-shortfall)
+                        )
                       ui.table(
                           columns=[
                               {
@@ -4791,6 +4892,21 @@ def inventory_dashboard():
                                   "label": "平均成本",
                                   "field": "平均成本",
                               },
+                              {
+                                  "name": "(官網海濤客)需求",
+                                  "label": "(官網海濤客)需求",
+                                  "field": "(官網海濤客)需求",
+                              },
+                              {
+                                  "name": "(蝦皮海濤客)需求",
+                                  "label": "(蝦皮海濤客)需求",
+                                  "field": "(蝦皮海濤客)需求",
+                              },
+                              {
+                                  "name": "需補數量",
+                                  "label": "需補數量",
+                                  "field": "需補數量",
+                              },
                           ],
                           rows=display_rows,
                       ).classes("w-full")
@@ -4801,11 +4917,18 @@ def inventory_dashboard():
                       lambda e: update_inventory_table()
                   )
 
+                  load_shopline_demand()
                   update_inventory_table()
 
                   refs["wh_select"] = wh_select
                   refs["cat_select"] = cat_select
                   refs["update_inventory_table"] = update_inventory_table
+
+                  def refresh_shopline_demand_and_table():
+                    load_shopline_demand()
+                    update_inventory_table()
+
+                  refs["update_shopline_demand"] = refresh_shopline_demand_and_table
 
               # ---------------- 2.2：商品組合資訊（BOM） ----------------
               # 手冊 1.0.35 全文查過一遍，Items[Get] 只回傳「商品型態」
