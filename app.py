@@ -292,6 +292,43 @@ def compute_shopline_delivery_counts(orders, status_filter="all"):
   return counts
 
 
+def _normalize_product_name(name):
+  """去掉常見的裝飾符號（中括號、空白、常見全形/半形括號），方便做
+  品名關鍵字比對。這不是嚴謹的NLP正規化，只是去掉最常見會造成兩邊
+  名稱對不起來的雜訊字元。
+  """
+  import re
+  return re.sub(r"[【】\[\]()（）\s\-－_]", "", name or "")
+
+
+def match_product_name_to_item_id(product_name, items_map):
+  """用「品名關鍵字」猜這個商品名稱對應到哪個A1品號——SHOPLINE的SKU
+  常常跟A1的品號是兩邊各自獨立編的、對不起來，只能退而求其次改用
+  商品名稱猜。比對邏輯：正規化後，看兩邊名稱是不是互相包含（誰包含誰
+  都算，因為不確定哪邊的名稱比較完整）。
+
+  這是「猜」不是「查」，不保證100%正確——如果兩邊命名習慣差異很大，
+  可能猜不到，也可能猜錯（誤配到名稱相似但其實是不同商品的品號）。
+  長期來說建議改用一份「SKU對照表」取代這個函式，才能保證準確。
+
+  回傳第一個猜到的品號；找不到回傳None。
+  """
+  normalized_target = _normalize_product_name(product_name)
+  if not normalized_target:
+    return None
+  for item_id, info in items_map.items():
+    normalized_item_name = _normalize_product_name(info.get("Name", ""))
+    if not normalized_item_name:
+      continue
+    if (
+        normalized_item_name in normalized_target
+        or normalized_target in normalized_item_name
+    ):
+      return item_id
+  return None
+
+
+
 def compute_shopline_sku_rows(
     orders, status_filter="all", delivery_filter="all", keyword="",
     date_from="", date_to="",
@@ -4776,14 +4813,27 @@ def inventory_dashboard():
                   # 只抓一次快取起來，不要放進update_inventory_table()裡，
                   # 不然使用者每打一個篩選關鍵字都會重打一次SHOPLINE API，
                   # 既慢又浪費。只有初次進分頁跟按「同步」按鈕時才重抓。
-                  shopline_demand_state = {"by_sku": {}}
+                  #
+                  # 官網只賣「成品」「組合品61」這兩個分類的商品，其他分類
+                  # (原料等)不可能對應到官網訂單，配對候選品項跟鳳仁倉庫存
+                  # 基準都只在這兩個分類裡找，避免誤配到不相關分類。
+                  ALLOWED_CATEGORIES = {"(海濤客)_成品11", "(海濤客)_組合品61"}
+                  shopline_demand_state = {
+                      "by_sku": {}, "error": None, "count": 0,
+                      "unmatched": [], "skipped_combo": [],
+                  }
 
                   def load_shopline_demand():
                     creds = SHOPLINE_CHANNEL_CREDENTIALS.get(
                         ("興聖(股)公司", "官網(海濤客)")
                     )
-                    if not creds:
+                    if not creds or not creds[0] or not creds[1]:
                       shopline_demand_state["by_sku"] = {}
+                      shopline_demand_state["error"] = (
+                          "尚未設定 SHOPLINE_XINGSHENG_ACCESS_TOKEN /"
+                          " SHOPLINE_XINGSHENG_USER_AGENT"
+                      )
+                      print(f"[庫存查詢-官網需求] {shopline_demand_state['error']}")
                       return
                     access_token, user_agent = creds
                     created_after = (
@@ -4792,15 +4842,69 @@ def inventory_dashboard():
                     orders_raw, error = fetch_shopline_orders(
                         access_token, user_agent, SHOPLINE_ORDER_STATUSES, created_after,
                     )
-                    if error or not orders_raw:
+                    if error:
                       shopline_demand_state["by_sku"] = {}
+                      shopline_demand_state["error"] = f"抓取失敗：{error}"
+                      print(f"[庫存查詢-官網需求] {shopline_demand_state['error']}")
+                      return
+                    if not orders_raw:
+                      shopline_demand_state["by_sku"] = {}
+                      shopline_demand_state["error"] = None
+                      shopline_demand_state["count"] = 0
+                      print("[庫存查詢-官網需求] 抓取成功，但近3個月沒有待處理/已確認訂單")
                       return
                     demand_rows = compute_shopline_sku_rows(
                         orders_raw, status_filter="pending"
                     )
-                    shopline_demand_state["by_sku"] = {
-                        r["SKU"]: r["需求數量"] for r in demand_rows
+                    # SHOPLINE的SKU跟A1的品號是兩邊各自獨立編的、對不起來，
+                    # 改用「品名關鍵字」猜配對（見match_product_name_to_item_id
+                    # 的說明：這是用猜的，不保證100%準，長期建議改用SKU
+                    # 對照表取代）。同一個A1品號如果被猜配到好幾個SHOPLINE
+                    # 品項，需求數量會加總在一起。
+                    #
+                    # 兩個額外限制：
+                    # 1. A1候選品項只在「(海濤客)_成品11」「(海濤客)_組合品61」
+                    #    這兩個分類裡找（ALLOWED_CATEGORIES，跟鳳仁倉庫存
+                    #    基準共用同一份設定），因為官網只賣這兩類商品，其他
+                    #    分類(原料等)不可能是官網訂單對應到的品項，先篩掉
+                    #    可以避免誤配到不相關的分類。
+                    # 2. SHOPLINE商品名稱裡如果有「組合」兩個字，直接跳過
+                    #    不比對、不計入需求（不確定拆分方式，用猜的容易配
+                    #    錯，寧可不計也不要誤判）。
+                    items_map = app_state.get("items_map", {})
+                    candidate_items_map = {
+                        item_id: info
+                        for item_id, info in items_map.items()
+                        if info.get("CategoryName") in ALLOWED_CATEGORIES
                     }
+
+                    by_item_id = defaultdict(float)
+                    unmatched = []
+                    skipped_combo = []
+                    for r in demand_rows:
+                      if "組合" in r["商品"]:
+                        skipped_combo.append(r["商品"])
+                        continue
+                      item_id = match_product_name_to_item_id(
+                          r["商品"], candidate_items_map
+                      )
+                      if item_id:
+                        by_item_id[item_id] += r["需求數量"]
+                      else:
+                        unmatched.append(r["商品"])
+                    shopline_demand_state["by_sku"] = dict(by_item_id)
+                    shopline_demand_state["unmatched"] = unmatched
+                    shopline_demand_state["skipped_combo"] = skipped_combo
+                    shopline_demand_state["error"] = None
+                    shopline_demand_state["count"] = len(demand_rows)
+                    print(
+                        f"[庫存查詢-官網需求] 抓到 {len(orders_raw)} 筆訂單，"
+                        f"待處理品項彙總 {len(demand_rows)} 筆，其中"
+                        f"{len(skipped_combo)} 筆含「組合」已跳過，用品名"
+                        f"關鍵字（僅限成品/組合品61分類）猜配到"
+                        f" {len(by_item_id)} 個A1品號，猜不到的有"
+                        f" {len(unmatched)} 筆：{unmatched[:10]}"
+                    )
 
                   table_container = ui.column().classes("w-full")
 
@@ -4839,19 +4943,74 @@ def inventory_dashboard():
                         f"目前顯示 {len(df)} 列"
                     )
 
+                    # 「需補數量」的庫存基準固定用「食品廠鳳仁倉」（公司
+                    # 庫存），不是用列本身所在的倉庫——不然同一品號分散在
+                    # 好幾個倉庫時，每一列各自比對會不準。這裡從完整的
+                    # app_state["df"]（不是篩選後的df）重新加總鳳仁倉庫存，
+                    # 才不會受目前的倉庫/分類篩選影響。同時只考慮成品/
+                    # 組合品61這兩個分類（跟官網需求配對用的分類限制一致），
+                    # 因為官網只可能賣這兩類商品。
+                    full_df = app_state["df"]
+                    fengren_df = full_df[
+                        (full_df["倉庫名稱"] == "食品廠鳳仁倉")
+                        & (full_df["商品分類"].isin(ALLOWED_CATEGORIES))
+                    ]
+                    fengren_stock_by_item = dict(
+                        zip(fengren_df["品號"], fengren_df["庫存數量"])
+                    )
+
                     with table_container:
+                      if shopline_demand_state["error"]:
+                        with ui.row().classes(
+                            "w-full p-3 mb-3 bg-[#fdecea] border border-[#f5c2c0] rounded-lg"
+                        ):
+                          ui.label(
+                              f"「(官網海濤客)需求」抓取異常：{shopline_demand_state['error']}"
+                              "，目前該欄位會顯示0，需補數量可能不準確"
+                          ).classes("text-xs text-red-700")
+                      else:
+                        if shopline_demand_state["skipped_combo"]:
+                          with ui.row().classes(
+                              "w-full p-3 mb-2 bg-[#f0eef7] border border-[#d8d2ea] rounded-lg"
+                          ):
+                            ui.label(
+                                f"有 {len(shopline_demand_state['skipped_combo'])} 個"
+                                "商品名稱含「組合」，已自動跳過不計入需求：\n"
+                                + "、".join(shopline_demand_state["skipped_combo"][:15])
+                                + ("...等" if len(shopline_demand_state["skipped_combo"]) > 15 else "")
+                            ).classes("text-xs text-zinc-600").style(
+                                "white-space: pre-line"
+                            )
+                        if shopline_demand_state["unmatched"]:
+                          with ui.row().classes(
+                              "w-full p-3 mb-3 bg-[#fff8e6] border border-[#f0dca0] rounded-lg"
+                          ):
+                            ui.label(
+                                f"有 {len(shopline_demand_state['unmatched'])} 個"
+                                "SHOPLINE商品用品名關鍵字猜不到對應的A1品號"
+                                "（可能是命名差異太大，或不在成品/組合品61"
+                                "分類裡），這些商品的需求不會算進「需補"
+                                "數量」：\n"
+                                + "、".join(shopline_demand_state["unmatched"][:15])
+                                + ("...等" if len(shopline_demand_state["unmatched"]) > 15 else "")
+                            ).classes("text-xs text-amber-700").style(
+                                "white-space: pre-line"
+                            )
+
                       display_rows = df.to_dict("records")
                       demand_by_sku = shopline_demand_state["by_sku"]
                       for r in display_rows:
-                        stock_qty = ceil_qty(r.get("庫存數量"))
-                        r["庫存數量"] = stock_qty
+                        r["庫存數量"] = ceil_qty(r.get("庫存數量"))
+                        fengren_stock = ceil_qty(
+                            fengren_stock_by_item.get(r.get("品號"), 0)
+                        )
                         official_demand = demand_by_sku.get(r.get("品號"), 0)
                         r["(官網海濤客)需求"] = ceil_qty(official_demand)
                         r["(蝦皮海濤客)需求"] = "－"  # 尚未串接，先預留欄位
-                        # 需補數量＝庫存數量－官網海濤客需求－蝦皮海濤客需求
-                        # （蝦皮尚未串接，先當0算）；足夠的話不顯示負數，
-                        # 改顯示「庫存尚夠」，避免看起來像庫存短缺。
-                        shortfall = stock_qty - official_demand
+                        # 需補數量＝食品廠鳳仁倉庫存－官網海濤客需求－蝦皮
+                        # 海濤客需求（蝦皮尚未串接，先當0算）；足夠的話不
+                        # 顯示負數，改顯示「庫存尚夠」，避免看起來像短缺。
+                        shortfall = fengren_stock - official_demand
                         r["需補數量"] = (
                             "庫存尚夠" if shortfall >= 0 else ceil_qty(-shortfall)
                         )
@@ -4904,7 +5063,7 @@ def inventory_dashboard():
                               },
                               {
                                   "name": "需補數量",
-                                  "label": "需補數量",
+                                  "label": "需補數量(鳳仁倉)",
                                   "field": "需補數量",
                               },
                           ],
