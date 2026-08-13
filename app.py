@@ -1773,7 +1773,12 @@ def _fetch_google_sheet_records(tab_name, sheet_id=None):
   try:
     sh = gc.open_by_key(sheet_id)
     ws = sh.worksheet(tab_name)
-    return ws.get_all_records()
+    # numericise_ignore=['all']：gspread 預設會把「看起來像數字」的儲存格
+    # 內容自動轉成int/float，這個轉換是gspread套件自己做的後製處理，
+    # 跟Google Sheet儲存格本身是不是設成「純文字」無關——例如"0161151500001"
+    # 這種開頭有0的品號，會被轉成161151500001，開頭的0不見。全部欄位都
+    # 保留原始字串，不要自動轉型，交給各自的parse函式自己決定怎麼轉。
+    return ws.get_all_records(numericise_ignore=["all"])
   except Exception as e:
     print(f"讀取 Google Sheet「{tab_name}」分頁失敗：{e}")
     return []
@@ -1810,7 +1815,8 @@ def _fetch_google_sheet_records_verbose(tab_name, sheet_id=None, header_row=1):
   try:
     sh = gc.open_by_key(sheet_id)
     ws = sh.worksheet(tab_name)
-    records = ws.get_all_records(head=header_row)
+    # 同上：關掉gspread的自動數字轉換，避免開頭有0的品號被吃字。
+    records = ws.get_all_records(head=header_row, numericise_ignore=["all"])
     print(f"[Google Sheet「{tab_name}」] 讀取成功，共 {len(records)} 列")
     return records, None
   except Exception as e:
