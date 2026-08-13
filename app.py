@@ -2158,26 +2158,49 @@ def parse_production_schedule_grid(values):
 
 
 def load_bom_from_google_sheet():
-  """讀取 Google Sheet 版的「BOM表」分頁；None＝未設定，[]/dict＝已設定"""
-  records = _fetch_google_sheet_records(BOM_GOOGLE_SHEET_TAB)
+  """讀取 Google Sheet 版的「BOM表」分頁。回傳 (bom_map, error)。
+  bom_map=None 代表沒設定憑證/Sheet ID、或讀取時發生錯誤（用error分辨
+  是哪一種：error="not_configured"是前者，其他字串是後者的實際錯誤
+  訊息）；bom_map是dict代表成功（就算是空dict也算成功，例如分頁確實
+  還沒填任何一列資料）。
+  """
+  records, error = _fetch_google_sheet_records_verbose(BOM_GOOGLE_SHEET_TAB)
   if records is None:
-    return None
+    return None, error
   bom_map = _parse_bom_records(records)
   print(
       f"Google Sheet BOM表讀取完成：共 {len(bom_map)} 個主件品號、"
       f"{sum(len(v) for v in bom_map.values())} 筆子件關係"
   )
-  return bom_map
+  return bom_map, None
 
 
 def load_bom_data():
   """統一入口：優先讀 Google Sheets，沒設定時自動退回本機 Excel（過渡期
-  相容），回傳 (bom_map, 資料來源標籤)。
+  相容）。回傳 (bom_map, 資料來源標籤, error)。
+
+  error只在「有設定Google Sheets、也真的嘗試連線，但讀取失敗」時才有
+  值（例如分頁名稱打錯、服務帳號沒權限），讓畫面能直接顯示具體原因，
+  不用使用者自己去查Render Logs；如果是單純沒設定Google Sheets（退回
+  Excel是預期中的正常過渡行為），error會是None，不算錯誤。
   """
-  sheet_result = load_bom_from_google_sheet()
-  if sheet_result is not None:
-    return sheet_result, "Google Sheets"
-  return load_bom_from_excel(BOM_EXCEL_PATH), "本機 Excel（尚未設定 Google Sheets）"
+  bom_map, error = load_bom_from_google_sheet()
+  if bom_map is not None:
+    return bom_map, "Google Sheets", None
+  if error == "not_configured":
+    return (
+        load_bom_from_excel(BOM_EXCEL_PATH),
+        "本機 Excel（尚未設定 Google Sheets）",
+        None,
+    )
+  # 有設定，但讀取真的失敗了（分頁名稱打錯、服務帳號沒有這份試算表的
+  # 存取權限等）——不要靜靜地退回Excel把問題藏起來，把error往上傳，
+  # 讓畫面能顯示紅字提示，同時還是退回Excel資料讓功能至少能繼續用。
+  return (
+      load_bom_from_excel(BOM_EXCEL_PATH),
+      "本機 Excel（Google Sheets讀取失敗，暫時退回Excel）",
+      error,
+  )
 
 
 # ---- 海濤客品號對應（Google Sheet，SKU→A1品號 對照表） ----
@@ -2412,7 +2435,12 @@ def load_orders_from_google_sheet():
   configured=False 代表 Google Sheets 根本沒設定；這種情況下畫面要顯示
   「請先設定 Google Sheets」而不是「目前沒有訂單」，兩種情況給使用者的
   訊息應該不一樣。
+
+  目前先停用（使用者已把Google Sheet裡的「訂單資訊」分頁刪掉，不需要
+  再讀）：直接回傳空資料+未設定，不會真的打Google Sheets API。之後如果
+  要恢復，把下面這行return拿掉即可，不用改其他呼叫端的程式碼。
   """
+  return [], False
   records = _fetch_google_sheet_records(ORDERS_GOOGLE_SHEET_TAB)
   if records is None:
     return [], False
@@ -2450,7 +2478,14 @@ def _parse_sales_history_records(records):
 
 
 def load_sales_history_from_google_sheet():
-  """讀取「銷售歷史」分頁。回傳 (sales_rows, configured)，意義同上。"""
+  """讀取「銷售歷史」分頁。回傳 (sales_rows, configured)，意義同上。
+
+  目前先停用（使用者已把Google Sheet裡的「銷售歷史」分頁刪掉，不需要
+  再讀；銷售歷史改用5.3「手動從A1抓取」的結果即可）：直接回傳空資料+
+  未設定，不會真的打Google Sheets API。之後如果要恢復，把下面這行
+  return拿掉即可。
+  """
+  return [], False
   records = _fetch_google_sheet_records(SALES_HISTORY_GOOGLE_SHEET_TAB)
   if records is None:
     return [], False
@@ -2504,7 +2539,13 @@ def _parse_receiving_records(records):
 
 
 def load_receivings_from_google_sheet():
-  """讀取「進貨明細」分頁。回傳 (receivings, configured)，意義同訂單資訊。"""
+  """讀取「進貨明細」分頁。回傳 (receivings, configured)，意義同訂單資訊。
+
+  目前先停用（使用者已把Google Sheet裡的「進貨明細」分頁刪掉，不需要
+  再讀）：直接回傳空資料+未設定，不會真的打Google Sheets API。之後如果
+  要恢復，把下面這行return拿掉即可。
+  """
+  return [], False
   records = _fetch_google_sheet_records(RECEIVING_GOOGLE_SHEET_TAB)
   if records is None:
     return [], False
@@ -2560,7 +2601,13 @@ def _parse_channel_sales_records(records):
 
 
 def load_channel_sales_from_google_sheet():
-  """讀取「通路銷售明細」分頁。回傳 (rows, configured)。"""
+  """讀取「通路銷售明細」分頁。回傳 (rows, configured)。
+
+  目前先停用（使用者已把Google Sheet裡的「通路銷售明細」分頁刪掉，不
+  需要再讀）：直接回傳空資料+未設定，不會真的打Google Sheets API。之後
+  如果要恢復，把下面這行return拿掉即可。
+  """
+  return [], False
   records = _fetch_google_sheet_records(CHANNEL_SALES_GOOGLE_SHEET_TAB)
   if records is None:
     return [], False
@@ -4035,7 +4082,7 @@ LOGO_PATH = os.path.join(STATIC_DIR, "logo.png")
 
 # 初始化全域狀態
 initial_df, initial_whs, initial_cats, initial_items_map, initial_customers_map, initial_suppliers_map = fetch_all_a1_inventory()
-initial_bom_map, initial_bom_source = load_bom_data()
+initial_bom_map, initial_bom_source, initial_bom_error = load_bom_data()
 initial_orders, initial_orders_configured = load_orders_from_google_sheet()
 initial_sales_history, initial_sales_configured = load_sales_history_from_google_sheet()
 initial_receivings, initial_receivings_configured = load_receivings_from_google_sheet()
@@ -4047,6 +4094,7 @@ app_state = {
     "suppliers_map": initial_suppliers_map,
     "bom_map": initial_bom_map,
     "bom_source": initial_bom_source,
+    "bom_error": initial_bom_error,
     "orders": initial_orders,
     "orders_configured": initial_orders_configured,
     "sales_history": initial_sales_history,
@@ -4566,7 +4614,7 @@ def inventory_dashboard():
           # 就能拿到最新的庫存 + BOM + 訂單 + 銷售歷史，不用分開點好幾個
           # 「重新載入」按鈕（若銷售歷史目前是用「5.3 手動從 A1 抓取」的
           # 結果，這裡就不覆蓋回 Sheets，避免白抓一次又被蓋掉）
-          app_state["bom_map"], app_state["bom_source"] = load_bom_data()
+          app_state["bom_map"], app_state["bom_source"], app_state["bom_error"] = load_bom_data()
           app_state["orders"], app_state["orders_configured"] = (
               load_orders_from_google_sheet()
           )
@@ -4640,7 +4688,7 @@ def inventory_dashboard():
         """
         sync_time = datetime.now()
         try:
-          app_state["bom_map"], app_state["bom_source"] = load_bom_data()
+          app_state["bom_map"], app_state["bom_source"], app_state["bom_error"] = load_bom_data()
           app_state["orders"], app_state["orders_configured"] = (
               load_orders_from_google_sheet()
           )
@@ -5454,6 +5502,7 @@ def inventory_dashboard():
                   bom_source_badge = ui.label().classes(
                       "text-xs font-bold mb-2"
                   )
+                  bom_error_container = ui.column().classes("w-full mb-2")
 
                   with ui.row().classes(
                       "w-full items-center gap-3 flex-wrap mb-4 p-3"
@@ -5461,7 +5510,7 @@ def inventory_dashboard():
                   ):
 
                     def handle_reload_bom():
-                      app_state["bom_map"], app_state["bom_source"] = (
+                      app_state["bom_map"], app_state["bom_source"], app_state["bom_error"] = (
                           load_bom_data()
                       )
                       ui.notify(
@@ -5518,6 +5567,21 @@ def inventory_dashboard():
                     bom_source_badge.text = (
                         f"目前資料來源：{app_state.get('bom_source', '未知')}"
                     )
+
+                    bom_error_container.clear()
+                    bom_error = app_state.get("bom_error")
+                    if bom_error:
+                      with bom_error_container:
+                        with ui.row().classes(
+                            "w-full p-3 bg-[#fdecea] border border-[#f5c2c0] rounded-lg"
+                        ):
+                          ui.label(
+                              f"讀取「{BOM_GOOGLE_SHEET_TAB}」分頁失敗：{bom_error}"
+                              "（常見原因：分頁名稱跟環境變數"
+                              "BOM_GOOGLE_SHEET_TAB設定的不一致、服務帳號沒有"
+                              "這份試算表的存取權限。下面暫時顯示的是本機"
+                              "Excel的舊資料，不是最新的Google Sheet內容）"
+                          ).classes("text-xs text-red-700")
 
                     keyword = (combo_search_input.value or "").strip().lower()
 
@@ -7908,22 +7972,10 @@ def inventory_dashboard():
                   ).classes("text-xs text-zinc-600")
                   for label, tab_name, source_state in (
                       ("BOM表", BOM_GOOGLE_SHEET_TAB, app_state.get("bom_source")),
-                      (
-                          "訂單資訊", ORDERS_GOOGLE_SHEET_TAB,
-                          "Google Sheets" if app_state.get("orders_configured") else "尚未設定",
-                      ),
-                      (
-                          "銷售歷史", SALES_HISTORY_GOOGLE_SHEET_TAB,
-                          app_state.get("sales_history_source", "尚未設定"),
-                      ),
-                      (
-                          "進貨明細", RECEIVING_GOOGLE_SHEET_TAB,
-                          "Google Sheets" if app_state.get("receivings_configured") else "尚未設定",
-                      ),
-                      (
-                          "通路銷售明細", CHANNEL_SALES_GOOGLE_SHEET_TAB,
-                          "Google Sheets" if app_state.get("channel_sales_configured") else "尚未設定",
-                      ),
+                      ("訂單資訊", ORDERS_GOOGLE_SHEET_TAB, "已停用（分頁已刪除，不讀取）"),
+                      ("銷售歷史", SALES_HISTORY_GOOGLE_SHEET_TAB, "已停用（分頁已刪除，不讀取；改用5.3手動從A1抓取）"),
+                      ("進貨明細", RECEIVING_GOOGLE_SHEET_TAB, "已停用（分頁已刪除，不讀取）"),
+                      ("通路銷售明細", CHANNEL_SALES_GOOGLE_SHEET_TAB, "已停用（分頁已刪除，不讀取）"),
                       (
                           "海濤客品號對應", HAITAOKE_SKU_MAP_GOOGLE_SHEET_TAB,
                           "Google Sheets（開啟庫存查詢分頁時即時查詢，"
