@@ -256,6 +256,52 @@ def fetch_shopline_orders(access_token, user_agent, statuses, created_after):
     return None, str(e)
 
 
+# ---- SHOPLINE 訂單快取（避免「切換分頁」就自動重打一次API，很慢）----
+# key: (公司, 通路標籤)，例如("興聖(股)公司","官網(海濤客)")；value:
+# {"orders": [...], "updated_at": "YYYY-MM-DD HH:MM:SS"}（台灣時間）。
+# 只有「這個key第一次被讀取」或使用者按「重新整理」才會真的打SHOPLINE
+# API；純粹切換公司分頁／通路分頁／庫存查詢分頁，一律直接讀這份快取，
+# 不會自動重抓。伺服器重啟（含Render睡眠喚醒）快取會清空，之後第一次
+# 讀取才會再打一次API，這是預期行為。
+SHOPLINE_ORDERS_CACHE = {}
+
+
+def _shopline_created_after():
+  return (
+      datetime.utcnow() - timedelta(days=SHOPLINE_LOOKBACK_DAYS)
+  ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def get_cached_shopline_orders(cache_key, access_token, user_agent):
+  """有快取就直接回傳快取內容，不打API；沒有快取（伺服器剛啟動、或
+  這個通路第一次被讀取）才真的打一次API，並存進快取。
+  回傳 (orders, error, updated_at)；error不為None時orders是None。
+  """
+  cached = SHOPLINE_ORDERS_CACHE.get(cache_key)
+  if cached is not None:
+    return cached["orders"], None, cached["updated_at"]
+  orders, error = fetch_shopline_orders(
+      access_token, user_agent, SHOPLINE_ORDER_STATUSES, _shopline_created_after(),
+  )
+  updated_at = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+  if not error:
+    SHOPLINE_ORDERS_CACHE[cache_key] = {"orders": orders or [], "updated_at": updated_at}
+  return orders, error, updated_at
+
+
+def refresh_shopline_orders_cache(cache_key, access_token, user_agent):
+  """強制重新打一次SHOPLINE API（給「重新整理」按鈕、或使用者主動觸發
+  的同步用），成功的話覆蓋掉快取。回傳 (orders, error, updated_at)。
+  """
+  orders, error = fetch_shopline_orders(
+      access_token, user_agent, SHOPLINE_ORDER_STATUSES, _shopline_created_after(),
+  )
+  updated_at = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+  if not error:
+    SHOPLINE_ORDERS_CACHE[cache_key] = {"orders": orders or [], "updated_at": updated_at}
+  return orders, error, updated_at
+
+
 def compute_shopline_stats(orders):
   """算總覽統計：待處理/已確認筆數（全部訂單，不受篩選影響），以及全部
   送貨方式名單（用來讓下拉選單的選項順序/項目固定，不會因為篩選而忽多
@@ -3120,7 +3166,9 @@ async def render_shopline_product_changes(company_name):
   render_results()
 
 
-async def render_shopline_channel(access_token, user_agent, channel_title, restock_target=None):
+async def render_shopline_channel(
+    access_token, user_agent, channel_title, restock_target=None, cache_key=None,
+):
   """SHOPLINE官網訂單通路的共用畫面（興聖官網(海濤客)／官網(JDH)／
   芙萊柏官網-B'f 都呼叫這支，只是傳入的access_token/user_agent/標題不同）。
   抓近3個月「待處理」+「已確認」訂單，畫面：
@@ -3130,28 +3178,40 @@ async def render_shopline_channel(access_token, user_agent, channel_title, resto
     2. 商品需求彙總表：依目前篩選條件即時算出的SKU加總結果，商品名稱
        欄位可排序，右下角可切換每頁顯示筆數(10/30/50/全部)，不用一直
        往下滑。所有篩選都是在「已經抓好的資料」裡做，不會重打API。
-  每次「切換到這個分頁」都會重新打一次API抓最新資料；分頁內也有「重新
-  整理」按鈕，不用離開分頁再切回來也能手動重抓一次。
+  改用 SHOPLINE_ORDERS_CACHE 快取：只有這個 cache_key 第一次被讀取（例如
+  服務剛啟動、或這個通路第一次被打開）才會真的打API，之後「切換分頁」
+  一律直接讀快取，不會自動重抓，避免每次切換都卡在等API回應。要看最新
+  資料，用分頁內的「重新整理」按鈕手動觸發。
 
   restock_target：這個通路的商品要向誰請備貨/採購，會顯示在商品需求
   彙總的標題裡（不同通路賣的商品可能來自不同工廠/公司，備貨對象不一定
   跟通路本身掛在哪個公司頁籤一樣）。沒傳的話預設用channel_title。
 
+  cache_key：SHOPLINE_ORDERS_CACHE的key，建議傳(公司, 通路標籤)這種
+  組合，確保不同公司/通路各自快取，不會互相覆蓋。沒傳的話退回用
+  channel_title本身當key（單一通路頁面可以這樣簡化呼叫）。
+
   這支是async函式，實際打API的地方都用 run.io_bound() 包起來，讓抓資料
   這段「同步阻塞」的過程丟到背景執行緒跑，不會卡住整個伺服器的事件
-  迴圈──不然一個人切到這個分頁在等API回應時，全部人的畫面都會跟著
-  卡住沒反應。
+  迴圈──不然一個人在等API回應時，全部人的畫面都會跟著卡住沒反應。
   """
   restock_target = restock_target or channel_title
+  cache_key = cache_key or channel_title
+
   def fetch_data():
-    created_after = (
-        datetime.utcnow() - timedelta(days=SHOPLINE_LOOKBACK_DAYS)
-    ).strftime("%Y-%m-%d %H:%M:%S")
     return fetch_shopline_orders(
-        access_token, user_agent, SHOPLINE_ORDER_STATUSES, created_after,
+        access_token, user_agent, SHOPLINE_ORDER_STATUSES, _shopline_created_after(),
     )
 
-  orders, error = await run.io_bound(fetch_data)
+  cached = SHOPLINE_ORDERS_CACHE.get(cache_key)
+  if cached is not None:
+    orders, error, last_updated = cached["orders"], None, cached["updated_at"]
+  else:
+    orders, error = await run.io_bound(fetch_data)
+    last_updated = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+    if not error:
+      SHOPLINE_ORDERS_CACHE[cache_key] = {"orders": orders or [], "updated_at": last_updated}
+
   if error:
     render_section_placeholder(f"訂單出貨－{channel_title}", f"抓取失敗：{error}")
     return
@@ -3162,7 +3222,6 @@ async def render_shopline_channel(access_token, user_agent, channel_title, resto
     return
 
   stats = compute_shopline_stats(orders)
-  last_updated = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
   state = {
       "status_filter": "all", "delivery_filter": "all", "keyword": "",
       "date_from": "", "date_to": "",
@@ -3175,7 +3234,10 @@ async def render_shopline_channel(access_token, user_agent, channel_title, resto
     nonlocal last_updated
     refresh_row.clear()
     with refresh_row:
-      ui.label(f"資料更新時間：{last_updated}").classes("text-xs text-zinc-400")
+      ui.label(f"資料更新時間：{last_updated}（切換分頁不會自動重抓，"
+                "此為快取資料，按右側按鈕可手動更新）").classes(
+          "text-xs text-zinc-400"
+      )
 
       async def handle_refresh():
         nonlocal orders, stats, last_updated
@@ -3186,6 +3248,7 @@ async def render_shopline_channel(access_token, user_agent, channel_title, resto
         orders = new_orders or []
         stats = compute_shopline_stats(orders)
         last_updated = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+        SHOPLINE_ORDERS_CACHE[cache_key] = {"orders": orders, "updated_at": last_updated}
         render_refresh_row()
         render_toolbar()
         refresh_results()
@@ -3552,7 +3615,8 @@ def render_order_channels_tabs(company_name):
     with channel_body:
       if shopline_creds:
         await render_shopline_channel(
-            shopline_creds[0], shopline_creds[1], ch, restock_target
+            shopline_creds[0], shopline_creds[1], ch, restock_target,
+            cache_key=(company_name, ch),
         )
       else:
         render_section_placeholder(
@@ -4869,9 +4933,20 @@ def inventory_dashboard():
                       "unmatched": [], "skipped_combo": [],
                   }
 
-                  def load_shopline_demand():
+                  HAI_TAO_KE_SHOPLINE_CACHE_KEY = ("興聖(股)公司", "官網(海濤客)")
+
+                  def load_shopline_demand(force_refresh=False):
+                    """force_refresh=False（預設，頁面初次載入/切換分頁時
+                    用）：有快取就直接用快取，不打SHOPLINE API；沒快取
+                    （伺服器剛啟動後第一次讀取）才會真的打一次。
+                    force_refresh=True（使用者按「同步」按鈕時用）：一定
+                    強制重打API取得最新資料，並覆蓋快取。
+                    這份快取跟「雲端電商訂單」App裡興聖／官網(海濤客)通路
+                    共用同一個key，兩邊只要有一邊先讀過，另一邊就不用
+                    再重打一次API。
+                    """
                     creds = SHOPLINE_CHANNEL_CREDENTIALS.get(
-                        ("興聖(股)公司", "官網(海濤客)")
+                        HAI_TAO_KE_SHOPLINE_CACHE_KEY
                     )
                     if not creds or not creds[0] or not creds[1]:
                       shopline_demand_state["by_sku"] = {}
@@ -4882,12 +4957,14 @@ def inventory_dashboard():
                       print(f"[庫存查詢-官網需求] {shopline_demand_state['error']}")
                       return
                     access_token, user_agent = creds
-                    created_after = (
-                        datetime.utcnow() - timedelta(days=SHOPLINE_LOOKBACK_DAYS)
-                    ).strftime("%Y-%m-%d %H:%M:%S")
-                    orders_raw, error = fetch_shopline_orders(
-                        access_token, user_agent, SHOPLINE_ORDER_STATUSES, created_after,
-                    )
+                    if force_refresh:
+                      orders_raw, error, _ = refresh_shopline_orders_cache(
+                          HAI_TAO_KE_SHOPLINE_CACHE_KEY, access_token, user_agent,
+                      )
+                    else:
+                      orders_raw, error, _ = get_cached_shopline_orders(
+                          HAI_TAO_KE_SHOPLINE_CACHE_KEY, access_token, user_agent,
+                      )
                     if error:
                       shopline_demand_state["by_sku"] = {}
                       shopline_demand_state["error"] = f"抓取失敗：{error}"
@@ -5142,7 +5219,7 @@ def inventory_dashboard():
                   refs["update_inventory_table"] = update_inventory_table
 
                   def refresh_shopline_demand_and_table():
-                    load_shopline_demand()
+                    load_shopline_demand(force_refresh=True)
                     update_inventory_table()
 
                   refs["update_shopline_demand"] = refresh_shopline_demand_and_table
