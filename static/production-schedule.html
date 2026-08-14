@@ -1,0 +1,733 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>生產排程控制盤</title>
+<style>
+  :root{
+    --bg:#F6F4EE;
+    --panel:#FFFFFF;
+    --ink:#23262B;
+    --ink-soft:#767A82;
+    --line:#DEDACE;
+    --amber:#D9922E;
+    --amber-bg:#FBEBD3;
+    --green:#5E9179;
+    --green-bg:#DDEEE5;
+    --coral:#C85A3C;
+    --coral-bg:#F7E1D9;
+    --navy:#22303F;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0;
+    background:var(--bg);
+    color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,"PingFang TC","Microsoft JhengHei",sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}
+
+  header.top{
+    background:var(--navy);
+    color:#F3EFE4;
+    padding:18px 22px 16px;
+    position:sticky; top:0; z-index:30;
+  }
+  header.top h1{
+    margin:0 0 2px;
+    font-size:20px;
+    letter-spacing:.06em;
+    font-weight:800;
+  }
+  header.top .sub{
+    font-size:12px;
+    color:#B9C2CC;
+    letter-spacing:.04em;
+  }
+  .save-indicator{
+    position:absolute; right:22px; top:20px;
+    font-size:11px; color:#9FB0AD;
+  }
+
+  main{ padding:18px 16px 60px; max-width:1400px; margin:0 auto;}
+
+  .toolbar{
+    display:flex; flex-wrap:wrap; gap:8px; margin-bottom:14px;
+  }
+  button{
+    font:inherit; cursor:pointer; border:1px solid var(--line);
+    background:var(--panel); color:var(--ink);
+    padding:7px 12px; border-radius:6px; font-size:12.5px;
+    transition:all .12s ease;
+  }
+  button:hover{ border-color:var(--navy); }
+  button.primary{ background:var(--navy); color:#fff; border-color:var(--navy);}
+  button.primary:hover{ opacity:.88; }
+  button.ghost{ background:transparent; }
+  button.danger:hover{ border-color:var(--coral); color:var(--coral); }
+
+  section.panel{
+    background:var(--panel);
+    border:1px solid var(--line);
+    border-radius:10px;
+    padding:16px;
+    margin-bottom:18px;
+  }
+  section.panel > h2{
+    margin:0 0 12px;
+    font-size:14px;
+    letter-spacing:.05em;
+    text-transform:uppercase;
+    color:var(--ink-soft);
+    display:flex; align-items:center; gap:8px;
+  }
+
+  /* ---- grid table ---- */
+  .table-scroll{ overflow-x:auto; border:1px solid var(--line); border-radius:8px;}
+  table{ border-collapse:collapse; width:100%; min-width:760px;}
+  th,td{ border:1px solid var(--line); padding:0; text-align:center; vertical-align:middle;}
+  thead th{
+    background:#EFEAE0; font-size:12.5px; padding:8px 6px;
+    position:sticky; top:0; z-index:5; white-space:nowrap;
+  }
+  thead th .month-head{ display:flex; align-items:center; justify-content:center; gap:4px;}
+  thead th input.month-label{
+    width:52px; text-align:center; border:none; background:transparent;
+    font-weight:700; font-size:13px; color:var(--ink);
+  }
+  .archive-toggle{
+    margin-top:5px; font-size:10px; border:1px solid var(--line); background:#fff;
+    border-radius:10px; padding:2px 8px; cursor:pointer; color:var(--ink-soft); white-space:nowrap;
+  }
+  .archive-toggle:hover{ border-color:var(--navy); }
+  .archive-toggle.is-hidden{ background:var(--amber-bg); color:var(--amber); border-color:var(--amber);}
+  .archive-toggle.is-forced{ background:var(--coral-bg); color:var(--coral); border-color:var(--coral);}
+
+  th.sticky-col, td.sticky-col{
+    position:sticky; left:0; background:#EFEAE0; z-index:6;
+    min-width:120px; text-align:left; padding:6px 8px;
+  }
+  tbody td.sticky-col{ background:#FAF8F3; z-index:4;}
+  .rm-btn{
+    border:none; background:none; color:var(--ink-soft); cursor:pointer;
+    font-size:13px; padding:0 2px;
+  }
+  .rm-btn:hover{ color:var(--coral); }
+
+  .prod-name{
+    border:none; background:transparent; font-weight:600; font-size:13px;
+    width:78px; color:var(--ink);
+  }
+  .prod-row-inner{ display:flex; align-items:center; justify-content:space-between; gap:4px;}
+
+  .cell{
+    display:flex; flex-direction:column; gap:2px; padding:5px 4px;
+    min-width:88px; position:relative;
+  }
+  .cell.has-qty{ background:var(--amber-bg); }
+  .cell.is-new{ outline:2px solid var(--amber); outline-offset:-2px; }
+  .cell input{
+    border:1px solid transparent; background:#fff; border-radius:4px;
+    font-size:12px; text-align:center; padding:3px 2px; width:100%;
+  }
+  .cell input.qty-input{ font-weight:700; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
+  .cell input:focus{ border-color:var(--navy); outline:none;}
+  .cell .flag-toggle{
+    position:absolute; top:2px; right:2px; border:none; background:none;
+    font-size:11px; color:#C9BEA4; cursor:pointer; line-height:1; padding:1px;
+  }
+  .cell.is-new .flag-toggle{ color:var(--amber); }
+
+  tfoot td{ font-size:12.5px; }
+  tr.total-row td{ background:var(--green-bg); font-weight:700; padding:8px 4px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
+  tr.total-row td.sticky-col{ background:var(--green-bg); font-family:inherit; }
+  tr.material-row td{ padding:6px 4px; }
+  tr.material-row td.sticky-col{ background:#FAF8F3; }
+  tr.material-row input{
+    width:90%; border:1px solid var(--line); border-radius:4px;
+    text-align:center; font-size:12px; padding:4px 2px;
+  }
+  .note-strip{ font-size:11.5px; color:var(--coral); margin-top:8px;}
+
+  /* ---- timeline ---- */
+  .timeline{ list-style:none; margin:0; padding:0; }
+  .timeline li{
+    display:flex; gap:14px; position:relative; padding:0 0 20px 6px;
+  }
+  .timeline li:last-child{ padding-bottom:2px; }
+  .timeline .dot-col{ display:flex; flex-direction:column; align-items:center; width:14px;}
+  .timeline .dot{ width:12px; height:12px; border-radius:50%; flex:none; margin-top:3px;}
+  .timeline .bar{ flex:1; width:2px; background:var(--line); margin-top:2px;}
+  .timeline li:last-child .bar{ display:none; }
+  .dot.material{ background:var(--amber); }
+  .dot.ship{ background:var(--coral); }
+  .tl-body{ flex:1; }
+  .tl-date{ font-size:11px; color:var(--ink-soft); letter-spacing:.03em;}
+  .tl-label{ font-size:14px; font-weight:700; margin:1px 0 2px;}
+  .tl-label.material{ color:var(--amber); }
+  .tl-label.ship{ color:var(--coral); }
+  .tl-qty{ font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-weight:800; font-size:15px;}
+  .tl-detail{ font-size:11.5px; color:var(--ink-soft); margin-top:2px; line-height:1.5;}
+  .tl-empty{ color:var(--ink-soft); font-size:13px; padding:6px 0;}
+
+  .stat-strip{ display:flex; gap:10px; flex-wrap:wrap; margin-bottom:16px;}
+  .stat{
+    background:var(--panel); border:1px solid var(--line); border-radius:8px;
+    padding:10px 16px; min-width:120px;
+  }
+  .stat .num{ font-size:20px; font-weight:800; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
+  .stat .lbl{ font-size:11px; color:var(--ink-soft); letter-spacing:.03em;}
+
+  /* ---- logs ---- */
+  .log-list{ list-style:none; margin:0; padding:0; }
+  .log-list li{
+    display:flex; justify-content:space-between; gap:8px; align-items:flex-start;
+    padding:7px 0; border-bottom:1px dashed var(--line); font-size:13px;
+  }
+  .log-list li:last-child{ border-bottom:none; }
+  .log-list .log-date{ font-size:10.5px; color:var(--ink-soft); display:block; margin-top:2px;}
+  .log-del{ border:none; background:none; color:var(--ink-soft); cursor:pointer; font-size:12px;}
+  .log-del:hover{ color:var(--coral); }
+  .log-add{ display:flex; gap:6px; margin-top:10px;}
+  .log-add input{
+    flex:1; padding:7px 9px; border:1px solid var(--line); border-radius:6px; font-size:13px;
+  }
+
+  @media (max-width:640px){
+    header.top{ padding:14px 14px 12px;}
+    .save-indicator{ position:static; display:block; margin-top:4px;}
+    main{ padding:12px 10px 40px;}
+  }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <h1 id="pageTitle">生產排程控制盤</h1>
+  <div class="sub">品項 × 月份排程 · 包材到廠與出貨時程自動彙整</div>
+  <div class="save-indicator" id="saveIndicator">載入中…</div>
+</header>
+
+<main>
+
+  <div class="stat-strip" id="statStrip"></div>
+
+  <section class="panel">
+    <h2>⏱ 預計時程（自動產生）</h2>
+    <ul class="timeline" id="timeline"></ul>
+  </section>
+
+  <section class="panel">
+    <h2>📋 排程總表</h2>
+    <div class="toolbar">
+      <button class="primary" id="addProductBtn">＋ 新增品項</button>
+      <button id="addMonthBtn">＋ 新增月份</button>
+      <button id="toggleCompletedBtn">顯示已結束月份</button>
+      <button class="ghost" id="exportBtn">匯出備份 (JSON)</button>
+      <button class="ghost danger" id="resetBtn">重置為範例資料</button>
+    </div>
+    <div class="table-scroll">
+      <table id="mainTable"></table>
+    </div>
+    <div class="note-strip">交期＝工廠預計出貨日／填裝日；每格上方數字為數量，可用「+」表示多筆加訂（例如 3000+2000）；點格子右上角 ✦ 可標記為新增訂單。月份會依系統日期自動隱藏已過的月份，也可點月份標籤下方按鈕手動切換「自動／封存／強制顯示」。</div>
+  </section>
+
+  <section class="panel">
+    <h2>📝 異動記錄</h2>
+    <ul class="log-list" id="logList"></ul>
+    <div class="log-add">
+      <input type="text" id="logInput" placeholder="輸入異動內容，例如：7/20 追加 B1 2000">
+      <button class="primary" id="logAddBtn">新增</button>
+    </div>
+  </section>
+
+</main>
+
+<script>
+// 這份頁面被多間公司的「生產排程」分頁用iframe嵌入，用網址參數
+// ?company=xxx 分辨是哪一間，各自存到後端各自的JSON檔案，不會互相
+// 蓋掉。company沒帶或帶到不認識的值時，退回一個獨立的demo資料存放
+// 位置，不會不小心存進任何一間公司的正式資料裡。
+const COMPANY_LABELS = {
+  hai_tao_ke: '海濤客食品工業(股)公司',
+  rong_hong: '容鴻(股)公司',
+  fu_lai_bo: '芙萊柏(股)公司',
+};
+const urlParams = new URLSearchParams(window.location.search);
+const rawCompanyParam = urlParams.get('company');
+const COMPANY_KEY = COMPANY_LABELS[rawCompanyParam] ? rawCompanyParam : null;
+let saveTimer = null;
+
+function monthId(y,m){ return 'y'+y+String(m).padStart(2,'0'); }
+
+function defaultState(){
+  const months = [];
+  for(let m=6;m<=12;m++) months.push({id:monthId(2026,m), label:'2026/'+m+'月'});
+  for(let m=1;m<=12;m++) months.push({id:monthId(2027,m), label:'2027/'+m+'月'});
+
+  const products = ['B1','B2','B3','W1','W2','W3','W4','W5','F2','M1','O1','SS']
+    .map(n=>({id:n.toLowerCase(), name:n}));
+
+  const cells = {};
+  const set = (p,y,m,qty,date,isNew)=>{ cells[p.toLowerCase()+'_'+monthId(y,m)] = {qty:String(qty), date:date||'', new:!!isNew}; };
+
+  set('B1',2026,6,2000); set('B2',2026,6,2000); set('W5',2026,6,1000);
+  set('F2',2026,6,2000); set('M1',2026,6,2000); set('O1',2026,6,1000); set('SS',2026,6,1000);
+
+  set('B3',2026,7,2000); set('W2',2026,7,1000); set('W3',2026,7,2000); set('O1',2026,7,1000); set('SS',2026,7,2000);
+
+  set('B1',2026,8,3000,'2026/8/17'); set('B2',2026,8,3000,'2026/8/17'); set('W1',2026,8,3000,'2026/8/17');
+  set('W4',2026,8,2000,'2026/8/17'); set('F2',2026,8,3000,'2026/8/17'); set('M1',2026,8,3000,'2026/8/17'); set('O1',2026,8,3000,'2026/8/17');
+
+  set('B3',2026,9,'3000+2000','9月18日'); set('W2',2026,9,3000,'9月18日'); set('W3',2026,9,'3000+3000','9月18日');
+  set('W5',2026,9,2000,'9月18日'); set('SS',2026,9,'3000+3000','9月18日');
+
+  set('B1',2026,10,3000,'2026/10/14'); set('B2',2026,10,'3000+3000','2026/10/14'); set('W1',2026,10,'3000+3000','2026/10/14');
+  set('W4',2026,10,2000,'2026/10/14'); set('F2',2026,10,3000,'2026/10/14'); set('M1',2026,10,3000,'2026/10/14'); set('O1',2026,10,3000,'2026/10/14');
+
+  set('B1',2026,11,3000,'2026/11/13'); set('B3',2026,11,3000,'2026/11/13',true); set('W2',2026,11,'3000+3000','2026/11/13',true);
+  set('W5',2026,11,3000,'2026/11/13',true); set('F2',2026,11,'3000+3000','2026/11/13',true);
+  set('M1',2026,11,'3000+3000','2026/11/13',true); set('O1',2026,11,'3000+3000','2026/11/13',true);
+
+  set('B2',2026,12,3000,'2026/12/8',true); set('W1',2026,12,3000,'2026/12/8',true);
+  set('W3',2026,12,3000,'2026/12/8',true); set('W4',2026,12,3000,'2026/12/8',true);
+
+  const materialArrival = {};
+  materialArrival[monthId(2026,8)] = '2026/7/30';
+  materialArrival[monthId(2026,9)] = '2026/8/27';
+  materialArrival[monthId(2026,10)] = '2026/9/18';
+  materialArrival[monthId(2026,11)] = '2026/10/16';
+  materialArrival[monthId(2026,12)] = '2026/11/20';
+
+  const logs = [
+    '7月份追加 SS 2000',
+    '7/8 追加 O1 3000',
+    '7/13 追加 W2 3000',
+    '7/15 追加 W3 3000',
+    '7/16 追加 B3、W2、W4、W5 各3000',
+    '原12月生產的 O1 改到11月生產，再增加12月訂單'
+  ];
+
+  return { products, months, cells, materialArrival, logs, showCompleted:false };
+}
+
+let state = defaultState();
+
+/* ---------------- storage ----------------
+   原本用Artifacts環境專屬的window.storage，搬進系統後改成打後端這兩支
+   API（見app.py的 /api/production-schedule/{company_key}），存成伺服器
+   上的JSON檔案。同一個company_key（同一間公司）不管誰打開這個頁面，
+   看到的都是同一份資料（不是各自瀏覽器分開存），存檔會互相蓋掉最新的
+   ——多人同時編輯同一間公司的排程表時要注意這點。
+*/
+async function loadState(){
+  const ind = document.getElementById('saveIndicator');
+  const titleEl = document.getElementById('pageTitle');
+  if(!COMPANY_KEY){
+    titleEl.textContent = '生產排程控制盤（網址缺少 ?company= 參數）';
+    ind.textContent = '未指定公司，僅本機暫存，不會存檔';
+    renderAll();
+    return;
+  }
+  titleEl.textContent = '生產排程控制盤－' + COMPANY_LABELS[COMPANY_KEY];
+  try{
+    const res = await fetch('/api/production-schedule/' + COMPANY_KEY);
+    const data = await res.json();
+    if(data && data.value){
+      const parsed = JSON.parse(data.value);
+      if(parsed && parsed.products && parsed.months){
+        state = parsed;
+      }
+    }
+    ind.textContent = '已同步伺服器';
+  }catch(e){
+    ind.textContent = '尚無伺服器資料，使用範例';
+  }
+  renderAll();
+}
+
+function scheduleSave(){
+  const ind = document.getElementById('saveIndicator');
+  if(!COMPANY_KEY){
+    ind.textContent = '未指定公司，僅本機暫存，不會存檔';
+    return;
+  }
+  ind.textContent = '儲存中…';
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(async ()=>{
+    try{
+      const res = await fetch('/api/production-schedule/' + COMPANY_KEY, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({value: JSON.stringify(state)}),
+      });
+      if(!res.ok) throw new Error('save failed');
+      const now = new Date();
+      ind.textContent = '已儲存 ' + now.getHours().toString().padStart(2,'0') + ':' + now.getMinutes().toString().padStart(2,'0');
+    }catch(e){
+      ind.textContent = '儲存失敗（僅本機暫存）';
+    }
+  }, 500);
+}
+
+/* ---------------- helpers ---------------- */
+function esc(str){
+  return String(str==null?'':str).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+}
+function parseQty(str){
+  if(!str) return 0;
+  const nums = String(str).match(/\d[\d,]*/g);
+  if(!nums) return 0;
+  return nums.reduce((sum,n)=> sum + parseInt(n.replace(/,/g,''),10), 0);
+}
+function parseDate(str){
+  if(!str) return null;
+  const nums = (String(str).match(/\d+/g)||[]).map(n=>parseInt(n,10));
+  if(nums.length===0) return null;
+  let year=2026, month, day;
+  const yIdx = nums.findIndex(n=>n>=1000);
+  if(yIdx>=0){
+    year = nums[yIdx];
+    const rest = nums.filter((_,i)=>i!==yIdx);
+    month = rest[0]; day = rest[1];
+  }else{
+    month = nums[0]; day = nums[1];
+  }
+  if(!month) return null;
+  if(!day) day = 1;
+  const d = new Date(year, month-1, day);
+  return isNaN(d.getTime()) ? null : d;
+}
+function parseMonthId(id){
+  const m = /^y(\d{4})(\d{2})$/.exec(id);
+  if(!m) return null;
+  return {year:parseInt(m[1],10), month:parseInt(m[2],10)};
+}
+function isMonthPast(mo){
+  const d = parseMonthId(mo.id);
+  if(!d) return false;
+  const now = new Date();
+  const curY = now.getFullYear(), curM = now.getMonth()+1;
+  return (d.year < curY) || (d.year===curY && d.month < curM);
+}
+function effectiveHidden(mo){
+  if(mo.override==='hide') return true;
+  if(mo.override==='show') return false;
+  return isMonthPast(mo);
+}
+function getVisibleMonths(){
+  return state.months.filter(m => state.showCompleted || !effectiveHidden(m));
+}
+function updateToggleLabel(){
+  const btn = document.getElementById('toggleCompletedBtn');
+  if(!btn) return;
+  const hiddenCount = state.months.filter(effectiveHidden).length;
+  btn.textContent = state.showCompleted ? '隱藏已結束月份' : ('顯示已結束月份 (' + hiddenCount + ')');
+  btn.classList.toggle('primary', state.showCompleted);
+}
+function cellKey(p,m){ return p+'_'+m; }
+function getCell(p,m){ return state.cells[cellKey(p,m)] || {qty:'',date:'',new:false}; }
+function ensureCell(p,m){
+  const k = cellKey(p,m);
+  if(!state.cells[k]) state.cells[k] = {qty:'',date:'',new:false};
+  return state.cells[k];
+}
+function computeMonthTotal(monthId){
+  let sum = 0;
+  state.products.forEach(p=>{
+    const c = state.cells[cellKey(p.id, monthId)];
+    if(c) sum += parseQty(c.qty);
+  });
+  return sum;
+}
+
+/* ---------------- render: table ---------------- */
+function renderTable(){
+  const table = document.getElementById('mainTable');
+  const visibleMonths = getVisibleMonths();
+  let html = '<thead><tr><th class="sticky-col">品名</th>';
+  visibleMonths.forEach(m=>{
+    const hidden = effectiveHidden(m);
+    const archLabel = m.override==='hide' ? '📥 已封存' : m.override==='show' ? '📌 強制顯示' : (hidden ? '⏳ 已結束' : '進行中');
+    const archClass = m.override ? 'is-forced' : (hidden ? 'is-hidden' : '');
+    html += `<th data-month="${esc(m.id)}">
+      <div class="month-head">
+        <input class="month-label" data-month="${esc(m.id)}" value="${esc(m.label)}">
+        <button class="rm-btn" data-action="rm-month" data-month="${esc(m.id)}" title="刪除此月份">✕</button>
+      </div>
+      <button class="archive-toggle ${archClass}" data-action="cycle-archive" data-month="${esc(m.id)}" title="切換自動／封存／強制顯示">${archLabel}</button>
+    </th>`;
+  });
+  html += '</tr></thead><tbody>';
+
+  state.products.forEach(p=>{
+    html += `<tr><td class="sticky-col"><div class="prod-row-inner">
+      <input class="prod-name" data-product="${esc(p.id)}" value="${esc(p.name)}">
+      <button class="rm-btn" data-action="rm-product" data-product="${esc(p.id)}" title="刪除此品項">✕</button>
+    </div></td>`;
+    visibleMonths.forEach(m=>{
+      const c = getCell(p.id, m.id);
+      const hasQty = parseQty(c.qty) > 0;
+      html += `<td>
+        <div class="cell ${hasQty?'has-qty':''} ${c.new?'is-new':''}" data-product="${esc(p.id)}" data-month="${esc(m.id)}">
+          <button class="flag-toggle" data-action="toggle-new" data-product="${esc(p.id)}" data-month="${esc(m.id)}" title="標記／取消新增">✦</button>
+          <input class="qty-input" data-field="qty" data-product="${esc(p.id)}" data-month="${esc(m.id)}" placeholder="數量" value="${esc(c.qty)}">
+          <input class="date-input" data-field="date" data-product="${esc(p.id)}" data-month="${esc(m.id)}" placeholder="交期" value="${esc(c.date)}">
+        </div>
+      </td>`;
+    });
+    html += '</tr>';
+  });
+  html += '</tbody><tfoot>';
+
+  html += '<tr class="total-row"><td class="sticky-col">月合計</td>';
+  visibleMonths.forEach(m=>{
+    html += `<td><span id="tot-${esc(m.id)}">${computeMonthTotal(m.id).toLocaleString()}</span></td>`;
+  });
+  html += '</tr>';
+
+  html += '<tr class="material-row"><td class="sticky-col">包材到廠日</td>';
+  visibleMonths.forEach(m=>{
+    html += `<td><input class="material-date" data-month="${esc(m.id)}" placeholder="到廠日期" value="${esc(state.materialArrival[m.id]||'')}"></td>`;
+  });
+  html += '</tr>';
+
+  html += '</tfoot>';
+  table.innerHTML = html;
+  updateToggleLabel();
+}
+
+/* ---------------- render: stats ---------------- */
+function renderStats(){
+  const totalQty = state.months.reduce((s,m)=>s+computeMonthTotal(m.id),0);
+  const events = buildEvents();
+  const materialQty = events.filter(e=>e.type==='material').reduce((s,e)=>s+e.qty,0);
+  const shipQty = events.filter(e=>e.type==='ship').reduce((s,e)=>s+e.qty,0);
+  const el = document.getElementById('statStrip');
+  el.innerHTML = `
+    <div class="stat"><div class="num">${totalQty.toLocaleString()}</div><div class="lbl">全期總數量</div></div>
+    <div class="stat"><div class="num" style="color:var(--amber)">${materialQty.toLocaleString()}</div><div class="lbl">包材需求總量</div></div>
+    <div class="stat"><div class="num" style="color:var(--coral)">${shipQty.toLocaleString()}</div><div class="lbl">預計出貨總量</div></div>
+    <div class="stat"><div class="num">${state.products.length}</div><div class="lbl">追蹤品項數</div></div>
+  `;
+}
+
+/* ---------------- render: timeline ---------------- */
+function buildEvents(){
+  const events = [];
+  const visibleMonths = getVisibleMonths();
+  visibleMonths.forEach(m=>{
+    const dateStr = state.materialArrival[m.id];
+    if(dateStr && dateStr.trim()){
+      const qty = computeMonthTotal(m.id);
+      events.push({type:'material', date:dateStr, sortDate:parseDate(dateStr), label:m.label+' 包材到廠', qty});
+    }
+  });
+  const shipMap = {};
+  state.products.forEach(p=>{
+    visibleMonths.forEach(m=>{
+      const c = state.cells[cellKey(p.id,m.id)];
+      if(c && c.date && c.date.trim() && parseQty(c.qty)>0){
+        if(!shipMap[c.date]) shipMap[c.date] = {qty:0, items:[]};
+        shipMap[c.date].qty += parseQty(c.qty);
+        shipMap[c.date].items.push(p.name+' '+parseQty(c.qty).toLocaleString());
+      }
+    });
+  });
+  Object.entries(shipMap).forEach(([dateStr,info])=>{
+    events.push({type:'ship', date:dateStr, sortDate:parseDate(dateStr), label:'預計出貨', qty:info.qty, detail:info.items.join('、')});
+  });
+  events.sort((a,b)=>{
+    const da = a.sortDate ? a.sortDate.getTime() : Infinity;
+    const db = b.sortDate ? b.sortDate.getTime() : Infinity;
+    return da-db;
+  });
+  return events;
+}
+
+function renderTimeline(){
+  const events = buildEvents();
+  const el = document.getElementById('timeline');
+  if(events.length===0){
+    el.innerHTML = '<li class="tl-empty">尚無日期資料，請在表格中填入交期或包材到廠日。</li>';
+    return;
+  }
+  el.innerHTML = events.map(e=>`
+    <li>
+      <div class="dot-col"><div class="dot ${e.type}"></div><div class="bar"></div></div>
+      <div class="tl-body">
+        <div class="tl-date">${esc(e.date)}</div>
+        <div class="tl-label ${e.type}">${e.type==='material'?'📦 ':'🚚 '}${esc(e.label)}</div>
+        <div class="tl-qty">${e.qty.toLocaleString()} 件</div>
+        ${e.detail?`<div class="tl-detail">${esc(e.detail)}</div>`:''}
+      </div>
+    </li>
+  `).join('');
+}
+
+/* ---------------- render: logs ---------------- */
+function renderLogs(){
+  const el = document.getElementById('logList');
+  if(state.logs.length===0){
+    el.innerHTML = '<li class="tl-empty">尚無記錄</li>';
+    return;
+  }
+  el.innerHTML = state.logs.map((text,i)=>`
+    <li>
+      <span>${esc(text)}</span>
+      <button class="log-del" data-action="del-log" data-index="${i}">刪除</button>
+    </li>
+  `).join('');
+}
+
+function renderAll(){
+  renderTable();
+  renderStats();
+  renderTimeline();
+  renderLogs();
+}
+
+/* ---------------- events ---------------- */
+document.addEventListener('input', (e)=>{
+  const t = e.target;
+  if(t.classList.contains('qty-input') || t.classList.contains('date-input')){
+    const p = t.dataset.product, m = t.dataset.month, field = t.dataset.field;
+    const c = ensureCell(p,m);
+    c[field] = t.value;
+    const wrap = t.closest('.cell');
+    if(wrap){ wrap.classList.toggle('has-qty', parseQty(getCell(p,m).qty) > 0); }
+    const totEl = document.getElementById('tot-'+m);
+    if(totEl) totEl.textContent = computeMonthTotal(m).toLocaleString();
+    renderStats();
+    renderTimeline();
+    scheduleSave();
+  } else if(t.classList.contains('material-date')){
+    state.materialArrival[t.dataset.month] = t.value;
+    renderStats();
+    renderTimeline();
+    scheduleSave();
+  } else if(t.classList.contains('prod-name')){
+    const prod = state.products.find(p=>p.id===t.dataset.product);
+    if(prod){ prod.name = t.value; }
+    renderTimeline();
+    scheduleSave();
+  } else if(t.classList.contains('month-label')){
+    const mo = state.months.find(m=>m.id===t.dataset.month);
+    if(mo){ mo.label = t.value; }
+    renderTimeline();
+    scheduleSave();
+  }
+});
+
+document.addEventListener('click', (e)=>{
+  const btn = e.target.closest('[data-action]');
+  if(!btn) return;
+  const action = btn.dataset.action;
+
+  if(action==='toggle-new'){
+    const p = btn.dataset.product, m = btn.dataset.month;
+    const c = ensureCell(p,m);
+    c.new = !c.new;
+    const wrap = btn.closest('.cell');
+    if(wrap) wrap.classList.toggle('is-new', c.new);
+    scheduleSave();
+  }
+  else if(action==='rm-product'){
+    const p = btn.dataset.product;
+    const prod = state.products.find(x=>x.id===p);
+    if(prod && confirm('確定要刪除品項「'+prod.name+'」嗎？此列所有資料將一併移除。')){
+      state.products = state.products.filter(x=>x.id!==p);
+      Object.keys(state.cells).forEach(k=>{ if(k.startsWith(p+'_')) delete state.cells[k]; });
+      renderAll();
+      scheduleSave();
+    }
+  }
+  else if(action==='rm-month'){
+    const m = btn.dataset.month;
+    const mo = state.months.find(x=>x.id===m);
+    if(mo && confirm('確定要刪除「'+mo.label+'」這個月份欄位嗎？此欄所有資料將一併移除。')){
+      state.months = state.months.filter(x=>x.id!==m);
+      Object.keys(state.cells).forEach(k=>{ if(k.endsWith('_'+m)) delete state.cells[k]; });
+      delete state.materialArrival[m];
+      renderAll();
+      scheduleSave();
+    }
+  }
+  else if(action==='cycle-archive'){
+    const m = btn.dataset.month;
+    const mo = state.months.find(x=>x.id===m);
+    if(mo){
+      if(!mo.override) mo.override = 'hide';
+      else if(mo.override==='hide') mo.override = 'show';
+      else mo.override = undefined;
+      renderAll();
+      scheduleSave();
+    }
+  }
+  else if(action==='del-log'){
+    const idx = parseInt(btn.dataset.index,10);
+    state.logs.splice(idx,1);
+    renderLogs();
+    scheduleSave();
+  }
+});
+
+document.getElementById('addProductBtn').addEventListener('click', ()=>{
+  const name = prompt('輸入新品項名稱：');
+  if(!name) return;
+  const id = name.toLowerCase().replace(/\s+/g,'-') + '-' + Math.random().toString(36).slice(2,6);
+  state.products.push({id, name});
+  renderAll();
+  scheduleSave();
+});
+
+document.getElementById('addMonthBtn').addEventListener('click', ()=>{
+  const label = prompt('輸入新月份名稱（例如：2027/1月）：');
+  if(!label) return;
+  const id = 'm-' + Math.random().toString(36).slice(2,8);
+  state.months.push({id, label});
+  renderAll();
+  scheduleSave();
+});
+
+document.getElementById('toggleCompletedBtn').addEventListener('click', ()=>{
+  state.showCompleted = !state.showCompleted;
+  renderAll();
+  scheduleSave();
+});
+
+document.getElementById('logAddBtn').addEventListener('click', addLog);
+document.getElementById('logInput').addEventListener('keydown', (e)=>{ if(e.key==='Enter') addLog(); });
+function addLog(){
+  const input = document.getElementById('logInput');
+  const text = input.value.trim();
+  if(!text) return;
+  state.logs.unshift(text);
+  input.value = '';
+  renderLogs();
+  scheduleSave();
+}
+
+document.getElementById('exportBtn').addEventListener('click', ()=>{
+  const blob = new Blob([JSON.stringify(state,null,2)], {type:'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'production-schedule-backup.json';
+  a.click();
+  URL.revokeObjectURL(url);
+});
+
+document.getElementById('resetBtn').addEventListener('click', ()=>{
+  if(confirm('確定要重置為範例資料嗎？目前輸入的內容將被覆蓋。')){
+    state = defaultState();
+    renderAll();
+    scheduleSave();
+  }
+});
+
+loadState();
+</script>
+</body>
+</html>
