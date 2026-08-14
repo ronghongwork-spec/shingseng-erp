@@ -4251,26 +4251,50 @@ async def api_save_production_schedule(company_key: str, request: Request):
 
 
 @app.get("/api/production-schedule-item-search")
-def api_search_a1_items(q: str = ""):
-  """生產排程表「新增品項」的品名關鍵字搜尋，給 static/production-
+def api_search_a1_items(q: str = "", category: str = ""):
+  """生產排程表「新增品項」的品名關鍵字／分類搜尋，給 static/production-
   schedule.html 用。目前items_map只有海濤客有真正串接A1（見/areas/
   shingseng-erp.md：容鴻/芙萊柏「後三間先建頁面骨架，資料待補」），所以
   這支對容鴻/芙萊柏來說會查不到東西——前端在查無結果時要保留「手動
   輸入」的退路，不能只依賴這支API。
-  回傳最多30筆 {"id": 品號, "name": 品名}，依品名字母排序。
+
+  q和category都是選填，但至少要有一個才會真的查（兩個都空白直接回傳
+  空清單，避免誤觸就把全部商品倒出來）；兩個都填的話是「同時符合」
+  （關鍵字比對品名、分類要完全相等）。
+  回傳最多50筆 {"id": 品號, "name": 品名, "category": 分類}，依品名排序。
   """
   from fastapi.responses import JSONResponse
   keyword = (q or "").strip().lower()
-  if not keyword:
+  category = (category or "").strip()
+  if not keyword and not category:
     return JSONResponse({"items": []})
   items_map = app_state.get("items_map", {})
   matched = [
-      {"id": item_id, "name": info.get("Name", "")}
+      {
+          "id": item_id,
+          "name": info.get("Name", ""),
+          "category": info.get("CategoryName", ""),
+      }
       for item_id, info in items_map.items()
-      if keyword in (info.get("Name", "") or "").lower()
+      if (not keyword or keyword in (info.get("Name", "") or "").lower())
+      and (not category or info.get("CategoryName", "") == category)
   ]
   matched.sort(key=lambda x: x["name"])
-  return JSONResponse({"items": matched[:30]})
+  return JSONResponse({"items": matched[:50]})
+
+
+@app.get("/api/production-schedule-item-categories")
+def api_list_a1_item_categories():
+  """生產排程表「新增品項」搜尋面板的分類下拉選單選項，讀items_map裡
+  實際出現過的CategoryName，去重＋排序後回傳。
+  """
+  from fastapi.responses import JSONResponse
+  items_map = app_state.get("items_map", {})
+  categories = sorted({
+      info.get("CategoryName", "") for info in items_map.values()
+      if info.get("CategoryName")
+  })
+  return JSONResponse({"categories": categories})
 
 
 def load_production_schedule_state(company_key):
@@ -4325,10 +4349,18 @@ def _psched_parse_date(raw):
 
 
 def compute_production_schedule_events(state):
-  """把生產排程表state（products/months/cells/materialArrival）換算成
-  {date: [{"type": "material"/"ship", "qty":.., "label":..}, ...]} 的
-  事件字典，給行事曆整合用；跟前端 buildEvents() 邏輯對應，只是搬到
-  Python算一次，不用真的載入iframe裡的JS。
+  """把生產排程表state（products/cells，每格含qty/date/type/
+  materialDate）換算成 {date: [{"type":.., "qty":.., "label":..,
+  "detail":..}, ...]} 的事件字典，給行事曆整合用；跟前端 buildEvents()
+  邏輯對應，只是搬到Python算一次，不用真的載入iframe裡的JS。
+
+  每一格（品項×月份）最多可以產生兩筆事件：
+    1. 交期事件：格子裡的「類型」選了「進貨」就顯示成「預計到貨」
+       （圖示跟包材事件共用📦），選「生產」或沒選就顯示成「預計出貨」
+       （🚚）。
+    2. 包材/原料寄出事件：格子裡「包材/原料寄出日」有填就另外顯示一筆
+       「包材/原料寄出」（📦），跟交期事件是否同時存在無關。
+  這兩個日期欄位是各自獨立的，同一格可以兩個都填、也可以只填一個。
   """
   events_by_date = defaultdict(list)
   if not state:
@@ -4336,45 +4368,61 @@ def compute_production_schedule_events(state):
 
   products = {p["id"]: p.get("name", p["id"]) for p in state.get("products", [])}
   cells = state.get("cells", {})
-  months = {m["id"]: m.get("label", m["id"]) for m in state.get("months", [])}
 
-  for month_id, date_str in (state.get("materialArrival") or {}).items():
-    d = _psched_parse_date(date_str)
-    if not d:
-      continue
-    qty = sum(
-        _psched_parse_qty((cells.get(f"{pid}_{month_id}") or {}).get("qty"))
-        for pid in products
-    )
-    if qty > 0:
-      events_by_date[d].append({
-          "type": "material",
-          "qty": qty,
-          "label": f"{months.get(month_id, month_id)} 包材到廠",
-      })
+  main_map = defaultdict(lambda: {"qty": 0, "items": [], "types": set()})
+  material_map = defaultdict(lambda: {"qty": 0, "items": []})
 
-  ship_map = defaultdict(lambda: {"qty": 0, "items": []})
   for key, cell in cells.items():
-    date_str = (cell or {}).get("date")
-    qty = _psched_parse_qty((cell or {}).get("qty"))
-    if not date_str or qty <= 0:
+    cell = cell or {}
+    qty = _psched_parse_qty(cell.get("qty"))
+    if qty <= 0:
       continue
     pid = key.rsplit("_", 1)[0]
+    pname = products.get(pid, pid)
+    ctype = (cell.get("type") or "").strip()
+
+    date_str = cell.get("date")
+    if date_str and str(date_str).strip():
+      main_map[date_str]["qty"] += qty
+      suffix = f"（{ctype}）" if ctype else ""
+      main_map[date_str]["items"].append(f"{pname} {qty:,}{suffix}")
+      if ctype:
+        main_map[date_str]["types"].add(ctype)
+
+    material_date_str = cell.get("materialDate")
+    if material_date_str and str(material_date_str).strip():
+      material_map[material_date_str]["qty"] += qty
+      material_map[material_date_str]["items"].append(f"{pname} {qty:,}")
+
+  for date_str, info in main_map.items():
     d = _psched_parse_date(date_str)
     if not d:
       continue
-    ship_map[d]["qty"] += qty
-    ship_map[d]["items"].append(f"{products.get(pid, pid)} {qty:,}")
-
-  for d, info in ship_map.items():
+    types = info["types"]
+    if len(types) == 1 and next(iter(types)) == "進貨":
+      label, event_type = "預計到貨", "material"
+    else:
+      label, event_type = "預計出貨", "ship"
     events_by_date[d].append({
-        "type": "ship",
+        "type": event_type,
         "qty": info["qty"],
-        "label": "預計出貨",
+        "label": label,
+        "detail": "、".join(info["items"]),
+    })
+
+  for date_str, info in material_map.items():
+    d = _psched_parse_date(date_str)
+    if not d:
+      continue
+    events_by_date[d].append({
+        "type": "material",
+        "qty": info["qty"],
+        "label": "包材/原料寄出",
         "detail": "、".join(info["items"]),
     })
 
   return events_by_date
+
 
 
 # 初始化全域狀態
