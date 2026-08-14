@@ -56,6 +56,24 @@
   .toolbar{
     display:flex; flex-wrap:wrap; gap:8px; margin-bottom:14px;
   }
+  .product-search-panel{
+    background:#FDFBF6; border:1px solid var(--line); border-radius:8px;
+    padding:12px; margin-bottom:14px;
+  }
+  .product-search-panel input{
+    width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:6px;
+    font-size:13px; margin-bottom:8px;
+  }
+  .product-search-results{ max-height:220px; overflow-y:auto; }
+  .product-search-results .psr-item{
+    padding:7px 8px; border-radius:6px; cursor:pointer; font-size:13px;
+    display:flex; justify-content:space-between; gap:8px; align-items:center;
+  }
+  .product-search-results .psr-item:hover{ background:var(--amber-bg); }
+  .product-search-results .psr-empty{ font-size:12.5px; color:var(--ink-soft); padding:6px 2px;}
+  .product-search-results .psr-id{ font-size:11px; color:var(--ink-soft); font-family:ui-monospace,SFMono-Regular,Menlo,monospace; white-space:nowrap;}
+  .product-search-footer{ display:flex; align-items:center; gap:8px; margin-top:8px; flex-wrap:wrap;}
+  .product-search-hint{ font-size:12px; color:var(--ink-soft);}
   button{
     font:inherit; cursor:pointer; border:1px solid var(--line);
     background:var(--panel); color:var(--ink);
@@ -227,6 +245,17 @@
       <button id="toggleCompletedBtn">顯示已結束月份</button>
       <button class="ghost" id="exportBtn">匯出備份 (JSON)</button>
       <button class="ghost danger" id="resetBtn">重置為範例資料</button>
+    </div>
+    <div class="product-search-panel" id="productSearchPanel" style="display:none;">
+      <input type="text" id="productSearchInput" placeholder="輸入品名關鍵字搜尋商品資訊…">
+      <div class="product-search-results" id="productSearchResults">
+        <div class="psr-empty">輸入關鍵字開始搜尋…</div>
+      </div>
+      <div class="product-search-footer">
+        <span class="product-search-hint">找不到想要的品項？</span>
+        <button class="ghost" id="productManualAddBtn">手動輸入名稱</button>
+        <button class="ghost" id="productSearchCloseBtn">取消</button>
+      </div>
     </div>
     <div class="table-scroll">
       <table id="mainTable"></table>
@@ -674,13 +703,80 @@ document.addEventListener('click', (e)=>{
   }
 });
 
-document.getElementById('addProductBtn').addEventListener('click', ()=>{
-  const name = prompt('輸入新品項名稱：');
-  if(!name) return;
-  const id = name.toLowerCase().replace(/\s+/g,'-') + '-' + Math.random().toString(36).slice(2,6);
+/* ---------------- 新增品項：關鍵字搜尋商品資訊，找不到才手動輸入 ----------------
+   原本是prompt()直接手打名字，容易跟A1商品主檔的品名對不起來（打錯字、
+   漏字），現在改成打 /api/production-schedule-item-search 關鍵字搜尋
+   （後端讀app_state裡的items_map，目前只有海濤客真的有A1商品資料，容鴻/
+   芙萊柏搜尋不到東西是正常的，保留「手動輸入名稱」當退路）。
+*/
+const productSearchPanel = document.getElementById('productSearchPanel');
+const productSearchInput = document.getElementById('productSearchInput');
+const productSearchResults = document.getElementById('productSearchResults');
+let productSearchTimer = null;
+
+function addProductToState(id, name){
+  if(state.products.some(p=>p.id===id)){
+    alert('「'+name+'」已經在排程表裡了，不會重複新增。');
+    return;
+  }
   state.products.push({id, name});
   renderAll();
   scheduleSave();
+}
+
+document.getElementById('addProductBtn').addEventListener('click', ()=>{
+  productSearchPanel.style.display = 'block';
+  productSearchInput.value = '';
+  productSearchResults.innerHTML = '<div class="psr-empty">輸入關鍵字開始搜尋…</div>';
+  productSearchInput.focus();
+});
+
+document.getElementById('productSearchCloseBtn').addEventListener('click', ()=>{
+  productSearchPanel.style.display = 'none';
+});
+
+document.getElementById('productManualAddBtn').addEventListener('click', ()=>{
+  const name = prompt('輸入新品項名稱：');
+  if(!name) return;
+  const id = name.toLowerCase().replace(/\s+/g,'-') + '-' + Math.random().toString(36).slice(2,6);
+  addProductToState(id, name);
+  productSearchPanel.style.display = 'none';
+});
+
+productSearchInput.addEventListener('input', ()=>{
+  clearTimeout(productSearchTimer);
+  const q = productSearchInput.value.trim();
+  if(!q){
+    productSearchResults.innerHTML = '<div class="psr-empty">輸入關鍵字開始搜尋…</div>';
+    return;
+  }
+  productSearchTimer = setTimeout(async ()=>{
+    productSearchResults.innerHTML = '<div class="psr-empty">搜尋中…</div>';
+    try{
+      const res = await fetch('/api/production-schedule-item-search?q=' + encodeURIComponent(q));
+      const data = await res.json();
+      const items = (data && data.items) || [];
+      if(items.length === 0){
+        productSearchResults.innerHTML = '<div class="psr-empty">查無符合的商品，可以按下方「手動輸入名稱」新增。</div>';
+        return;
+      }
+      productSearchResults.innerHTML = items.map(it => `
+        <div class="psr-item" data-id="${esc(it.id)}" data-name="${esc(it.name)}">
+          <span>${esc(it.name)}</span>
+          <span class="psr-id">${esc(it.id)}</span>
+        </div>
+      `).join('');
+    }catch(e){
+      productSearchResults.innerHTML = '<div class="psr-empty">搜尋失敗，可以按下方「手動輸入名稱」新增。</div>';
+    }
+  }, 300);
+});
+
+productSearchResults.addEventListener('click', (e)=>{
+  const item = e.target.closest('.psr-item');
+  if(!item) return;
+  addProductToState(item.dataset.id, item.dataset.name);
+  productSearchPanel.style.display = 'none';
 });
 
 document.getElementById('addMonthBtn').addEventListener('click', ()=>{
