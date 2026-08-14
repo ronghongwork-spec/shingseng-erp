@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import calendar
 import concurrent.futures
 import io
 import json
@@ -1473,7 +1474,301 @@ def fetch_suppliers(token):
 
 
 # -------------------------------------------------------------------------
-# Orders[Post] 反向同步：把 Google Sheets「訂單資訊」的內容寫回 A1
+# 雲端會計（海濤客食品工業(股)公司）：廠商資訊／應收明細／應付明細
+# -------------------------------------------------------------------------
+# 這幾支是照使用者提供的digiwin_client.py（NAS上另一個「逾期未沖帳明細」
+# 工具的原始碼）裡實際驗證過能用的A1呼叫方式搬過來的：
+#   - 客戶/廠商清單只有ID/Name兩欄，要完整資料得先GET清單拿到ID，
+#     再逐一GET /Customers/{ID}或/Suppliers/{ID}補明細
+#   - 銷貨單資料是POST /Sales/PaginationQuery，單次最多查7天，要自己
+#     切段+翻頁（body帶Pagination頁碼，回應的More欄位是否還有下一頁）
+# 「應收明細」目前只有「客戶/單據日期/來源單號/金額/稅額/應收金額」
+# 這幾欄位是確定從A1這支API能拿到的（digiwin_client.py實際用到的
+# 欄位）；「經辦人」「發票號碼」「已收金額」「未收金額」A1的銷貨單
+# 原始回應裡有沒有這些欄位還沒驗證過，先用.get()嘗試抓、抓不到就留空，
+# 部署後如果這幾欄一直是空的，把Render Logs裡第一筆原始資料印出來的
+# 內容貼給我，才能知道A1實際欄位叫什麼名字去修正對照。
+ACCOUNTING_APP_COMPANIES = ("海濤客食品工業(股)公司",)
+
+# 「應付明細」目前A1沒有開放API可以查詢，使用者會定期從A1後台手動匯出
+# Excel、整份覆蓋上傳，欄位對照畫面截圖：廠商/單據日期/來源單號/經辦人/
+# 發票號碼/金額/稅額/應付金額/已付金額/未付金額。同樣受Render沒有
+# Persistent Disk的限制，重新部署/重啟後上傳的檔案會消失，需要重新上傳。
+AP_EXCEL_PATH = os.environ.get(
+    "A1_AP_EXCEL_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "應付明細.xlsx"),
+)
+
+
+def fetch_a1_supplier_details(token):
+  """完整廠商資訊：GET /Suppliers 拿ID清單，再逐一 GET /Suppliers/{ID}
+  補完整欄位（地址/電話/統編/付款條件等，實際有哪些欄位以A1回傳為準）。
+  回傳 (rows, error)。
+  """
+  headers = {"Authorization": token}
+  try:
+    resp = requests.get(f"{A1_BASE_URL}/Suppliers", headers=headers, timeout=REQUEST_TIMEOUT)
+    if resp.status_code != 200:
+      return [], f"HTTP {resp.status_code}：{resp.text[:200]}"
+    id_list = resp.json()
+  except requests.exceptions.RequestException as e:
+    return [], str(e)
+
+  detailed = []
+  for s in id_list:
+    sid = s.get("ID")
+    if not sid:
+      continue
+    try:
+      d_resp = requests.get(
+          f"{A1_BASE_URL}/Suppliers/{sid}", headers=headers, timeout=REQUEST_TIMEOUT
+      )
+      if d_resp.status_code == 200:
+        detailed.append(d_resp.json())
+    except requests.exceptions.RequestException:
+      continue
+  return detailed, None
+
+
+def fetch_a1_customer_details(token):
+  """同上，客戶版本——應收明細要用客戶的AccountDay(月結日)/PaymentDay
+  (付款日)才能算「預結帳日」「預收款日」，客戶清單本身沒有這兩個欄位，
+  一定要逐筆補明細。回傳 (rows, error)。
+  """
+  headers = {"Authorization": token}
+  try:
+    resp = requests.get(f"{A1_BASE_URL}/Customers", headers=headers, timeout=REQUEST_TIMEOUT)
+    if resp.status_code != 200:
+      return [], f"HTTP {resp.status_code}：{resp.text[:200]}"
+    id_list = resp.json()
+  except requests.exceptions.RequestException as e:
+    return [], str(e)
+
+  detailed = []
+  for c in id_list:
+    cid = c.get("ID")
+    if not cid:
+      continue
+    try:
+      d_resp = requests.get(
+          f"{A1_BASE_URL}/Customers/{cid}", headers=headers, timeout=REQUEST_TIMEOUT
+      )
+      if d_resp.status_code == 200:
+        detailed.append(d_resp.json())
+    except requests.exceptions.RequestException:
+      continue
+  return detailed, None
+
+
+def fetch_a1_sales_paginated(token, start_date, end_date):
+  """銷貨單：POST /Sales/PaginationQuery，單次最多查7天，自動切段+翻頁
+  （跟digiwin_client.py的get_sales()同一套邏輯）。回傳 (rows, error)。
+  """
+  headers = {"Authorization": token}
+  all_rows = []
+  cursor = start_date
+  try:
+    while cursor <= end_date:
+      chunk_end = min(cursor + timedelta(days=6), end_date)
+      page = 1
+      while True:
+        resp = requests.post(
+            f"{A1_BASE_URL}/Sales/PaginationQuery",
+            headers=headers,
+            json={
+                "StartDate": cursor.strftime("%Y-%m-%d"),
+                "EndDate": chunk_end.strftime("%Y-%m-%d"),
+                "Pagination": page,
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code != 200:
+          return all_rows, f"HTTP {resp.status_code}：{resp.text[:200]}"
+        body = resp.json()
+        rows = body.get("Data", []) or []
+        all_rows.extend(rows)
+        if page == 1 and rows:
+          # 只在第一批印一次，讓Render Logs可以看到A1實際回傳的完整
+          # 欄位名稱——如果畫面上「經辦人/發票號碼/已收金額/未收金額」
+          # 一直是空的，去Logs看這行，確認A1到底有沒有給這些欄位、
+          # 叫什麼名字。
+          print(f"[應收明細] 銷貨單原始欄位範例（第1筆）：{list(rows[0].keys())}")
+        if not body.get("More"):
+          break
+        page += 1
+      cursor = chunk_end + timedelta(days=1)
+  except requests.exceptions.RequestException as e:
+    return all_rows, str(e)
+  return all_rows, None
+
+
+def _estimate_statement_date(trade_date, account_day):
+  """預結帳日（月結日）：單據日在「月結日」以前算當月結帳，之後算下個
+  月結帳。這是假設值，跟「逾期未沖帳明細」工具裡的estimate_due_date()
+  同一套「以帳期天數判斷結帳月份」邏輯，但只算到「結帳月份的account_day
+  那天」，還沒加上後續的付款寬限——如果貴公司「預結帳日」定義不是這樣，
+  請告知實際規則，我再調整這支函式。
+  """
+  account_day = account_day or 1
+  if trade_date.day <= account_day:
+    y, m = trade_date.year, trade_date.month
+  else:
+    y = trade_date.year + (1 if trade_date.month == 12 else 0)
+    m = 1 if trade_date.month == 12 else trade_date.month + 1
+  last_day = calendar.monthrange(y, m)[1]
+  return date(y, m, min(account_day, last_day))
+
+
+def _estimate_payment_date(trade_date, account_day, payment_day):
+  """預收款日／預付款日：完全比照「逾期未沖帳明細」工具run.py裡
+  estimate_due_date()的公式（已驗證過用在正式的逾期帳款計算），單據日
+  在月結日以前算當月結帳、之後算下個月結帳，付款日固定用payment_day
+  當天號數。
+  """
+  account_day = account_day or 1
+  payment_day = payment_day or 1
+  if trade_date.day <= account_day:
+    y, m = trade_date.year, trade_date.month
+  else:
+    y = trade_date.year + (1 if trade_date.month == 12 else 0)
+    m = 1 if trade_date.month == 12 else trade_date.month + 1
+  last_day = calendar.monthrange(y, m)[1]
+  return date(y, m, min(payment_day, last_day))
+
+
+def _parse_a1_date(s):
+  if not s:
+    return None
+  try:
+    return datetime.strptime(str(s).split("T")[0], "%Y-%m-%d").date()
+  except ValueError:
+    return None
+
+
+def compute_receivable_rows(sales_rows, customers_by_id):
+  """把銷貨單原始資料換算成「應收明細」要顯示的列表，每筆都算好
+  單據日期/預結帳日/預收款日/應收金額，供畫面依三種日期類型篩選。
+  「經辦人」「發票號碼」「已收金額」「未收金額」用多組可能的欄位名稱
+  嘗試抓（不同A1租戶/版本欄位命名可能不同），抓不到就留空字串，不會
+  讓整筆資料消失或報錯。
+  """
+  def first_present(row, *keys):
+    for k in keys:
+      if row.get(k) not in (None, ""):
+        return row.get(k)
+    return ""
+
+  rows = []
+  for r in sales_rows:
+    trade_date = _parse_a1_date(r.get("TradeDate"))
+    if not trade_date:
+      continue
+    cust = customers_by_id.get(r.get("CustomerID"), {})
+    customer_name = cust.get("Name") or r.get("CustomerName") or r.get("CustomerID") or ""
+    account_day = cust.get("AccountDay")
+    payment_day = cust.get("PaymentDay")
+    statement_date = _estimate_statement_date(trade_date, account_day)
+    payment_date = _estimate_payment_date(trade_date, account_day, payment_day)
+    subtotal = r.get("TotalAmount", 0) or 0
+    tax = r.get("TotalTax", 0) or 0
+    receivable = subtotal + tax
+    paid = first_present(r, "PaidAmount", "ReceivedAmount", "WriteOffAmount")
+    unpaid = (
+        (receivable - float(paid)) if paid not in ("", None)
+        else ("" if not r.get("IsWriteOffReceivable") else 0)
+    )
+    rows.append({
+        "客戶": customer_name,
+        "單據日期": trade_date.isoformat(),
+        "預結帳日": statement_date.isoformat(),
+        "預收款日": payment_date.isoformat(),
+        "來源單號": r.get("No") or "",
+        "經辦人": first_present(r, "SalesPersonName", "HandlerName", "Contact"),
+        "發票號碼": first_present(r, "InvoiceNo", "InvoiceNumber"),
+        "金額": subtotal,
+        "稅額": tax,
+        "應收金額": receivable,
+        "已收金額": paid,
+        "未收金額": unpaid,
+        "_trade_date": trade_date,
+        "_statement_date": statement_date,
+        "_payment_date": payment_date,
+    })
+  return rows
+
+
+def _to_float_safe(v):
+  if v is None:
+    return 0.0
+  s = str(v).replace(",", "").strip()
+  if not s:
+    return 0.0
+  try:
+    return float(s)
+  except ValueError:
+    return 0.0
+
+
+def parse_payable_excel(path, suppliers_by_name=None):
+  """讀取人工上傳的「應付明細」Excel（A1目前沒開放這份資料的API，靠
+  人工從A1後台匯出、每次整份覆蓋上傳），欄位對照畫面截圖：廠商/單據
+  日期/來源單號/經辦人/發票號碼/金額/稅額/應付金額/已付金額/未付金額。
+
+  suppliers_by_name：{廠商名稱: 廠商detail dict}，有給的話會用廠商的
+  AccountDay/PaymentDay算出預結帳日/預收款日（算法跟應收明細同一套），
+  給的廠商名字在字典裡對不到就留空，不影響其他欄位正常顯示——所以
+  Excel裡「廠商」欄位的文字要跟A1廠商資訊裡的名稱一致，才能算出這兩個
+  日期。
+  """
+  if not path or not os.path.exists(path):
+    return []
+  suppliers_by_name = suppliers_by_name or {}
+  try:
+    df = pd.read_excel(path, dtype=str)
+  except Exception as e:
+    print(f"讀取應付明細 Excel 失敗：{e}")
+    return []
+
+  rows = []
+  for record in df.fillna("").to_dict("records"):
+    vendor = str(record.get("廠商", "")).strip()
+    date_str = str(record.get("單據日期", "")).strip()
+    trade_date = _parse_a1_date(date_str)
+    supplier = suppliers_by_name.get(vendor, {})
+    statement_date = (
+        _estimate_statement_date(trade_date, supplier.get("AccountDay"))
+        if trade_date else None
+    )
+    payment_date = (
+        _estimate_payment_date(trade_date, supplier.get("AccountDay"), supplier.get("PaymentDay"))
+        if trade_date else None
+    )
+    amount = _to_float_safe(record.get("金額"))
+    tax = _to_float_safe(record.get("稅額"))
+    payable = _to_float_safe(record.get("應付金額")) or (amount + tax)
+    paid = _to_float_safe(record.get("已付金額"))
+    unpaid_raw = _to_float_safe(record.get("未付金額"))
+    unpaid = unpaid_raw if record.get("未付金額") not in ("", None) else (payable - paid)
+    rows.append({
+        "廠商": vendor,
+        "單據日期": trade_date.isoformat() if trade_date else date_str,
+        "預結帳日": statement_date.isoformat() if statement_date else "",
+        "預收款日": payment_date.isoformat() if payment_date else "",
+        "來源單號": str(record.get("來源單號", "")).strip(),
+        "經辦人": str(record.get("經辦人", "")).strip(),
+        "發票號碼": str(record.get("發票號碼", "")).strip(),
+        "金額": amount,
+        "稅額": tax,
+        "應付金額": payable,
+        "已付金額": paid,
+        "未付金額": unpaid,
+        "_trade_date": trade_date,
+        "_statement_date": statement_date,
+        "_payment_date": payment_date,
+    })
+  return rows
+
+
 # 這是「寫入」正式 A1 系統的動作，刻意做成手動觸發＋確認彈窗，不會自動
 # 執行。手冊要求 CustomerID（客戶代號）、TotalSaleAmount（總金額）、
 # 每個品項的 Amount 都必填，所以「訂單資訊」Sheet 新增了「客戶代號」跟
@@ -8558,7 +8853,327 @@ def cloud_orders_dashboard():
 def cloud_accounting_dashboard():
   inject_global_theme_css()
   render_app_switcher("/accounting")
-  render_company_switcher_placeholder("雲端會計")
+  inject_company_tab_css()
+
+  DATE_TYPE_OPTIONS = ["單據日期", "預結帳日", "預收款日"]
+  DATE_TYPE_FIELD_MAP = {
+      "單據日期": "_trade_date", "預結帳日": "_statement_date", "預收款日": "_payment_date",
+  }
+
+  accounting_state = {"suppliers_by_name": None}
+
+  def fetch_receivable_rows_for_range(date_type, start, end):
+    """應收明細的資料來源：A1銷貨單。date_type只影響「要往前抓多寬的
+    緩衝範圍」——選「單據日期」就直接抓使用者給的範圍；選「預結帳日」
+    「預收款日」因為是算出來的日期，最多比單據日期晚兩個月，往前抓寬
+    60天當緩衝，確保不會漏資料（緩衝內抓到的資料一樣會在下面依實際
+    篩選條件過濾，不會多顯示）。
+    """
+    if not start or not end:
+      return [], "請先選擇查詢起訖日期"
+    token = get_a1_token()
+    if not token:
+      return [], "A1登入失敗，請確認 A1_API_KEY／A1_API_PASSWORD 設定"
+    customers, err = fetch_a1_customer_details(token)
+    if err:
+      return [], f"取得客戶資料失敗：{err}"
+    customers_by_id = {c.get("ID"): c for c in customers}
+    fetch_start = start if date_type == "單據日期" else (start - timedelta(days=60))
+    sales, err = fetch_a1_sales_paginated(token, fetch_start, end)
+    if err:
+      return [], f"取得銷貨單失敗：{err}"
+    return compute_receivable_rows(sales, customers_by_id), None
+
+  def fetch_payable_rows_from_excel(date_type, start, end):
+    """應付明細的資料來源：人工上傳的Excel（A1目前沒開放這份資料的
+    API）。date_type/start/end這裡用不到（Excel本身資料量小，不用像
+    A1那樣分段抓），統一介面方便跟應收明細共用同一支畫面渲染函式。
+    """
+    if not os.path.exists(AP_EXCEL_PATH):
+      return [], "尚未上傳「應付明細」Excel"
+    if accounting_state["suppliers_by_name"] is None:
+      token = get_a1_token()
+      suppliers_by_name = {}
+      if token:
+        suppliers, err = fetch_a1_supplier_details(token)
+        if not err:
+          suppliers_by_name = {
+              (s.get("Name") or s.get("ShortName")): s for s in suppliers if s.get("Name") or s.get("ShortName")
+          }
+      accounting_state["suppliers_by_name"] = suppliers_by_name
+    rows = parse_payable_excel(AP_EXCEL_PATH, accounting_state["suppliers_by_name"])
+    return rows, None
+
+  def render_ledger_tab(container, entity_field, amount_field, paid_field, unpaid_field, fetch_fn):
+    """應收明細／應付明細共用的「篩選＋表格」畫面。entity_field是
+    "客戶"或"廠商"；amount_field/paid_field/unpaid_field是該分類金額
+    欄位的key名稱（"應收金額"/"已收金額"/"未收金額" 或
+    "應付金額"/"已付金額"/"未付金額"）；fetch_fn(date_type, start, end)
+    是實際的資料來源（A1 API或Excel），回傳(rows, error)。
+    回傳一個「重新查詢」函式，給外部（例如應付明細上傳完新Excel後）
+    觸發重新整理用。
+    """
+    state = {"rows": [], "error": None, "date_type": "單據日期", "start": None, "end": None, "entity": None}
+
+    with container:
+      ui.label(
+          f"「日期類型」決定下面起訖日期是比對哪一欄；「{entity_field}」"
+          "篩選是選填，資料抓回來後才會列出目前有出現過的名稱可以選。"
+      ).classes("text-xs text-zinc-500 mb-2")
+      summary_label = ui.label("尚未查詢").classes("text-xs text-zinc-500 mb-2")
+      error_container = ui.column().classes("w-full mb-2")
+
+      with ui.row().classes("items-end gap-3 flex-wrap mb-3"):
+        date_type_select = ui.select(
+            DATE_TYPE_OPTIONS, value="單據日期", label="日期類型",
+        ).props("dense outlined").classes("w-32")
+        start_input = ui.input(label="起").props("dense outlined type=date").classes("w-40")
+        end_input = ui.input(label="迄").props("dense outlined type=date").classes("w-40")
+        entity_select = ui.select(
+            [], value=None, label=f"{entity_field}（選填）",
+        ).props("dense outlined clearable").classes("w-56")
+
+        async def do_query():
+          state["date_type"] = date_type_select.value
+          state["start"] = _parse_a1_date(start_input.value) if start_input.value else None
+          state["end"] = _parse_a1_date(end_input.value) if end_input.value else None
+          if not state["start"] or not state["end"]:
+            ui.notify("請先選擇查詢起訖日期", color="warning")
+            return
+          query_btn.props("loading")
+          rows, error = await run.io_bound(
+              fetch_fn, state["date_type"], state["start"], state["end"],
+          )
+          query_btn.props(remove="loading")
+          state["rows"] = rows
+          state["error"] = error
+          entities = sorted({r.get(entity_field) for r in rows if r.get(entity_field)})
+          entity_select.options = entities
+          state["entity"] = entity_select.value
+          render_table()
+
+        query_btn = ui.button("查詢", on_click=do_query).classes(
+            "sync-btn px-4 py-1.5 text-xs rounded-lg"
+        )
+
+      table_container = ui.column().classes("w-full")
+
+      def on_entity_change():
+        state["entity"] = entity_select.value
+        render_table()
+
+      entity_select.on_value_change(lambda e: on_entity_change())
+
+      def render_table():
+        table_container.clear()
+        error_container.clear()
+        if state["error"]:
+          with error_container:
+            ui.label(f"讀取失敗：{state['error']}").classes("text-xs text-red-600")
+        rows = state["rows"]
+        date_key = DATE_TYPE_FIELD_MAP[state["date_type"]]
+        start, end, entity = state["start"], state["end"], state["entity"]
+        filtered = []
+        for r in rows:
+          d = r.get(date_key)
+          if not d:
+            continue
+          if start and d < start:
+            continue
+          if end and d > end:
+            continue
+          if entity and r.get(entity_field) != entity:
+            continue
+          filtered.append(r)
+
+        money_cols = {"金額", "稅額", amount_field, paid_field, unpaid_field}
+        total = sum(r.get(amount_field, 0) or 0 for r in filtered if isinstance(r.get(amount_field), (int, float)))
+        summary_label.text = f"共 {len(filtered)} 筆，{amount_field}合計 {total:,.0f}"
+
+        with table_container:
+          if state["error"]:
+            return
+          if not rows:
+            ui.label("尚未查詢，請設定條件後按「查詢」").classes("text-xs text-zinc-400")
+            return
+          if not filtered:
+            ui.label("沒有符合篩選條件的資料").classes("text-xs text-zinc-400")
+            return
+          display_rows = []
+          for r in filtered:
+            display_rows.append({
+                k: (f"{v:,.0f}" if k in money_cols and isinstance(v, (int, float)) else v)
+                for k, v in r.items() if not k.startswith("_")
+            })
+          columns = [
+              entity_field, "單據日期", "預結帳日", "預收款日", "來源單號",
+              "經辦人", "發票號碼", "金額", "稅額", amount_field, paid_field, unpaid_field,
+          ]
+          ui.table(
+              columns=[
+                  {
+                      "name": c, "label": c, "field": c,
+                      "align": "right" if c in money_cols else "left",
+                      "sortable": True,
+                  }
+                  for c in columns
+              ],
+              rows=display_rows,
+              pagination={"rowsPerPage": 20, "sortBy": "單據日期", "descending": True},
+          ).classes("w-full").props(':rows-per-page-options="[10,20,50,0]"')
+
+      render_table()
+
+    return do_query
+
+  async def render_supplier_info_tab(container):
+    container.clear()
+    with container:
+      with ui.row().classes("w-full items-center gap-2 p-4 justify-center"):
+        ui.spinner(size="24px").classes("text-zinc-400")
+        ui.label("讀取廠商資訊中…").classes("text-xs text-zinc-500")
+    await asyncio.sleep(0)
+
+    token = get_a1_token()
+    container.clear()
+    if not token:
+      with container:
+        ui.label("A1登入失敗，請確認 A1_API_KEY／A1_API_PASSWORD 設定").classes("text-xs text-red-600")
+      return
+
+    suppliers, err = await run.io_bound(fetch_a1_supplier_details, token)
+    accounting_state["suppliers_by_name"] = {
+        (s.get("Name") or s.get("ShortName")): s for s in suppliers if s.get("Name") or s.get("ShortName")
+    }
+    with container:
+      if err:
+        ui.label(f"讀取廠商資訊失敗：{err}").classes("text-xs text-red-600")
+        return
+      if not suppliers:
+        ui.label("目前沒有廠商資料").classes("text-xs text-zinc-400")
+        return
+      ui.label(f"共 {len(suppliers)} 家廠商").classes("text-xs text-zinc-500 mb-2")
+      preferred_cols = [
+          "ID", "Name", "ShortName", "Address", "Phone", "Fax",
+          "TaxNo", "Contact", "AccountDay", "PaymentDay",
+      ]
+      present_cols = [c for c in preferred_cols if any(s.get(c) not in (None, "") for s in suppliers)]
+      if not present_cols:
+        present_cols = list(suppliers[0].keys())[:8]
+      ui.table(
+          columns=[
+              {"name": c, "label": c, "field": c, "align": "left", "sortable": True}
+              for c in present_cols
+          ],
+          rows=[{c: s.get(c, "") for c in present_cols} for s in suppliers],
+          pagination={"rowsPerPage": 20, "sortBy": present_cols[0], "descending": False},
+      ).classes("w-full").props(':rows-per-page-options="[10,20,50,0]"')
+
+  def render_accounting_company_content(company_name):
+    content_container.clear()
+    with content_container:
+      with ui.column().classes("w-full p-8 max-w-[1600px] mx-auto gap-4"):
+        if company_name not in ACCOUNTING_APP_COMPANIES:
+          with ui.card().classes(
+              "w-full p-16 bg-white border border-[#e6e1d4]"
+              " shadow-[0_1px_3px_rgba(42,40,35,0.06)] rounded-lg text-center"
+          ):
+            ui.label(company_name).classes("text-lg font-bold text-zinc-900 mb-2")
+            ui.label("這間公司的雲端會計功能還沒開通，敬請期待").classes(
+                "text-sm text-zinc-500"
+            )
+          return
+
+        ui.label(company_name).classes("text-lg font-bold text-zinc-900")
+
+        with ui.row().classes(
+            "w-full p-3 mb-1 bg-[#fdecea] border border-[#f5c2c0] rounded-lg"
+        ):
+          ui.label(
+              "「應收明細」的經辦人／發票號碼／已收金額／未收金額這幾欄"
+              "是嘗試從A1銷貨單資料裡抓，還沒實際驗證過A1有沒有回傳這些"
+              "欄位——如果查詢後這幾欄一直是空的，代表A1這支API沒有給這"
+              "些資料，需要另外確認有沒有別支API可以拿到，或改成人工"
+              "維護（跟應付明細一樣上傳Excel）。"
+          ).classes("text-xs text-red-700")
+
+        with ui.tabs(
+            on_change=lambda e: handle_section_change(e.value)
+        ).props("dense no-caps").classes("w-full") as section_tabs:
+          ui.tab("廠商資訊")
+          ui.tab("應收明細")
+          ui.tab("應付明細")
+
+        section_body = ui.column().classes("w-full")
+        payable_requery_fn = {"fn": None}
+
+        async def handle_section_change(tab_label):
+          section_body.clear()
+          if tab_label == "廠商資訊":
+            with section_body:
+              supplier_container = ui.column().classes("w-full")
+            await render_supplier_info_tab(supplier_container)
+          elif tab_label == "應收明細":
+            with section_body:
+              render_ledger_tab(
+                  ui.column().classes("w-full"),
+                  "客戶", "應收金額", "已收金額", "未收金額",
+                  fetch_receivable_rows_for_range,
+              )
+          elif tab_label == "應付明細":
+            with section_body:
+              with ui.card().classes(
+                  "w-full p-4 bg-white border border-[#e6e1d4] rounded-lg mb-3"
+              ):
+                ui.label("應付明細資料來源：人工上傳 Excel").classes(
+                    "text-sm font-bold text-zinc-700 mb-1"
+                )
+                ui.label(
+                    "A1目前沒有開放應付帳款查詢的API，請定期從A1後台匯出"
+                    "Excel、整份覆蓋上傳（欄位：廠商/單據日期/來源單號/"
+                    "經辦人/發票號碼/金額/稅額/應付金額/已付金額/未付"
+                    "金額）。上傳後記得按「查詢」重新整理資料。"
+                ).classes("text-xs text-zinc-500 mb-2")
+
+                def handle_ap_upload(e):
+                  os.makedirs(os.path.dirname(AP_EXCEL_PATH), exist_ok=True)
+                  with open(AP_EXCEL_PATH, "wb") as f:
+                    f.write(e.content.read())
+                  accounting_state["suppliers_by_name"] = None
+                  ui.notify(
+                      f"已上傳「{e.name}」，請按下方「查詢」重新整理", color="positive",
+                  )
+
+                ui.upload(
+                    label="上傳應付明細 Excel（.xlsx，整份覆蓋）",
+                    on_upload=handle_ap_upload,
+                    auto_upload=True,
+                ).props('accept=".xlsx"').classes("max-w-sm text-xs")
+
+              payable_requery_fn["fn"] = render_ledger_tab(
+                  ui.column().classes("w-full"),
+                  "廠商", "應付金額", "已付金額", "未付金額",
+                  fetch_payable_rows_from_excel,
+              )
+
+        section_tabs.set_value("廠商資訊")
+
+  with ui.row().classes(
+      "w-full flex flex-nowrap items-center bg-white border-b border-[#e6e1d4]"
+      " px-8 py-3 sticky top-[41px] z-40"
+  ):
+    ui.label("興聖集團｜雲端會計").classes(
+        "text-base font-black tracking-wider flex-shrink-0 mr-4"
+    )
+    with ui.tabs(
+        on_change=lambda e: render_accounting_company_content(e.value)
+    ).props("dense no-caps").classes("flex-shrink-0") as accounting_company_tabs:
+      for i, c in enumerate(COMPANIES):
+        ui.tab(c).classes(f"company-tab-{i}")
+
+  content_container = ui.column().classes("w-full")
+  accounting_company_tabs.set_value("海濤客食品工業(股)公司")
+
 
 
 @ui.page("/analytics")
