@@ -5,11 +5,13 @@ import io
 import json
 import math
 import os
+import re
 import secrets
 import sys
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
+from fastapi import Request
 from nicegui import app, run, ui
 import pandas as pd
 import requests
@@ -1847,7 +1849,7 @@ def fetch_daily_tasks(tab_name):
   return tasks
 
 
-def render_monthly_task_calendar(company_name, orders_source=None, refs=None, refs_key="update_calendar"):
+def render_monthly_task_calendar(company_name, orders_source=None, refs=None, refs_key="update_calendar", production_schedule_key=None):
   """通用每月工作行事曆：company_name決定要讀COMPANY_TASKS_SHEET_TAB裡
   哪一個分頁的每日工作事項（進貨/其它事項/出貨...依實際填的「類型」
   文字動態分組顯示）。orders_source是可選的訂單清單（例如海濤客的
@@ -1860,6 +1862,11 @@ def render_monthly_task_calendar(company_name, orders_source=None, refs=None, re
   函式登記進去（refs[refs_key] = 重新整理函式），這樣外部的「同步」
   按鈕按下去之後，才能連帶把月曆一起重畫成最新資料，不然月曆雖然每次
   自己開啟時都會抓最新資料，但按其他地方的同步按鈕不會主動通知它重畫。
+
+  production_schedule_key：可選，海濤客/容鴻/芙萊柏「生產排程」分頁
+  （品項×月份排程表）用的公司代號（見PRODUCTION_SCHEDULE_COMPANIES）。
+  有給的話，月曆格子會多顯示該公司排程表算出來的「包材到廠」「預計
+  出貨」事件，跟工作事項、訂單出貨顯示在同一個格子裡。
   """
   with ui.card().classes(
       "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)]"
@@ -1886,7 +1893,7 @@ def render_monthly_task_calendar(company_name, orders_source=None, refs=None, re
     ):
       day_detail_body = ui.column().classes("w-full gap-2")
 
-    def open_day_detail(d, orders_by_date, tasks_by_date):
+    def open_day_detail(d, orders_by_date, tasks_by_date, schedule_events_by_date=None):
       day_detail_body.clear()
       with day_detail_body:
         ui.label(d.isoformat()).classes(
@@ -1894,6 +1901,7 @@ def render_monthly_task_calendar(company_name, orders_source=None, refs=None, re
         )
         day_orders = orders_by_date.get(d, [])
         day_tasks = tasks_by_date.get(d, [])
+        day_schedule_events = (schedule_events_by_date or {}).get(d, [])
 
         if orders_source is not None:
           ui.label(f"出貨（訂單資訊，共 {len(day_orders)} 筆）").classes(
@@ -1906,6 +1914,22 @@ def render_monthly_task_calendar(company_name, orders_source=None, refs=None, re
                 f"{o.get('訂單編號','')}｜{o.get('品名','')}"
                 f" x{o.get('預計出貨數量','')}"
             ).classes("text-xs text-zinc-600")
+
+        if production_schedule_key is not None:
+          ui.label(f"生產排程（品項×月份排程表，共 {len(day_schedule_events)} 筆）").classes(
+              "text-xs font-bold text-zinc-700 mt-2"
+          )
+          if not day_schedule_events:
+            ui.label("（無）").classes("text-xs text-zinc-400")
+          for ev in day_schedule_events:
+            icon = "📦" if ev["type"] == "material" else "🚚"
+            ui.label(
+                f"{icon} {ev['label']}｜{ev['qty']:,} 件"
+            ).classes("text-xs text-zinc-600")
+            if ev.get("detail"):
+              ui.label(ev["detail"]).classes(
+                  "text-xs text-zinc-400"
+              ).style("white-space: pre-line")
 
         # 依「類型」欄位實際出現的文字動態分組（不限定固定選項），
         # 保留原本的填寫順序，同類型的排在一起。
@@ -1971,6 +1995,11 @@ def render_monthly_task_calendar(company_name, orders_source=None, refs=None, re
         for t in tasks_raw:
           tasks_by_date[t["日期"]].append(t)
 
+      schedule_events_by_date = {}
+      if production_schedule_key is not None:
+        schedule_state = load_production_schedule_state(production_schedule_key)
+        schedule_events_by_date = compute_production_schedule_events(schedule_state)
+
       with calendar_grid_container:
         if tasks_not_configured:
           ui.label(
@@ -2013,6 +2042,7 @@ def render_monthly_task_calendar(company_name, orders_source=None, refs=None, re
             d = datetime(year, month, day_num).date()
             day_orders = orders_by_date.get(d, [])
             day_tasks = tasks_by_date.get(d, [])
+            day_schedule_events = schedule_events_by_date.get(d, [])
             is_today = d == today_for_cal
 
             with ui.column().classes(
@@ -2024,8 +2054,8 @@ def render_monthly_task_calendar(company_name, orders_source=None, refs=None, re
                 )
             ).on(
                 "click",
-                lambda e, d=d, ob=orders_by_date, tb=tasks_by_date:
-                    open_day_detail(d, ob, tb),
+                lambda e, d=d, ob=orders_by_date, tb=tasks_by_date, sb=schedule_events_by_date:
+                    open_day_detail(d, ob, tb, sb),
             ):
               ui.label(str(day_num)).classes(
                   "text-xs font-bold text-zinc-700"
@@ -2039,6 +2069,12 @@ def render_monthly_task_calendar(company_name, orders_source=None, refs=None, re
                 # 詳細分類點進去看detail dialog即可。
                 ui.label(f"事項 {len(day_tasks)}").classes(
                     "text-[10px] text-purple-700"
+                )
+              for ev in day_schedule_events:
+                icon = "📦" if ev["type"] == "material" else "🚚"
+                ui.label(f"{icon} {ev['qty']:,}").classes(
+                    "text-[10px] text-amber-700"
+                    if ev["type"] == "material" else "text-[10px] text-orange-700"
                 )
 
     render_calendar_grid()
@@ -4086,6 +4122,168 @@ app.add_static_files("/static", STATIC_DIR)
 LOGO_PATH = os.path.join(STATIC_DIR, "logo.png")
 
 
+# -------------------------------------------------------------------------
+# 生產排程表（品項×月份，含包材到廠/出貨時程自動彙整）：後端儲存 API
+# -------------------------------------------------------------------------
+# 前端是 static/production-schedule.html（單一份靜態頁面，用網址參數
+# ?company=xxx 分辨是哪間公司），原本用Artifacts環境專屬的window.storage
+# 存資料，搬進這個系統後改成打這兩支API，存成本機JSON檔案（伺服器重啟
+# 會清空，之後如果要跨重啟保存，可以改成寫回Google Sheet，目前先用最
+# 簡單的方式讓功能能動）。
+PRODUCTION_SCHEDULE_DATA_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "data", "production_schedule"
+)
+os.makedirs(PRODUCTION_SCHEDULE_DATA_DIR, exist_ok=True)
+
+# 網址參數用的公司代號 -> 中文公司名稱（顯示標題／給行事曆整合用）
+PRODUCTION_SCHEDULE_COMPANIES = {
+    "hai_tao_ke": "海濤客食品工業(股)公司",
+    "rong_hong": "容鴻(股)公司",
+    "fu_lai_bo": "芙萊柏(股)公司",
+}
+
+
+def _production_schedule_file_path(company_key):
+  safe_key = "".join(c for c in company_key if c.isalnum() or c == "_")
+  return os.path.join(PRODUCTION_SCHEDULE_DATA_DIR, f"{safe_key}.json")
+
+
+@app.get("/api/production-schedule/{company_key}")
+def api_get_production_schedule(company_key: str):
+  from fastapi.responses import JSONResponse
+  if company_key not in PRODUCTION_SCHEDULE_COMPANIES:
+    return JSONResponse({"error": "invalid company_key"}, status_code=400)
+  path = _production_schedule_file_path(company_key)
+  if not os.path.exists(path):
+    return JSONResponse({"value": None})
+  try:
+    with open(path, "r", encoding="utf-8") as f:
+      return JSONResponse({"value": f.read()})
+  except Exception as e:
+    return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/production-schedule/{company_key}")
+async def api_save_production_schedule(company_key: str, request: Request):
+  from fastapi.responses import JSONResponse
+  if company_key not in PRODUCTION_SCHEDULE_COMPANIES:
+    return JSONResponse({"error": "invalid company_key"}, status_code=400)
+  try:
+    body = await request.json()
+    value = body.get("value")
+    if value is None:
+      return JSONResponse({"error": "missing value"}, status_code=400)
+    path = _production_schedule_file_path(company_key)
+    with open(path, "w", encoding="utf-8") as f:
+      f.write(value)
+    return JSONResponse({"ok": True})
+  except Exception as e:
+    return JSONResponse({"error": str(e)}, status_code=500)
+
+
+def load_production_schedule_state(company_key):
+  """讀取指定公司的生產排程表 JSON 狀態（跟上面的API讀同一份檔案）。
+  回傳 dict 或 None（檔案不存在，代表還沒填過任何資料）。
+  """
+  path = _production_schedule_file_path(company_key)
+  if not os.path.exists(path):
+    return None
+  try:
+    with open(path, "r", encoding="utf-8") as f:
+      return json.loads(f.read())
+  except Exception as e:
+    print(f"[生產排程] 讀取「{company_key}」狀態失敗：{e}")
+    return None
+
+
+def _psched_parse_qty(raw):
+  """跟前端parseQty()邏輯一致：抓出字串裡所有數字（含千分位逗號）加總，
+  例如"3000+2000"算5000，方便同一格用「+」表示多筆加訂。"""
+  if not raw:
+    return 0
+  nums = re.findall(r"\d[\d,]*", str(raw))
+  return sum(int(n.replace(",", "")) for n in nums)
+
+
+def _psched_parse_date(raw):
+  """跟前端parseDate()邏輯一致：從字串裡抓數字當年/月/日，寬鬆解析
+  （"2026/8/17"、"9月18日"、"9/18"都可以），抓不到就回傳None。"""
+  if not raw:
+    return None
+  nums = [int(n) for n in re.findall(r"\d+", str(raw))]
+  if not nums:
+    return None
+  year = 2026
+  y_idx = next((i for i, n in enumerate(nums) if n >= 1000), None)
+  if y_idx is not None:
+    year = nums[y_idx]
+    rest = [n for i, n in enumerate(nums) if i != y_idx]
+    month = rest[0] if rest else None
+    day = rest[1] if len(rest) > 1 else 1
+  else:
+    month = nums[0]
+    day = nums[1] if len(nums) > 1 else 1
+  if not month or not (1 <= month <= 12):
+    return None
+  try:
+    return date(year, month, day or 1)
+  except ValueError:
+    return None
+
+
+def compute_production_schedule_events(state):
+  """把生產排程表state（products/months/cells/materialArrival）換算成
+  {date: [{"type": "material"/"ship", "qty":.., "label":..}, ...]} 的
+  事件字典，給行事曆整合用；跟前端 buildEvents() 邏輯對應，只是搬到
+  Python算一次，不用真的載入iframe裡的JS。
+  """
+  events_by_date = defaultdict(list)
+  if not state:
+    return events_by_date
+
+  products = {p["id"]: p.get("name", p["id"]) for p in state.get("products", [])}
+  cells = state.get("cells", {})
+  months = {m["id"]: m.get("label", m["id"]) for m in state.get("months", [])}
+
+  for month_id, date_str in (state.get("materialArrival") or {}).items():
+    d = _psched_parse_date(date_str)
+    if not d:
+      continue
+    qty = sum(
+        _psched_parse_qty((cells.get(f"{pid}_{month_id}") or {}).get("qty"))
+        for pid in products
+    )
+    if qty > 0:
+      events_by_date[d].append({
+          "type": "material",
+          "qty": qty,
+          "label": f"{months.get(month_id, month_id)} 包材到廠",
+      })
+
+  ship_map = defaultdict(lambda: {"qty": 0, "items": []})
+  for key, cell in cells.items():
+    date_str = (cell or {}).get("date")
+    qty = _psched_parse_qty((cell or {}).get("qty"))
+    if not date_str or qty <= 0:
+      continue
+    pid = key.rsplit("_", 1)[0]
+    d = _psched_parse_date(date_str)
+    if not d:
+      continue
+    ship_map[d]["qty"] += qty
+    ship_map[d]["items"].append(f"{products.get(pid, pid)} {qty:,}")
+
+  for d, info in ship_map.items():
+    events_by_date[d].append({
+        "type": "ship",
+        "qty": info["qty"],
+        "label": "預計出貨",
+        "detail": "、".join(info["items"]),
+    })
+
+  return events_by_date
+
+
 # 初始化全域狀態
 initial_df, initial_whs, initial_cats, initial_items_map, initial_customers_map, initial_suppliers_map = fetch_all_a1_inventory()
 initial_bom_map, initial_bom_source, initial_bom_error = load_bom_data()
@@ -4520,9 +4718,17 @@ def inventory_dashboard():
     tabs_class = f"section-tabs-{slug}"
 
     if company_name in ("容鴻(股)公司", "芙萊柏(股)公司"):
-      SECTION_TABS = ["儀表板", "商品資訊", "調撥紀錄", "退換貨記錄", "採購分析"]
+      SECTION_TABS = ["儀表板", "商品資訊", "調撥紀錄", "退換貨記錄", "生產排程", "採購分析"]
     else:
       SECTION_TABS = ["儀表板", "調撥紀錄", "退換貨記錄", "採購分析"]
+
+    # 「生產排程」（品項×月份排程表）用的公司代號，給iframe網址跟儀表板
+    # 月曆整合用；興聖目前不開放這個分頁，company_name不在這裡的話
+    # PRODUCTION_SCHEDULE_KEY會是None。
+    PRODUCTION_SCHEDULE_KEY = {
+        "容鴻(股)公司": "rong_hong",
+        "芙萊柏(股)公司": "fu_lai_bo",
+    }.get(company_name)
 
     with content_container:
       with ui.column().classes("w-full p-8 max-w-[1600px] mx-auto gap-4"):
@@ -4559,7 +4765,9 @@ def inventory_dashboard():
           if tab_label == "儀表板":
             section_body.clear()
             with section_body:
-              render_monthly_task_calendar(company_name)
+              render_monthly_task_calendar(
+                  company_name, production_schedule_key=PRODUCTION_SCHEDULE_KEY,
+              )
           elif tab_label == "商品資訊":
             section_body.clear()
             with section_body:
@@ -4580,6 +4788,27 @@ def inventory_dashboard():
             section_body.clear()
             with section_body:
               render_section_placeholder("退換貨記錄")
+          elif tab_label == "生產排程":
+            section_body.clear()
+            with section_body:
+              with ui.card().classes(
+                  "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)]"
+                  " rounded-lg"
+              ):
+                ui.label("生產排程表（品項×月份）").classes(
+                    "text-lg font-bold text-zinc-900 tracking-wide mb-2"
+                )
+                ui.label(
+                    "品項×月份的排程格，手動填入數量/交期，自動彙整"
+                    "「包材幾號要到廠、出多少」「幾號要出貨、出多少」的"
+                    "時程；資料存在伺服器上（同一份大家看到的都一樣，"
+                    "不是各自瀏覽器分開存），儀表板月曆也會一起顯示這裡"
+                    "的日期。"
+                ).classes("text-xs text-zinc-500 mb-3")
+                ui.html(
+                    f'<iframe src="/static/production-schedule.html?company={PRODUCTION_SCHEDULE_KEY}"'
+                    ' style="width:100%; height:1400px; border:none;"></iframe>'
+                ).classes("w-full")
           elif tab_label == "採購分析":
             section_body.clear()
             procurement_creds = PROCUREMENT_ANALYSIS_CREDENTIALS.get(company_name)
@@ -4770,6 +4999,7 @@ def inventory_dashboard():
           with ui.tab_panel(tab_dashboard):
             render_monthly_task_calendar(
                 "海濤客食品工業(股)公司", refs=refs, refs_key="update_calendar",
+                production_schedule_key="hai_tao_ke",
             )
 
             with ui.card().classes(
@@ -7037,109 +7267,20 @@ def inventory_dashboard():
                 "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)]"
                 " rounded-lg mb-4"
             ):
-              ui.label("工廠生產排程行事曆").classes(
+              ui.label("生產排程表（品項×月份）").classes(
                   "text-lg font-bold text-zinc-900 tracking-wide mb-2"
               )
               ui.label(
-                  "直接鏡射工廠維護的 Google Sheet 行事曆內容（只顯示文字，"
-                  "不解讀顏色/意義），工廠照原本習慣填寫即可，不用改格式。"
+                  "品項×月份的排程格，手動填入數量/交期，自動彙整「包材"
+                  "幾號要到廠、出多少」「幾號要出貨、出多少」的時程；"
+                  "資料存在伺服器上（同一份大家看到的都一樣，不是各自"
+                  "瀏覽器分開存），儀表板月曆也會一起顯示這裡的日期。"
               ).classes("text-xs text-zinc-500 mb-3")
+              ui.html(
+                  '<iframe src="/static/production-schedule.html?company=hai_tao_ke"'
+                  ' style="width:100%; height:1400px; border:none;"></iframe>'
+              ).classes("w-full")
 
-              production_schedule_state = {"weeks": None, "index": 0, "error": None}
-
-              def load_production_schedule():
-                values, error = fetch_production_schedule_grid()
-                if error:
-                  production_schedule_state["error"] = error
-                  production_schedule_state["weeks"] = None
-                  return
-                weeks = parse_production_schedule_grid(values or [])
-                production_schedule_state["weeks"] = weeks
-                production_schedule_state["error"] = None
-                today = datetime.now().date()
-                best_idx, best_diff = 0, None
-                for i, w in enumerate(weeks):
-                  valid_dates = [d for d in w["dates"] if d]
-                  if not valid_dates:
-                    continue
-                  diff = abs((min(valid_dates) - today).days)
-                  if best_diff is None or diff < best_diff:
-                    best_diff, best_idx = diff, i
-                production_schedule_state["index"] = best_idx
-
-              def navigate_schedule_week(delta):
-                weeks = production_schedule_state["weeks"] or []
-                if not weeks:
-                  return
-                new_idx = production_schedule_state["index"] + delta
-                production_schedule_state["index"] = max(0, min(new_idx, len(weeks) - 1))
-                render_production_schedule_view()
-
-              def render_production_schedule_view():
-                schedule_view_container.clear()
-                with schedule_view_container:
-                  if production_schedule_state["error"]:
-                    render_section_placeholder(
-                        "生產排程行事曆", f"讀取失敗：{production_schedule_state['error']}"
-                    )
-                    return
-                  weeks = production_schedule_state["weeks"]
-                  if not weeks:
-                    render_section_placeholder(
-                        "生產排程行事曆",
-                        "尚未設定 Google Sheets，或找不到符合格式的週次資料"
-                        "（需要有一列剛好是星期日～星期六）",
-                    )
-                    return
-
-                  idx = production_schedule_state["index"]
-                  week = weeks[idx]
-                  valid_dates = [d for d in week["dates"] if d]
-                  date_range_label = (
-                      f"{valid_dates[0].isoformat()} ～ {valid_dates[-1].isoformat()}"
-                      if valid_dates else "（無法辨識日期）"
-                  )
-
-                  with ui.row().classes("w-full items-center justify-between mb-3"):
-                    ui.button(
-                        "← 上一週", on_click=lambda: navigate_schedule_week(-1),
-                    ).props("dense no-caps unelevated").classes(
-                        "px-3 py-1 text-xs rounded-lg"
-                    ).style(
-                        "background:#ffffff; color:#4b5563; border:1px solid #e6e1d4;"
-                    )
-                    ui.label(date_range_label).classes(
-                        "text-sm font-bold text-zinc-700"
-                    )
-                    ui.button(
-                        "下一週 →", on_click=lambda: navigate_schedule_week(1),
-                    ).props("dense no-caps unelevated").classes(
-                        "px-3 py-1 text-xs rounded-lg"
-                    ).style(
-                        "background:#ffffff; color:#4b5563; border:1px solid #e6e1d4;"
-                    )
-
-                  with ui.row().classes("w-full gap-2 items-stretch"):
-                    for i, label in enumerate(WEEKDAY_LABELS):
-                      d = week["dates"][i]
-                      with ui.column().classes(
-                          "flex-1 gap-1 p-2 bg-[#f7f5ef] border border-[#e6e1d4]"
-                          " rounded-lg min-h-[140px]"
-                      ):
-                        ui.label(label).classes("text-xs font-bold text-zinc-700")
-                        ui.label(d.isoformat() if d else "-").classes(
-                            "text-xs text-zinc-400 mb-1"
-                        )
-                        if not week["events"][i]:
-                          ui.label("（無資料）").classes("text-xs text-zinc-300")
-                        for ev in week["events"][i]:
-                          ui.label(ev).classes(
-                              "text-xs text-zinc-600 leading-snug"
-                          )
-
-              schedule_view_container = ui.column().classes("w-full")
-              load_production_schedule()
-              render_production_schedule_view()
 
             with ui.card().classes(
                 "w-full p-6 bg-white border border-[#e6e1d4] shadow-[0_1px_3px_rgba(42,40,35,0.06)]"
