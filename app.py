@@ -1643,12 +1643,24 @@ def _estimate_payment_date(trade_date, account_day, payment_day):
 
 
 def _parse_a1_date(s):
+  """寬鬆解析日期字串，兩種常見情況都要接住：
+  1. A1 API 回傳的 ISO 格式 "2026-08-13"（可能還帶"T00:00:00"時間部份）
+  2. Excel 儲存格如果本身是日期格式，pandas用dtype=str讀出來常常會變成
+     "2026-08-13 00:00:00"這種帶空白+時間的字串；如果儲存格是純文字
+     格式，可能長得像畫面上看到的"2026/08/13"（斜線）。
+  兩種分隔符號、有沒有夾帶時間都要能解析，不然「應付明細」上傳的Excel
+  很容易因為日期解析失敗，被當成沒有單據日期整批跳過，導致查詢结果
+  一片空白。
+  """
   if not s:
     return None
-  try:
-    return datetime.strptime(str(s).split("T")[0], "%Y-%m-%d").date()
-  except ValueError:
-    return None
+  s = str(s).strip().split("T")[0].split(" ")[0]
+  for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+    try:
+      return datetime.strptime(s, fmt).date()
+    except ValueError:
+      continue
+  return None
 
 
 def compute_receivable_rows(sales_rows, customers_by_id):
@@ -1735,11 +1747,18 @@ def parse_payable_excel(path, suppliers_by_name=None):
     print(f"讀取應付明細 Excel 失敗：{e}")
     return []
 
+  print(f"[應付明細] Excel實際欄位標題：{list(df.columns)}，共 {len(df)} 列")
+  if len(df) > 0:
+    print(f"[應付明細] 第1列原始內容：{df.iloc[0].to_dict()}")
+
   rows = []
+  skipped_no_date = 0
   for record in df.fillna("").to_dict("records"):
     vendor = str(record.get("廠商", "")).strip()
     date_str = str(record.get("單據日期", "")).strip()
     trade_date = _parse_a1_date(date_str)
+    if not trade_date:
+      skipped_no_date += 1
     supplier = suppliers_by_name.get(vendor, {})
     statement_date = (
         _estimate_statement_date(trade_date, supplier.get("AccountDay"))
@@ -1772,6 +1791,11 @@ def parse_payable_excel(path, suppliers_by_name=None):
         "_statement_date": statement_date,
         "_payment_date": payment_date,
     })
+  print(
+      f"[應付明細] 解析完成：共 {len(rows)} 列，其中 {skipped_no_date} 列"
+      "「單據日期」解析失敗（畫面上會顯示，但因為沒有日期，篩選時如果"
+      "選了日期範圍會被排除）"
+  )
   return rows
 
 
@@ -8910,12 +8934,17 @@ def cloud_accounting_dashboard():
     rows = parse_payable_excel(AP_EXCEL_PATH, accounting_state["suppliers_by_name"])
     return rows, None
 
-  def render_ledger_tab(container, entity_field, amount_field, paid_field, unpaid_field, fetch_fn):
+  def render_ledger_tab(container, entity_field, amount_field, paid_field, unpaid_field, fetch_fn, require_date_range=True):
     """應收明細／應付明細共用的「篩選＋表格」畫面。entity_field是
     "客戶"或"廠商"；amount_field/paid_field/unpaid_field是該分類金額
     欄位的key名稱（"應收金額"/"已收金額"/"未收金額" 或
     "應付金額"/"已付金額"/"未付金額"）；fetch_fn(date_type, start, end)
     是實際的資料來源（A1 API或Excel），回傳(rows, error)。
+    require_date_range：應收明細資料來源是A1 API，不限縮日期範圍會抓
+    太多、太慢，所以要求一定要先選起訖日期才給查；應付明細資料來源是
+    本機Excel（資料量小、本來就整份讀進來），不需要這個限制，設False
+    讓「不選日期直接查」也能顯示全部資料，篩選之後再用起訖日期縮小
+    範圍即可。
     回傳一個「重新查詢」函式，給外部（例如應付明細上傳完新Excel後）
     觸發重新整理用。
     """
@@ -8923,8 +8952,9 @@ def cloud_accounting_dashboard():
 
     with container:
       ui.label(
-          f"「日期類型」決定下面起訖日期是比對哪一欄；「{entity_field}」"
-          "篩選是選填，資料抓回來後才會列出目前有出現過的名稱可以選。"
+          f"「日期類型」決定下面起訖日期是比對哪一欄；起訖日期／"
+          f"「{entity_field}」篩選都是選填，資料抓回來後才會列出目前"
+          "有出現過的名稱可以選。"
       ).classes("text-xs text-zinc-500 mb-2")
       summary_label = ui.label("尚未查詢").classes("text-xs text-zinc-500 mb-2")
       error_container = ui.column().classes("w-full mb-2")
@@ -8933,8 +8963,8 @@ def cloud_accounting_dashboard():
         date_type_select = ui.select(
             DATE_TYPE_OPTIONS, value="單據日期", label="日期類型",
         ).props("dense outlined").classes("w-32")
-        start_input = ui.input(label="起").props("dense outlined type=date").classes("w-40")
-        end_input = ui.input(label="迄").props("dense outlined type=date").classes("w-40")
+        start_input = ui.input(label="起（選填）").props("dense outlined type=date").classes("w-40")
+        end_input = ui.input(label="迄（選填）").props("dense outlined type=date").classes("w-40")
         entity_select = ui.select(
             [], value=None, label=f"{entity_field}（選填）",
         ).props("dense outlined clearable").classes("w-56")
@@ -8943,7 +8973,7 @@ def cloud_accounting_dashboard():
           state["date_type"] = date_type_select.value
           state["start"] = _parse_a1_date(start_input.value) if start_input.value else None
           state["end"] = _parse_a1_date(end_input.value) if end_input.value else None
-          if not state["start"] or not state["end"]:
+          if require_date_range and (not state["start"] or not state["end"]):
             ui.notify("請先選擇查詢起訖日期", color="warning")
             return
           query_btn.props("loading")
@@ -9201,6 +9231,7 @@ def cloud_accounting_dashboard():
                   ui.column().classes("w-full"),
                   "廠商", "應付金額", "已付金額", "未付金額",
                   fetch_payable_rows_from_excel,
+                  require_date_range=False,
               )
 
         section_tabs.set_value("廠商資訊")
