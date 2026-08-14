@@ -60,9 +60,14 @@
     background:#FDFBF6; border:1px solid var(--line); border-radius:8px;
     padding:12px; margin-bottom:14px;
   }
-  .product-search-panel input{
-    width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:6px;
-    font-size:13px; margin-bottom:8px;
+  .product-search-filters{ display:flex; gap:8px; margin-bottom:8px; flex-wrap:wrap;}
+  .product-search-filters input{
+    flex:2; min-width:180px; padding:8px 10px; border:1px solid var(--line); border-radius:6px;
+    font-size:13px;
+  }
+  .product-search-filters select{
+    flex:1; min-width:140px; padding:8px 10px; border:1px solid var(--line); border-radius:6px;
+    font-size:13px; background:#fff; color:var(--ink);
   }
   .product-search-results{ max-height:220px; overflow-y:auto; }
   .product-search-results .psr-item{
@@ -152,21 +157,18 @@
   }
   .cell input.qty-input{ font-weight:700; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
   .cell input:focus{ border-color:var(--navy); outline:none;}
+  .cell select.type-select{
+    border:1px solid transparent; background:#fff; border-radius:4px;
+    font-size:11px; text-align:center; padding:3px 1px; width:100%; color:var(--ink-soft);
+  }
+  .cell select.type-select:focus{ border-color:var(--navy); outline:none;}
+  .cell input.material-date-input{ font-size:11px; color:var(--ink-soft); }
   .cell .flag-toggle{
     position:absolute; top:2px; right:2px; border:none; background:none;
     font-size:11px; color:#C9BEA4; cursor:pointer; line-height:1; padding:1px;
   }
   .cell.is-new .flag-toggle{ color:var(--amber); }
 
-  tfoot td{ font-size:12.5px; }
-  tr.total-row td{ background:var(--green-bg); font-weight:700; padding:8px 4px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
-  tr.total-row td.sticky-col{ background:var(--green-bg); font-family:inherit; }
-  tr.material-row td{ padding:6px 4px; }
-  tr.material-row td.sticky-col{ background:#FAF8F3; }
-  tr.material-row input{
-    width:90%; border:1px solid var(--line); border-radius:4px;
-    text-align:center; font-size:12px; padding:4px 2px;
-  }
   .note-strip{ font-size:11.5px; color:var(--coral); margin-top:8px;}
 
   /* ---- timeline ---- */
@@ -247,9 +249,14 @@
       <button class="ghost danger" id="resetBtn">重置為範例資料</button>
     </div>
     <div class="product-search-panel" id="productSearchPanel" style="display:none;">
-      <input type="text" id="productSearchInput" placeholder="輸入品名關鍵字搜尋商品資訊…">
+      <div class="product-search-filters">
+        <input type="text" id="productSearchInput" placeholder="輸入品名關鍵字搜尋商品資訊…">
+        <select id="productCategorySelect">
+          <option value="">全部分類</option>
+        </select>
+      </div>
       <div class="product-search-results" id="productSearchResults">
-        <div class="psr-empty">輸入關鍵字開始搜尋…</div>
+        <div class="psr-empty">輸入關鍵字或選擇分類開始搜尋…</div>
       </div>
       <div class="product-search-footer">
         <span class="product-search-hint">找不到想要的品項？</span>
@@ -260,7 +267,7 @@
     <div class="table-scroll">
       <table id="mainTable"></table>
     </div>
-    <div class="note-strip">交期＝工廠預計出貨日／填裝日；每格上方數字為數量，可用「+」表示多筆加訂（例如 3000+2000）；點格子右上角 ✦ 可標記為新增訂單。月份會依系統日期自動隱藏已過的月份，也可點月份標籤下方按鈕手動切換「自動／封存／強制顯示」。</div>
+    <div class="note-strip">每格可選擇類型（進貨／生產）、填入數量與交期（可用「+」表示多筆加訂，例如 3000+2000），另有「包材/原料寄出日」可手動填寫，兩個日期各自獨立、可以只填一個；點格子右上角 ✦ 可標記為新增訂單。月份會依系統日期自動隱藏已過的月份，也可點月份標籤下方按鈕手動切換「自動／封存／強制顯示」。</div>
   </section>
 
   <section class="panel">
@@ -300,7 +307,7 @@ function defaultState(){
     .map(n=>({id:n.toLowerCase(), name:n}));
 
   const cells = {};
-  const set = (p,y,m,qty,date,isNew)=>{ cells[p.toLowerCase()+'_'+monthId(y,m)] = {qty:String(qty), date:date||'', new:!!isNew}; };
+  const set = (p,y,m,qty,date,isNew)=>{ cells[p.toLowerCase()+'_'+monthId(y,m)] = {qty:String(qty), date:date||'', new:!!isNew, type:'', materialDate:''}; };
 
   set('B1',2026,6,2000); set('B2',2026,6,2000); set('W5',2026,6,1000);
   set('F2',2026,6,2000); set('M1',2026,6,2000); set('O1',2026,6,1000); set('SS',2026,6,1000);
@@ -323,13 +330,6 @@ function defaultState(){
   set('B2',2026,12,3000,'2026/12/8',true); set('W1',2026,12,3000,'2026/12/8',true);
   set('W3',2026,12,3000,'2026/12/8',true); set('W4',2026,12,3000,'2026/12/8',true);
 
-  const materialArrival = {};
-  materialArrival[monthId(2026,8)] = '2026/7/30';
-  materialArrival[monthId(2026,9)] = '2026/8/27';
-  materialArrival[monthId(2026,10)] = '2026/9/18';
-  materialArrival[monthId(2026,11)] = '2026/10/16';
-  materialArrival[monthId(2026,12)] = '2026/11/20';
-
   const logs = [
     '7月份追加 SS 2000',
     '7/8 追加 O1 3000',
@@ -339,7 +339,7 @@ function defaultState(){
     '原12月生產的 O1 改到11月生產，再增加12月訂單'
   ];
 
-  return { products, months, cells, materialArrival, logs, showCompleted:false };
+  return { products, months, cells, logs, showCompleted:false };
 }
 
 let state = defaultState();
@@ -457,10 +457,10 @@ function updateToggleLabel(){
   btn.classList.toggle('primary', state.showCompleted);
 }
 function cellKey(p,m){ return p+'_'+m; }
-function getCell(p,m){ return state.cells[cellKey(p,m)] || {qty:'',date:'',new:false}; }
+function getCell(p,m){ return state.cells[cellKey(p,m)] || {qty:'',date:'',new:false,type:'',materialDate:''}; }
 function ensureCell(p,m){
   const k = cellKey(p,m);
-  if(!state.cells[k]) state.cells[k] = {qty:'',date:'',new:false};
+  if(!state.cells[k]) state.cells[k] = {qty:'',date:'',new:false,type:'',materialDate:''};
   return state.cells[k];
 }
 function computeMonthTotal(monthId){
@@ -502,28 +502,20 @@ function renderTable(){
       html += `<td>
         <div class="cell ${hasQty?'has-qty':''} ${c.new?'is-new':''}" data-product="${esc(p.id)}" data-month="${esc(m.id)}">
           <button class="flag-toggle" data-action="toggle-new" data-product="${esc(p.id)}" data-month="${esc(m.id)}" title="標記／取消新增">✦</button>
+          <select class="type-select" data-field="type" data-product="${esc(p.id)}" data-month="${esc(m.id)}">
+            <option value="" ${!c.type?'selected':''}>類型</option>
+            <option value="進貨" ${c.type==='進貨'?'selected':''}>進貨</option>
+            <option value="生產" ${c.type==='生產'?'selected':''}>生產</option>
+          </select>
           <input class="qty-input" data-field="qty" data-product="${esc(p.id)}" data-month="${esc(m.id)}" placeholder="數量" value="${esc(c.qty)}">
           <input class="date-input" data-field="date" data-product="${esc(p.id)}" data-month="${esc(m.id)}" placeholder="交期" value="${esc(c.date)}">
+          <input class="material-date-input" data-field="materialDate" data-product="${esc(p.id)}" data-month="${esc(m.id)}" placeholder="包材/原料寄出日" value="${esc(c.materialDate||'')}">
         </div>
       </td>`;
     });
     html += '</tr>';
   });
-  html += '</tbody><tfoot>';
-
-  html += '<tr class="total-row"><td class="sticky-col">月合計</td>';
-  visibleMonths.forEach(m=>{
-    html += `<td><span id="tot-${esc(m.id)}">${computeMonthTotal(m.id).toLocaleString()}</span></td>`;
-  });
-  html += '</tr>';
-
-  html += '<tr class="material-row"><td class="sticky-col">包材到廠日</td>';
-  visibleMonths.forEach(m=>{
-    html += `<td><input class="material-date" data-month="${esc(m.id)}" placeholder="到廠日期" value="${esc(state.materialArrival[m.id]||'')}"></td>`;
-  });
-  html += '</tr>';
-
-  html += '</tfoot>';
+  html += '</tbody>';
   table.innerHTML = html;
   updateToggleLabel();
 }
@@ -547,27 +539,40 @@ function renderStats(){
 function buildEvents(){
   const events = [];
   const visibleMonths = getVisibleMonths();
-  visibleMonths.forEach(m=>{
-    const dateStr = state.materialArrival[m.id];
-    if(dateStr && dateStr.trim()){
-      const qty = computeMonthTotal(m.id);
-      events.push({type:'material', date:dateStr, sortDate:parseDate(dateStr), label:m.label+' 包材到廠', qty});
-    }
-  });
-  const shipMap = {};
+  const mainMap = {};     // 交期事件：日期 -> {qty, items, types:Set}
+  const materialMap = {}; // 包材/原料寄出事件：日期 -> {qty, items}
+
   state.products.forEach(p=>{
     visibleMonths.forEach(m=>{
       const c = state.cells[cellKey(p.id,m.id)];
-      if(c && c.date && c.date.trim() && parseQty(c.qty)>0){
-        if(!shipMap[c.date]) shipMap[c.date] = {qty:0, items:[]};
-        shipMap[c.date].qty += parseQty(c.qty);
-        shipMap[c.date].items.push(p.name+' '+parseQty(c.qty).toLocaleString());
+      if(!c) return;
+      const qty = parseQty(c.qty);
+      if(qty<=0) return;
+      if(c.date && c.date.trim()){
+        if(!mainMap[c.date]) mainMap[c.date] = {qty:0, items:[], types:new Set()};
+        mainMap[c.date].qty += qty;
+        mainMap[c.date].items.push(p.name+' '+qty.toLocaleString()+(c.type?`（${c.type}）`:''));
+        if(c.type) mainMap[c.date].types.add(c.type);
+      }
+      if(c.materialDate && c.materialDate.trim()){
+        if(!materialMap[c.materialDate]) materialMap[c.materialDate] = {qty:0, items:[]};
+        materialMap[c.materialDate].qty += qty;
+        materialMap[c.materialDate].items.push(p.name+' '+qty.toLocaleString());
       }
     });
   });
-  Object.entries(shipMap).forEach(([dateStr,info])=>{
-    events.push({type:'ship', date:dateStr, sortDate:parseDate(dateStr), label:'預計出貨', qty:info.qty, detail:info.items.join('、')});
+
+  Object.entries(mainMap).forEach(([dateStr,info])=>{
+    let type = 'ship', label = '預計出貨';
+    if(info.types.size===1 && [...info.types][0]==='進貨'){
+      type = 'material'; label = '預計到貨';
+    }
+    events.push({type, date:dateStr, sortDate:parseDate(dateStr), label, qty:info.qty, detail:info.items.join('、')});
   });
+  Object.entries(materialMap).forEach(([dateStr,info])=>{
+    events.push({type:'material', date:dateStr, sortDate:parseDate(dateStr), label:'包材/原料寄出', qty:info.qty, detail:info.items.join('、')});
+  });
+
   events.sort((a,b)=>{
     const da = a.sortDate ? a.sortDate.getTime() : Infinity;
     const db = b.sortDate ? b.sortDate.getTime() : Infinity;
@@ -580,7 +585,7 @@ function renderTimeline(){
   const events = buildEvents();
   const el = document.getElementById('timeline');
   if(events.length===0){
-    el.innerHTML = '<li class="tl-empty">尚無日期資料，請在表格中填入交期或包材到廠日。</li>';
+    el.innerHTML = '<li class="tl-empty">尚無日期資料，請在表格中填入交期或包材/原料寄出日。</li>';
     return;
   }
   el.innerHTML = events.map(e=>`
@@ -621,19 +626,12 @@ function renderAll(){
 /* ---------------- events ---------------- */
 document.addEventListener('input', (e)=>{
   const t = e.target;
-  if(t.classList.contains('qty-input') || t.classList.contains('date-input')){
+  if(t.classList.contains('qty-input') || t.classList.contains('date-input') || t.classList.contains('material-date-input') || t.classList.contains('type-select')){
     const p = t.dataset.product, m = t.dataset.month, field = t.dataset.field;
     const c = ensureCell(p,m);
     c[field] = t.value;
     const wrap = t.closest('.cell');
     if(wrap){ wrap.classList.toggle('has-qty', parseQty(getCell(p,m).qty) > 0); }
-    const totEl = document.getElementById('tot-'+m);
-    if(totEl) totEl.textContent = computeMonthTotal(m).toLocaleString();
-    renderStats();
-    renderTimeline();
-    scheduleSave();
-  } else if(t.classList.contains('material-date')){
-    state.materialArrival[t.dataset.month] = t.value;
     renderStats();
     renderTimeline();
     scheduleSave();
@@ -679,7 +677,6 @@ document.addEventListener('click', (e)=>{
     if(mo && confirm('確定要刪除「'+mo.label+'」這個月份欄位嗎？此欄所有資料將一併移除。')){
       state.months = state.months.filter(x=>x.id!==m);
       Object.keys(state.cells).forEach(k=>{ if(k.endsWith('_'+m)) delete state.cells[k]; });
-      delete state.materialArrival[m];
       renderAll();
       scheduleSave();
     }
@@ -703,16 +700,20 @@ document.addEventListener('click', (e)=>{
   }
 });
 
-/* ---------------- 新增品項：關鍵字搜尋商品資訊，找不到才手動輸入 ----------------
+/* ---------------- 新增品項：關鍵字／分類搜尋商品資訊，找不到才手動輸入 ----------------
    原本是prompt()直接手打名字，容易跟A1商品主檔的品名對不起來（打錯字、
-   漏字），現在改成打 /api/production-schedule-item-search 關鍵字搜尋
-   （後端讀app_state裡的items_map，目前只有海濤客真的有A1商品資料，容鴻/
-   芙萊柏搜尋不到東西是正常的，保留「手動輸入名稱」當退路）。
+   漏字），現在改成打 /api/production-schedule-item-search 關鍵字／分類
+   搜尋（後端讀app_state裡的items_map，目前只有海濤客真的有A1商品資料，
+   容鴻/芙萊柏搜尋不到東西是正常的，保留「手動輸入名稱」當退路）。
+   分類下拉選單的選項來自 /api/production-schedule-item-categories，
+   只在第一次打開搜尋面板時抓一次，之後重複開關不會再重打。
 */
 const productSearchPanel = document.getElementById('productSearchPanel');
 const productSearchInput = document.getElementById('productSearchInput');
+const productCategorySelect = document.getElementById('productCategorySelect');
 const productSearchResults = document.getElementById('productSearchResults');
 let productSearchTimer = null;
+let productCategoriesLoaded = false;
 
 function addProductToState(id, name){
   if(state.products.some(p=>p.id===id)){
@@ -724,11 +725,60 @@ function addProductToState(id, name){
   scheduleSave();
 }
 
+async function ensureProductCategoriesLoaded(){
+  if(productCategoriesLoaded) return;
+  productCategoriesLoaded = true;
+  try{
+    const res = await fetch('/api/production-schedule-item-categories');
+    const data = await res.json();
+    const cats = (data && data.categories) || [];
+    productCategorySelect.innerHTML = '<option value="">全部分類</option>'
+      + cats.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('');
+  }catch(e){
+    // 分類抓不到不影響關鍵字搜尋，保留「全部分類」單一選項即可
+  }
+}
+
+function runProductSearch(){
+  clearTimeout(productSearchTimer);
+  const q = productSearchInput.value.trim();
+  const cat = productCategorySelect.value;
+  if(!q && !cat){
+    productSearchResults.innerHTML = '<div class="psr-empty">輸入關鍵字或選擇分類開始搜尋…</div>';
+    return;
+  }
+  productSearchTimer = setTimeout(async ()=>{
+    productSearchResults.innerHTML = '<div class="psr-empty">搜尋中…</div>';
+    try{
+      const params = new URLSearchParams();
+      if(q) params.set('q', q);
+      if(cat) params.set('category', cat);
+      const res = await fetch('/api/production-schedule-item-search?' + params.toString());
+      const data = await res.json();
+      const items = (data && data.items) || [];
+      if(items.length === 0){
+        productSearchResults.innerHTML = '<div class="psr-empty">查無符合的商品，可以按下方「手動輸入名稱」新增。</div>';
+        return;
+      }
+      productSearchResults.innerHTML = items.map(it => `
+        <div class="psr-item" data-id="${esc(it.id)}" data-name="${esc(it.name)}">
+          <span>${esc(it.name)}</span>
+          <span class="psr-id">${esc(it.category||'')} ${esc(it.id)}</span>
+        </div>
+      `).join('');
+    }catch(e){
+      productSearchResults.innerHTML = '<div class="psr-empty">搜尋失敗，可以按下方「手動輸入名稱」新增。</div>';
+    }
+  }, 300);
+}
+
 document.getElementById('addProductBtn').addEventListener('click', ()=>{
   productSearchPanel.style.display = 'block';
   productSearchInput.value = '';
-  productSearchResults.innerHTML = '<div class="psr-empty">輸入關鍵字開始搜尋…</div>';
+  productCategorySelect.value = '';
+  productSearchResults.innerHTML = '<div class="psr-empty">輸入關鍵字或選擇分類開始搜尋…</div>';
   productSearchInput.focus();
+  ensureProductCategoriesLoaded();
 });
 
 document.getElementById('productSearchCloseBtn').addEventListener('click', ()=>{
@@ -743,34 +793,8 @@ document.getElementById('productManualAddBtn').addEventListener('click', ()=>{
   productSearchPanel.style.display = 'none';
 });
 
-productSearchInput.addEventListener('input', ()=>{
-  clearTimeout(productSearchTimer);
-  const q = productSearchInput.value.trim();
-  if(!q){
-    productSearchResults.innerHTML = '<div class="psr-empty">輸入關鍵字開始搜尋…</div>';
-    return;
-  }
-  productSearchTimer = setTimeout(async ()=>{
-    productSearchResults.innerHTML = '<div class="psr-empty">搜尋中…</div>';
-    try{
-      const res = await fetch('/api/production-schedule-item-search?q=' + encodeURIComponent(q));
-      const data = await res.json();
-      const items = (data && data.items) || [];
-      if(items.length === 0){
-        productSearchResults.innerHTML = '<div class="psr-empty">查無符合的商品，可以按下方「手動輸入名稱」新增。</div>';
-        return;
-      }
-      productSearchResults.innerHTML = items.map(it => `
-        <div class="psr-item" data-id="${esc(it.id)}" data-name="${esc(it.name)}">
-          <span>${esc(it.name)}</span>
-          <span class="psr-id">${esc(it.id)}</span>
-        </div>
-      `).join('');
-    }catch(e){
-      productSearchResults.innerHTML = '<div class="psr-empty">搜尋失敗，可以按下方「手動輸入名稱」新增。</div>';
-    }
-  }, 300);
-});
+productSearchInput.addEventListener('input', runProductSearch);
+productCategorySelect.addEventListener('change', runProductSearch);
 
 productSearchResults.addEventListener('click', (e)=>{
   const item = e.target.closest('.psr-item');
