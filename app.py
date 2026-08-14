@@ -1527,6 +1527,12 @@ def fetch_a1_supplier_details(token):
         detailed.append(d_resp.json())
     except requests.exceptions.RequestException:
       continue
+  if detailed:
+    # 印出第一筆的完整原始欄位名稱，用來對照畫面上「廠商資訊」中文
+    # 標題底下猜測的英文key名稱有沒有猜對（見render_supplier_info_tab
+    # 裡的SUPPLIER_FIELD_LABELS）。部署後如果畫面上某欄一直是空的，
+    # 到Render Logs找這行，把完整內容貼給我核對。
+    print(f"[廠商資訊] A1原始欄位範例（第1筆）：{detailed[0]}")
   return detailed, None
 
 
@@ -9053,20 +9059,61 @@ def cloud_accounting_dashboard():
         ui.label("目前沒有廠商資料").classes("text-xs text-zinc-400")
         return
       ui.label(f"共 {len(suppliers)} 家廠商").classes("text-xs text-zinc-500 mb-2")
-      preferred_cols = [
-          "ID", "Name", "ShortName", "Address", "Phone", "Fax",
-          "TaxNo", "Contact", "AccountDay", "PaymentDay",
+      # 依你A1後台「廠商資料」畫面的欄位順序對照，中文標題後面那組是
+      # 用來嘗試抓對應英文key的候選清單（不確定A1實際命名，多猜幾個
+      # 常見寫法）——這份還沒實際驗證過，如果部署後某欄一直是空的，
+      # 去Render Logs找「[廠商資訊] A1原始欄位範例」那行，把完整內容
+      # 貼給我，我再把候選清單改成正確的key名稱。
+      SUPPLIER_FIELD_LABELS = [
+          ("廠商代號", ["ID"]),
+          ("廠商全名", ["Name"]),
+          ("廠商簡稱", ["ShortName"]),
+          ("統一編號", ["TaxNo", "TaxID", "UniformNo"]),
+          ("結帳方式", ["PaymentType", "SettleType", "AccountType"]),
+          ("每月結帳日", ["AccountDay"]),
+          ("付款日", ["PaymentDay"]),
+          ("備註", ["Note", "Remark", "Memo"]),
+          ("e-mail", ["Email", "EMail"]),
+          ("電話", ["Phone", "Tel", "TelNo"]),
+          ("聯絡人", ["Contact", "ContactName"]),
+          ("匯款帳號", ["BankAccount", "BankNo", "BankAccountNo"]),
       ]
-      present_cols = [c for c in preferred_cols if any(s.get(c) not in (None, "") for s in suppliers)]
-      if not present_cols:
-        present_cols = list(suppliers[0].keys())[:8]
+      present_labels = [
+          (label, keys) for label, keys in SUPPLIER_FIELD_LABELS
+          if any(
+              s.get(k) not in (None, "") for s in suppliers for k in keys
+          )
+      ]
+      if not present_labels:
+        # 一個候選key都對不到，退回顯示A1原始欄位名稱，至少資料還看
+        # 得到，只是標題還是英文，等log核對完欄位名稱後再改成中文。
+        raw_cols = list(suppliers[0].keys())[:10]
+        ui.table(
+            columns=[
+                {"name": c, "label": c, "field": c, "align": "left", "sortable": True}
+                for c in raw_cols
+            ],
+            rows=[{c: s.get(c, "") for c in raw_cols} for s in suppliers],
+            pagination={"rowsPerPage": 20, "sortBy": raw_cols[0], "descending": False},
+        ).classes("w-full").props(':rows-per-page-options="[10,20,50,0]"')
+        return
+
+      def pick(row, keys):
+        for k in keys:
+          if row.get(k) not in (None, ""):
+            return row.get(k)
+        return ""
+
       ui.table(
           columns=[
-              {"name": c, "label": c, "field": c, "align": "left", "sortable": True}
-              for c in present_cols
+              {"name": label, "label": label, "field": label, "align": "left", "sortable": True}
+              for label, _ in present_labels
           ],
-          rows=[{c: s.get(c, "") for c in present_cols} for s in suppliers],
-          pagination={"rowsPerPage": 20, "sortBy": present_cols[0], "descending": False},
+          rows=[
+              {label: pick(s, keys) for label, keys in present_labels}
+              for s in suppliers
+          ],
+          pagination={"rowsPerPage": 20, "sortBy": present_labels[0][0], "descending": False},
       ).classes("w-full").props(':rows-per-page-options="[10,20,50,0]"')
 
   def render_accounting_company_content(company_name):
