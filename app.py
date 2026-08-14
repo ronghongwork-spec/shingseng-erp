@@ -4181,6 +4181,29 @@ async def api_save_production_schedule(company_key: str, request: Request):
     return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@app.get("/api/production-schedule-item-search")
+def api_search_a1_items(q: str = ""):
+  """生產排程表「新增品項」的品名關鍵字搜尋，給 static/production-
+  schedule.html 用。目前items_map只有海濤客有真正串接A1（見/areas/
+  shingseng-erp.md：容鴻/芙萊柏「後三間先建頁面骨架，資料待補」），所以
+  這支對容鴻/芙萊柏來說會查不到東西——前端在查無結果時要保留「手動
+  輸入」的退路，不能只依賴這支API。
+  回傳最多30筆 {"id": 品號, "name": 品名}，依品名字母排序。
+  """
+  from fastapi.responses import JSONResponse
+  keyword = (q or "").strip().lower()
+  if not keyword:
+    return JSONResponse({"items": []})
+  items_map = app_state.get("items_map", {})
+  matched = [
+      {"id": item_id, "name": info.get("Name", "")}
+      for item_id, info in items_map.items()
+      if keyword in (info.get("Name", "") or "").lower()
+  ]
+  matched.sort(key=lambda x: x["name"])
+  return JSONResponse({"items": matched[:30]})
+
+
 def load_production_schedule_state(company_key):
   """讀取指定公司的生產排程表 JSON 狀態（跟上面的API讀同一份檔案）。
   回傳 dict 或 None（檔案不存在，代表還沒填過任何資料）。
