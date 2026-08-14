@@ -4127,13 +4127,19 @@ LOGO_PATH = os.path.join(STATIC_DIR, "logo.png")
 # -------------------------------------------------------------------------
 # 前端是 static/production-schedule.html（單一份靜態頁面，用網址參數
 # ?company=xxx 分辨是哪間公司），原本用Artifacts環境專屬的window.storage
-# 存資料，搬進這個系統後改成打這兩支API，存成本機JSON檔案（伺服器重啟
-# 會清空，之後如果要跨重啟保存，可以改成寫回Google Sheet，目前先用最
-# 簡單的方式讓功能能動）。
-PRODUCTION_SCHEDULE_DATA_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "data", "production_schedule"
+# 存資料，搬進這個系統後改成打這兩支API。存檔目的地是Google Sheet裡的
+# 「生產排程資料」分頁（用GOOGLE_SHEET_ID那份共用試算表，沒有另外設定
+# 專屬Sheet ID）：一間公司一列，欄位是「公司代號｜更新時間｜JSON內容」，
+# 整包狀態當一段JSON文字存進一個儲存格，不拆成零散欄位——這樣資料結構
+# 可以完全比照前端state的自由格式，不用因為Sheets是表格就重新設計欄位。
+# 好處是不受Render重新部署/重啟影響（本機檔案系統是暫存的，Google
+# Sheet不是），跟其他資料一致地存在同一份試算表裡。
+PRODUCTION_SCHEDULE_SHEET_TAB = os.environ.get(
+    "PRODUCTION_SCHEDULE_SHEET_TAB", "生產排程資料"
 )
-os.makedirs(PRODUCTION_SCHEDULE_DATA_DIR, exist_ok=True)
+PRODUCTION_SCHEDULE_SHEET_COL_COMPANY = "公司代號"
+PRODUCTION_SCHEDULE_SHEET_COL_UPDATED = "更新時間"
+PRODUCTION_SCHEDULE_SHEET_COL_JSON = "JSON內容"
 
 # 網址參數用的公司代號 -> 中文公司名稱（顯示標題／給行事曆整合用）
 PRODUCTION_SCHEDULE_COMPANIES = {
@@ -4143,9 +4149,76 @@ PRODUCTION_SCHEDULE_COMPANIES = {
 }
 
 
-def _production_schedule_file_path(company_key):
-  safe_key = "".join(c for c in company_key if c.isalnum() or c == "_")
-  return os.path.join(PRODUCTION_SCHEDULE_DATA_DIR, f"{safe_key}.json")
+def _get_production_schedule_worksheet():
+  """回傳 (worksheet, error)。分頁不存在時會自動建立（含標題列），因為
+  這個分頁是系統自己專用的，不像BOM表/品號對應那些需要人工先手動建好、
+  照固定格式填資料——這裡欄位單純，自動建立比較不容易出錯。
+  error：None代表成功；"not_configured"代表沒設定Google Sheets憑證/
+  Sheet ID；其他字串是實際錯誤訊息。
+  """
+  gc = _get_gspread_client(GOOGLE_SHEET_ID)
+  if gc is None:
+    return None, "not_configured"
+  try:
+    import gspread
+    sh = gc.open_by_key(GOOGLE_SHEET_ID)
+    try:
+      ws = sh.worksheet(PRODUCTION_SCHEDULE_SHEET_TAB)
+    except gspread.WorksheetNotFound:
+      ws = sh.add_worksheet(title=PRODUCTION_SCHEDULE_SHEET_TAB, rows=10, cols=3)
+      ws.update("A1:C1", [[
+          PRODUCTION_SCHEDULE_SHEET_COL_COMPANY,
+          PRODUCTION_SCHEDULE_SHEET_COL_UPDATED,
+          PRODUCTION_SCHEDULE_SHEET_COL_JSON,
+      ]])
+    return ws, None
+  except Exception as e:
+    print(f"[生產排程資料] 開啟分頁失敗：{e}")
+    return None, str(e)
+
+
+def load_production_schedule_from_sheet(company_key):
+  """回傳 (value_json_str_or_None, error)。value是None代表這間公司
+  還沒存過任何資料（分頁裡沒有這一列），不是錯誤。
+  """
+  ws, error = _get_production_schedule_worksheet()
+  if ws is None:
+    return None, error
+  try:
+    records = ws.get_all_records(numericise_ignore=["all"])
+    for row in records:
+      if str(row.get(PRODUCTION_SCHEDULE_SHEET_COL_COMPANY, "")).strip() == company_key:
+        return (row.get(PRODUCTION_SCHEDULE_SHEET_COL_JSON, "") or None), None
+    return None, None
+  except Exception as e:
+    print(f"[生產排程資料] 讀取「{company_key}」失敗：{e}")
+    return None, str(e)
+
+
+def save_production_schedule_to_sheet(company_key, value_json):
+  """把整包JSON狀態存進（或覆蓋）該公司那一列。回傳error（None代表
+  成功）。找不到既有列就新增一列，不用人工先手動建好每間公司的列。
+  """
+  ws, error = _get_production_schedule_worksheet()
+  if ws is None:
+    return error
+  try:
+    now_str = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+    # gspread不同版本的find()在找不到時行為不一致（有的回傳None，
+    # 有的丟CellNotFound例外），兩種都接住，統一當「還沒有這一列」處理。
+    try:
+      cell = ws.find(company_key, in_column=1)
+    except Exception:
+      cell = None
+    row_values = [company_key, now_str, value_json]
+    if cell:
+      ws.update(f"A{cell.row}:C{cell.row}", [row_values])
+    else:
+      ws.append_row(row_values)
+    return None
+  except Exception as e:
+    print(f"[生產排程資料] 儲存「{company_key}」失敗：{e}")
+    return str(e)
 
 
 @app.get("/api/production-schedule/{company_key}")
@@ -4153,14 +4226,10 @@ def api_get_production_schedule(company_key: str):
   from fastapi.responses import JSONResponse
   if company_key not in PRODUCTION_SCHEDULE_COMPANIES:
     return JSONResponse({"error": "invalid company_key"}, status_code=400)
-  path = _production_schedule_file_path(company_key)
-  if not os.path.exists(path):
-    return JSONResponse({"value": None})
-  try:
-    with open(path, "r", encoding="utf-8") as f:
-      return JSONResponse({"value": f.read()})
-  except Exception as e:
-    return JSONResponse({"error": str(e)}, status_code=500)
+  value, error = load_production_schedule_from_sheet(company_key)
+  if error:
+    return JSONResponse({"error": error}, status_code=500)
+  return JSONResponse({"value": value})
 
 
 @app.post("/api/production-schedule/{company_key}")
@@ -4173,9 +4242,9 @@ async def api_save_production_schedule(company_key: str, request: Request):
     value = body.get("value")
     if value is None:
       return JSONResponse({"error": "missing value"}, status_code=400)
-    path = _production_schedule_file_path(company_key)
-    with open(path, "w", encoding="utf-8") as f:
-      f.write(value)
+    error = save_production_schedule_to_sheet(company_key, value)
+    if error:
+      return JSONResponse({"error": error}, status_code=500)
     return JSONResponse({"ok": True})
   except Exception as e:
     return JSONResponse({"error": str(e)}, status_code=500)
@@ -4205,17 +4274,18 @@ def api_search_a1_items(q: str = ""):
 
 
 def load_production_schedule_state(company_key):
-  """讀取指定公司的生產排程表 JSON 狀態（跟上面的API讀同一份檔案）。
-  回傳 dict 或 None（檔案不存在，代表還沒填過任何資料）。
+  """讀取指定公司的生產排程表 JSON 狀態（跟上面的API讀同一份Google
+  Sheet列）。回傳 dict 或 None（還沒存過資料，或Google Sheets沒設定/
+  讀取失敗——這裡不特別區分，給行事曆整合用，讀不到就當作沒有事件
+  顯示，不影響月曆其他部分正常運作）。
   """
-  path = _production_schedule_file_path(company_key)
-  if not os.path.exists(path):
+  value, error = load_production_schedule_from_sheet(company_key)
+  if not value:
     return None
   try:
-    with open(path, "r", encoding="utf-8") as f:
-      return json.loads(f.read())
+    return json.loads(value)
   except Exception as e:
-    print(f"[生產排程] 讀取「{company_key}」狀態失敗：{e}")
+    print(f"[生產排程] 解析「{company_key}」狀態失敗：{e}")
     return None
 
 
@@ -8159,6 +8229,12 @@ def inventory_dashboard():
                           "時即時查詢，不隨開機同步）"
                           if (GOOGLE_SHEETS_CREDENTIALS_JSON and MONTHLY_SALES_REVIEW_GOOGLE_SHEET_ID)
                           else "尚未設定",
+                      ),
+                      (
+                          "生產排程資料", PRODUCTION_SCHEDULE_SHEET_TAB,
+                          "Google Sheets（海濤客/容鴻/芙萊柏「生產排程」"
+                          "分頁的存檔位置，分頁不存在時系統會自動建立）"
+                          if sheets_configured else "尚未設定",
                       ),
                   ):
                     ui.label(
