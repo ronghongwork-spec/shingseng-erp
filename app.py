@@ -4121,6 +4121,22 @@ os.makedirs(STATIC_DIR, exist_ok=True)
 app.add_static_files("/static", STATIC_DIR)
 LOGO_PATH = os.path.join(STATIC_DIR, "logo.png")
 
+# 靜態HTML檔案（例如production-schedule.html）用iframe嵌入時，瀏覽器會
+# 把iframe的src網址整個快取住——同一個網址不會因為伺服器上的檔案內容
+# 換了就自動重抓，導致「明明部署了新版，畫面卻還是舊的」。這裡取檔案
+# 的最後修改時間當版本號，串在iframe網址後面（?v=xxxxx）：只要檔案內容
+# 換了（redeploy時git checkout會更新mtime），版本號就會跟著變、網址
+# 變成新的，瀏覽器就會被迫重新抓取，不用使用者自己手動強制刷新。
+def _static_file_version(filename):
+  path = os.path.join(STATIC_DIR, filename)
+  try:
+    return str(int(os.path.getmtime(path)))
+  except OSError:
+    return "0"
+
+
+PRODUCTION_SCHEDULE_HTML_VERSION = _static_file_version("production-schedule.html")
+
 
 # -------------------------------------------------------------------------
 # 生產排程表（品項×月份，含包材到廠/出貨時程自動彙整）：後端儲存 API
@@ -4947,7 +4963,7 @@ def inventory_dashboard():
                     "的日期。"
                 ).classes("text-xs text-zinc-500 mb-3")
                 ui.html(
-                    f'<iframe src="/static/production-schedule.html?company={PRODUCTION_SCHEDULE_KEY}"'
+                    f'<iframe src="/static/production-schedule.html?company={PRODUCTION_SCHEDULE_KEY}&v={PRODUCTION_SCHEDULE_HTML_VERSION}"'
                     ' style="width:100%; height:1400px; border:none;"></iframe>',
                     sanitize=False,
                 ).classes("w-full")
@@ -7419,7 +7435,7 @@ def inventory_dashboard():
                   "瀏覽器分開存），儀表板月曆也會一起顯示這裡的日期。"
               ).classes("text-xs text-zinc-500 mb-3")
               ui.html(
-                  '<iframe src="/static/production-schedule.html?company=hai_tao_ke"'
+                  f'<iframe src="/static/production-schedule.html?company=hai_tao_ke&v={PRODUCTION_SCHEDULE_HTML_VERSION}"'
                   ' style="width:100%; height:1400px; border:none;"></iframe>',
                   sanitize=False,
               ).classes("w-full")
