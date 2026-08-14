@@ -4807,7 +4807,8 @@ def inventory_dashboard():
                 ).classes("text-xs text-zinc-500 mb-3")
                 ui.html(
                     f'<iframe src="/static/production-schedule.html?company={PRODUCTION_SCHEDULE_KEY}"'
-                    ' style="width:100%; height:1400px; border:none;"></iframe>'
+                    ' style="width:100%; height:1400px; border:none;"></iframe>',
+                    sanitize=False,
                 ).classes("w-full")
           elif tab_label == "採購分析":
             section_body.clear()
@@ -7278,7 +7279,8 @@ def inventory_dashboard():
               ).classes("text-xs text-zinc-500 mb-3")
               ui.html(
                   '<iframe src="/static/production-schedule.html?company=hai_tao_ke"'
-                  ' style="width:100%; height:1400px; border:none;"></iframe>'
+                  ' style="width:100%; height:1400px; border:none;"></iframe>',
+                  sanitize=False,
               ).classes("w-full")
 
 
