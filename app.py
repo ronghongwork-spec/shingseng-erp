@@ -5148,6 +5148,18 @@ def inventory_dashboard():
           tab_procurement = ui.tab("採購分析")
           tab_settings = ui.tab("系統設定")
 
+        def handle_page_tab_change(e):
+          # 這個頁面的分頁是一次全部建好（不像容鴻/芙萊柏是懶載入切換
+          # 才重畫），所以「儀表板」的月曆只有頁面剛載入、或按「同步」
+          # 按鈕時才會重算——切到「生產排程」填完資料、再切回「儀表板」
+          # 不會自動反映最新資料。這裡補一個監聽：只要切回「儀表板」
+          # 分頁，就順便重畫一次月曆，才能看到剛剛在「生產排程」填的
+          # 包材/出貨日期。
+          if e.value == tab_dashboard and "update_calendar" in refs:
+            refs["update_calendar"]()
+
+        page_tabs.on_value_change(handle_page_tab_change)
+
         with ui.tab_panels(page_tabs, value=tab_dashboard).classes(
             "w-full bg-transparent"
         ):
