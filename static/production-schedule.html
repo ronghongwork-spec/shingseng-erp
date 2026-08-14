@@ -232,7 +232,7 @@
 
 <main>
 
-  <div class="stat-strip" id="statStrip"></div>
+  <!-- 全期總數量/包材需求總量/預計出貨總量/追蹤品項數 這幾個統計卡片已依需求拿掉 -->
 
   <section class="panel">
     <h2>⏱ 預計時程（自動產生）</h2>
@@ -246,7 +246,7 @@
       <button id="addMonthBtn">＋ 新增月份</button>
       <button id="toggleCompletedBtn">顯示已結束月份</button>
       <button class="ghost" id="exportBtn">匯出備份 (JSON)</button>
-      <button class="ghost danger" id="resetBtn">重置為範例資料</button>
+      <button class="ghost danger" id="clearAllBtn">全部清除</button>
     </div>
     <div class="product-search-panel" id="productSearchPanel" style="display:none;">
       <div class="product-search-filters">
@@ -521,18 +521,10 @@ function renderTable(){
 }
 
 /* ---------------- render: stats ---------------- */
+// 使用者要求拿掉「全期總數量／包材需求總量／預計出貨總量／追蹤品項數」
+// 這四個統計卡片，保留函式本身（no-op）是因為其他地方還有呼叫
+// renderStats()，改成空函式比逐一刪掉所有呼叫點更不容易漏改。
 function renderStats(){
-  const totalQty = state.months.reduce((s,m)=>s+computeMonthTotal(m.id),0);
-  const events = buildEvents();
-  const materialQty = events.filter(e=>e.type==='material').reduce((s,e)=>s+e.qty,0);
-  const shipQty = events.filter(e=>e.type==='ship').reduce((s,e)=>s+e.qty,0);
-  const el = document.getElementById('statStrip');
-  el.innerHTML = `
-    <div class="stat"><div class="num">${totalQty.toLocaleString()}</div><div class="lbl">全期總數量</div></div>
-    <div class="stat"><div class="num" style="color:var(--amber)">${materialQty.toLocaleString()}</div><div class="lbl">包材需求總量</div></div>
-    <div class="stat"><div class="num" style="color:var(--coral)">${shipQty.toLocaleString()}</div><div class="lbl">預計出貨總量</div></div>
-    <div class="stat"><div class="num">${state.products.length}</div><div class="lbl">追蹤品項數</div></div>
-  `;
 }
 
 /* ---------------- render: timeline ---------------- */
@@ -563,9 +555,13 @@ function buildEvents(){
   });
 
   Object.entries(mainMap).forEach(([dateStr,info])=>{
+    // 進貨→預計到貨、生產→預計生產；沒選類型或同一天混了兩種類型
+    // （少見但技術上可能發生）就用「預計出貨」當中性的預設字樣。
     let type = 'ship', label = '預計出貨';
-    if(info.types.size===1 && [...info.types][0]==='進貨'){
-      type = 'material'; label = '預計到貨';
+    if(info.types.size===1){
+      const t = [...info.types][0];
+      if(t==='進貨'){ type='material'; label='預計到貨'; }
+      else if(t==='生產'){ type='ship'; label='預計生產'; }
     }
     events.push({type, date:dateStr, sortDate:parseDate(dateStr), label, qty:info.qty, detail:info.items.join('、')});
   });
@@ -839,9 +835,13 @@ document.getElementById('exportBtn').addEventListener('click', ()=>{
   URL.revokeObjectURL(url);
 });
 
-document.getElementById('resetBtn').addEventListener('click', ()=>{
-  if(confirm('確定要重置為範例資料嗎？目前輸入的內容將被覆蓋。')){
-    state = defaultState();
+document.getElementById('clearAllBtn').addEventListener('click', ()=>{
+  // 「全部清除」是不可逆動作，一定要跳出確認視窗、使用者按下確定才
+  // 真的清空——不是改成範例資料，是真的清成空白（品項、月份、所有
+  // 已填的數量/日期、異動記錄全部清掉），清完之後要重新用「＋新增
+  // 品項」「＋新增月份」建立。
+  if(confirm('確定要清除全部資料嗎？品項、月份、所有已填寫的數量/日期、異動記錄都會被清空，此動作無法復原。')){
+    state = {products:[], months:[], cells:{}, logs:[], showCompleted:false};
     renderAll();
     scheduleSave();
   }
