@@ -2072,7 +2072,7 @@ def render_monthly_task_calendar(company_name, orders_source=None, refs=None, re
                 )
               for ev in day_schedule_events:
                 icon = "📦" if ev["type"] == "material" else "🚚"
-                ui.label(f"{icon} {ev['qty']:,}").classes(
+                ui.label(f"{icon} {ev['label']}").classes(
                     "text-[10px] text-amber-700"
                     if ev["type"] == "material" else "text-[10px] text-orange-700"
                 )
@@ -4165,13 +4165,21 @@ PRODUCTION_SCHEDULE_COMPANIES = {
 }
 
 
-def _get_production_schedule_worksheet():
+def _get_production_schedule_worksheet(force_refresh=False):
   """回傳 (worksheet, error)。分頁不存在時會自動建立（含標題列），因為
   這個分頁是系統自己專用的，不像BOM表/品號對應那些需要人工先手動建好、
   照固定格式填資料——這裡欄位單純，自動建立比較不容易出錯。
   error：None代表成功；"not_configured"代表沒設定Google Sheets憑證/
   Sheet ID；其他字串是實際錯誤訊息。
+
+  這支的worksheet物件會快取在記憶體裡（force_refresh=True才會強制重開）
+  ——每次存檔如果都重新「開試算表→開分頁」，光這兩步就要來回打兩次
+  Google Sheets API，使用者在生產排程表打字停頓0.5秒觸發自動存檔時
+  會明顯感覺到卡頓。快取起來之後，正常情況下存一次檔只需要真正打
+  一次API（見save_production_schedule_to_sheet的列號快取）。
   """
+  if not force_refresh and _production_schedule_ws_cache["ws"] is not None:
+    return _production_schedule_ws_cache["ws"], None
   gc = _get_gspread_client(GOOGLE_SHEET_ID)
   if gc is None:
     return None, "not_configured"
@@ -4187,53 +4195,84 @@ def _get_production_schedule_worksheet():
           PRODUCTION_SCHEDULE_SHEET_COL_UPDATED,
           PRODUCTION_SCHEDULE_SHEET_COL_JSON,
       ]])
+    _production_schedule_ws_cache["ws"] = ws
     return ws, None
   except Exception as e:
     print(f"[生產排程資料] 開啟分頁失敗：{e}")
     return None, str(e)
 
 
+# worksheet物件快取（見上）＋ 每間公司資料列在第幾列的快取（見下）。
+# 快取失效時（gspread物件過期／API出錯）兩邊都會被清掉，下次呼叫會
+# 自動重新走一次完整流程，不用擔心快取壞掉之後永遠救不回來。
+_production_schedule_ws_cache = {"ws": None}
+_production_schedule_row_cache = {}  # company_key -> 該公司資料所在的列號
+
+
 def load_production_schedule_from_sheet(company_key):
   """回傳 (value_json_str_or_None, error)。value是None代表這間公司
   還沒存過任何資料（分頁裡沒有這一列），不是錯誤。
+  順便把這間公司資料所在的列號記下來，之後存檔可以直接用，不用再
+  find()一次。
   """
   ws, error = _get_production_schedule_worksheet()
   if ws is None:
     return None, error
   try:
     records = ws.get_all_records(numericise_ignore=["all"])
-    for row in records:
+    for idx, row in enumerate(records):
       if str(row.get(PRODUCTION_SCHEDULE_SHEET_COL_COMPANY, "")).strip() == company_key:
+        _production_schedule_row_cache[company_key] = idx + 2  # +1轉1-indexed，+1跳過標題列
         return (row.get(PRODUCTION_SCHEDULE_SHEET_COL_JSON, "") or None), None
     return None, None
   except Exception as e:
     print(f"[生產排程資料] 讀取「{company_key}」失敗：{e}")
+    _production_schedule_ws_cache["ws"] = None
     return None, str(e)
 
 
 def save_production_schedule_to_sheet(company_key, value_json):
   """把整包JSON狀態存進（或覆蓋）該公司那一列。回傳error（None代表
   成功）。找不到既有列就新增一列，不用人工先手動建好每間公司的列。
+
+  有快取列號的話直接update那一列，跳過find()這個額外的API呼叫——
+  這是使用者在生產排程表打字時「防手震」自動存檔的路徑，能少一次
+  API呼叫，體感速度差很多。update失敗（例如快取的列號其實已經不對，
+  比如有人手動改過Google Sheet的列順序）會被下面的except接住，清掉
+  快取後照舊路（find→update／append）重試一次，不會直接失敗給使用者
+  看到錯誤。
   """
   ws, error = _get_production_schedule_worksheet()
   if ws is None:
     return error
+  now_str = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+  row_values = [company_key, now_str, value_json]
+
+  cached_row = _production_schedule_row_cache.get(company_key)
+  if cached_row:
+    try:
+      ws.update(f"A{cached_row}:C{cached_row}", [row_values])
+      return None
+    except Exception as e:
+      print(f"[生產排程資料] 用快取列號({cached_row})存檔失敗，改用完整流程重試：{e}")
+      _production_schedule_row_cache.pop(company_key, None)
+
   try:
-    now_str = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
     # gspread不同版本的find()在找不到時行為不一致（有的回傳None，
     # 有的丟CellNotFound例外），兩種都接住，統一當「還沒有這一列」處理。
     try:
       cell = ws.find(company_key, in_column=1)
     except Exception:
       cell = None
-    row_values = [company_key, now_str, value_json]
     if cell:
+      _production_schedule_row_cache[company_key] = cell.row
       ws.update(f"A{cell.row}:C{cell.row}", [row_values])
     else:
       ws.append_row(row_values)
     return None
   except Exception as e:
     print(f"[生產排程資料] 儲存「{company_key}」失敗：{e}")
+    _production_schedule_ws_cache["ws"] = None
     return str(e)
 
 
@@ -4415,8 +4454,13 @@ def compute_production_schedule_events(state):
     if not d:
       continue
     types = info["types"]
+    # 進貨→預計到貨、生產→預計生產；沒選類型或同一天混了兩種類型
+    # （少見但技術上可能發生）就用「預計出貨」當中性的預設字樣，
+    # 跟前端buildEvents()的邏輯對應一致。
     if len(types) == 1 and next(iter(types)) == "進貨":
       label, event_type = "預計到貨", "material"
+    elif len(types) == 1 and next(iter(types)) == "生產":
+      label, event_type = "預計生產", "ship"
     else:
       label, event_type = "預計出貨", "ship"
     events_by_date[d].append({
